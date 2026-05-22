@@ -326,6 +326,64 @@ vp_delete_fs_state(struct pipe_context *pipe, void *p)
    FREE(cso);
 }
 
+/* ---- graphics: texture-sampler state (Phase 6) --------------------- */
+
+/* VX TEX encodings (VX_types.h) -- filter + wrap. */
+#define VX_TEX_FILTER_POINT     0
+#define VX_TEX_FILTER_BILINEAR  1
+#define VX_TEX_WRAP_CLAMP       0
+#define VX_TEX_WRAP_REPEAT      1
+#define VX_TEX_WRAP_MIRROR      2
+
+static uint32_t
+vp_vx_filter(unsigned f)
+{
+   return (f == PIPE_TEX_FILTER_LINEAR) ? VX_TEX_FILTER_BILINEAR
+                                        : VX_TEX_FILTER_POINT;
+}
+
+static uint32_t
+vp_vx_wrap(unsigned w)
+{
+   switch (w) {
+   case PIPE_TEX_WRAP_REPEAT:        return VX_TEX_WRAP_REPEAT;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT: return VX_TEX_WRAP_MIRROR;
+   default:                          return VX_TEX_WRAP_CLAMP;
+   }
+}
+
+/* Capture the bound texture + sampler for the Vortex TEX unit.
+ *
+ * lavapipe does not bind app textures through set_sampler_views (it
+ * keeps descriptors in a buffer the shader dereferences); the one
+ * place the underlying pipe_sampler_view / pipe_sampler_state surface
+ * is create_texture_handle. lavapipe calls it twice per resource: an
+ * image view passes the view (sampler state NULL), a sampler passes
+ * the state (view NULL). gfx-v1 drives a single TEX stage, so we
+ * capture the latest texture and the latest sampler. */
+static uint64_t
+vp_create_texture_handle(struct pipe_context *pipe,
+                         struct pipe_sampler_view *view,
+                         const struct pipe_sampler_state *state)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   if (view && view->texture) {
+      vp->cur_tex = view->texture;
+      vp_dbg("vortexpipe: TEX texture captured (%ux%u)",
+             vp->cur_tex->width0, vp->cur_tex->height0);
+   }
+   if (state) {
+      vp->cur_sampler_store.filter = vp_vx_filter(state->mag_img_filter);
+      vp->cur_sampler_store.wrap_u = vp_vx_wrap(state->wrap_s);
+      vp->cur_sampler_store.wrap_v = vp_vx_wrap(state->wrap_t);
+      vp->cur_sampler = &vp->cur_sampler_store;
+      vp_dbg("vortexpipe: TEX sampler captured filter=%u wrap=%u,%u",
+             vp->cur_sampler->filter, vp->cur_sampler->wrap_u,
+             vp->cur_sampler->wrap_v);
+   }
+   return vp->lp_create_texture_handle(pipe, view, state);
+}
+
 /* ---- graphics: framebuffer interception (Phase 4) ------------------ */
 
 /* Capture colour attachment 0 and the depth/stencil attachment so the
@@ -741,19 +799,54 @@ vp_draw_vbo(struct pipe_context *pipe,
                om.colormask  = 0xf;
             }
 
+            /* gather the bound texture for TEX stage 0, if any. The
+             * sampler-view image is read back to a tight host buffer
+             * (vp_raster_draw converts + uploads it); gfx-v1 supports
+             * a single power-of-two 2D texture. */
+            struct vp_tex_params tex = { 0 };
+            void *tex_px = NULL;
+            if (vp->cur_tex) {
+               uint32_t tw = vp->cur_tex->width0;
+               uint32_t th = vp->cur_tex->height0;
+               if (tw && th && !(tw & (tw - 1)) && !(th & (th - 1))) {
+                  tex_px = malloc((size_t)tw * th * 4);
+                  if (tex_px &&
+                      vp_resource_rw(pipe, vp->cur_tex, tw, th, tex_px,
+                                     false)) {
+                     tex.pixels = tex_px;
+                     tex.width  = tw;
+                     tex.height = th;
+                     tex.filter = vp->cur_sampler ? vp->cur_sampler->filter
+                                                  : VX_TEX_FILTER_POINT;
+                     tex.wrap_u = vp->cur_sampler ? vp->cur_sampler->wrap_u
+                                                  : VX_TEX_WRAP_CLAMP;
+                     tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
+                                                  : VX_TEX_WRAP_CLAMP;
+                  } else {
+                     free(tex_px);
+                     tex_px = NULL;
+                  }
+               } else {
+                  mesa_logw("vortexpipe: draw_vbo: non-power-of-two "
+                            "texture %ux%u unsupported (gfx-v1)", tw, th);
+               }
+            }
+
             void *cbuf = malloc((size_t)w * h * 4);
             if (cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
                 vp_raster_draw(vp->dev, fs->vxbin, fs->vxbin_size,
                                xverts, count, &vs->vs_layout,
-                               cbuf, w, h, &om) &&
+                               cbuf, w, h, &om, tex_px ? &tex : NULL) &&
                 vp_fb_color_write(pipe, vp, cbuf)) {
                vp_dbg("vortexpipe: draw_vbo -> Vortex RASTER+OM "
-                      "(%u verts, %ux%u, depth_test=%d)",
-                      count, w, h, om.depth_test);
+                      "(%u verts, %ux%u, depth_test=%d, textured=%d)",
+                      count, w, h, om.depth_test, tex_px != NULL);
+               free(tex_px);
                free(cbuf);
                free(xverts);
                return;
             }
+            free(tex_px);
             free(cbuf);
          }
 
@@ -829,6 +922,7 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_create_blend_state   = pipe->create_blend_state;
    vp->lp_bind_blend_state     = pipe->bind_blend_state;
    vp->lp_delete_blend_state   = pipe->delete_blend_state;
+   vp->lp_create_texture_handle = pipe->create_texture_handle;
    vp->lp_context_destroy      = pipe->destroy;
    vp_reg_put(pipe, vp);
 
@@ -852,6 +946,7 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->create_blend_state   = vp_create_blend_state;
    pipe->bind_blend_state     = vp_bind_blend_state;
    pipe->delete_blend_state   = vp_delete_blend_state;
+   pipe->create_texture_handle = vp_create_texture_handle;
    pipe->destroy              = vp_context_destroy;
 
    vp_dbg("vortexpipe: context created -- compute hooks intercepted");

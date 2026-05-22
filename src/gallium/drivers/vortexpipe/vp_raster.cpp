@@ -47,30 +47,51 @@
    VP_CHECK(vx_enqueue_dcr_write(q, (addr), (uint32_t)(val), 0, NULL, NULL), \
             #addr)
 
+/* exact log2 of a power-of-two texture dimension */
+static inline uint32_t
+vp_log2u(uint32_t n)
+{
+   uint32_t l = 0;
+   while ((1u << l) < n)
+      l++;
+   return l;
+}
+
 extern "C" bool
 vp_raster_draw(vx_device_h dev,
                const void *fs_vxbin, size_t fs_vxbin_size,
                const void *xverts, uint32_t vertex_count,
                const struct vp_vs_layout *layout,
                void *color, uint32_t width, uint32_t height,
-               const struct vp_om_params *om)
+               const struct vp_om_params *om,
+               const struct vp_tex_params *tex)
 {
    /* ---- triangle setup + binning ---------------------------------- *
-    * Convert the VS output records to CGLTrace vertices: slot 0 is the
-    * clip-space position, slot 1 the colour varying. */
+    * Convert the VS output records to CGLTrace vertices: record slot 0
+    * is the clip-space position, slots 1.. the generic varyings. The
+    * RASTER unit interpolates a fixed colour + texcoord; each varying
+    * is routed by its component count (2 -> texcoord, 3/4 -> colour),
+    * the same gfx-v1 mapping the FS translator uses. */
    std::unordered_map<uint32_t, cocogfx::CGLTrace::vertex_t> verts;
    std::vector<cocogfx::CGLTrace::primitive_t> prims;
    const uint8_t *xv = static_cast<const uint8_t *>(xverts);
 
    for (uint32_t i = 0; i < vertex_count; i++) {
-      const float *pos = reinterpret_cast<const float *>(
-         xv + (size_t)i * layout->stride);
-      const float *col = reinterpret_cast<const float *>(
-         xv + (size_t)i * layout->stride + 16);  /* varying slot 0 */
+      const uint8_t *rec = xv + (size_t)i * layout->stride;
+      const float *pos = reinterpret_cast<const float *>(rec);
       cocogfx::CGLTrace::vertex_t v;
       v.pos      = { pos[0], pos[1], pos[2], pos[3] };
-      v.color    = { col[0], col[1], col[2], 1.0f };
+      v.color    = { 1.0f, 1.0f, 1.0f, 1.0f };
       v.texcoord = { 0.0f, 0.0f };
+      for (uint32_t vi = 0; vi < layout->num_varyings; vi++) {
+         const float *a = reinterpret_cast<const float *>(
+            rec + 16u * (1u + vi));            /* slot 0 is gl_Position */
+         uint32_t nc = layout->varying_comps[vi];
+         if (nc == 2)
+            v.texcoord = { a[0], a[1] };
+         else if (nc >= 3)
+            v.color    = { a[0], a[1], a[2], nc >= 4 ? a[3] : 1.0f };
+      }
       verts[i] = v;
    }
    for (uint32_t i = 0; i + 2 < vertex_count; i += 3)
@@ -89,7 +110,7 @@ vp_raster_draw(vx_device_h dev,
    bool ok = false;
    vx_queue_h  q    = NULL;
    vx_buffer_h kbuf = NULL, tbuf = NULL, pbuf = NULL,
-               cbuf = NULL, zbuf = NULL, abuf = NULL;
+               cbuf = NULL, zbuf = NULL, abuf = NULL, xbuf = NULL;
    char vxpath[] = "/tmp/vortexpipe-fs.XXXXXX";
    int  vxfd = -1;
    const uint32_t cbuf_bytes = width * height * 4;
@@ -145,6 +166,12 @@ vp_raster_draw(vx_device_h dev,
                          ? 0x00 : 0xFF;
       std::vector<uint8_t> zclear(cbuf_bytes, zfill);
 
+      /* The converted texture words. vx_enqueue_write is asynchronous --
+       * the source memory must stay live until vx_queue_finish -- so the
+       * texel buffer is declared at this scope, alongside zclear, rather
+       * than inside the `if (tex)` block below. */
+      std::vector<uint32_t> texbuf;
+
       /* upload everything (the colour buffer carries the cleared image) */
       VP_CHECK(vx_enqueue_write(q, tbuf, 0, tilebuf.data(), tilebuf.size(),
                                 0, NULL, NULL), "vx_enqueue_write(tiles)");
@@ -188,6 +215,43 @@ vp_raster_draw(vx_device_h dev,
       DCR(VX_DCR_OM_BLEND_CONST,       0);
       DCR(VX_DCR_OM_LOGIC_OP,          0);
 
+      /* TEX unit (stage 0): convert the bound texture from the Vulkan
+       * R8G8B8A8 host layout to the A8R8G8B8 word the TEX unit unpacks,
+       * upload it, and program the sampler DCRs. Untextured draws (tex
+       * == NULL) leave the TEX state alone -- the FS kernel won't issue
+       * vx_tex(). Only mip 0 is supplied; gfx-v1 fragment shading
+       * samples at LOD 0. */
+      if (tex) {
+         const uint32_t texel_count = tex->width * tex->height;
+         texbuf.resize(texel_count);
+         const uint8_t *src = static_cast<const uint8_t *>(tex->pixels);
+         for (uint32_t i = 0; i < texel_count; i++) {
+            uint32_t r = src[i * 4 + 0];
+            uint32_t g = src[i * 4 + 1];
+            uint32_t b = src[i * 4 + 2];
+            uint32_t a = src[i * 4 + 3];
+            texbuf[i] = (a << 24) | (r << 16) | (g << 8) | b;
+         }
+         const size_t texbuf_bytes = texel_count * 4;
+
+         VP_CHECK(vx_buffer_create(dev, texbuf_bytes, 0, &xbuf),
+                  "vx_buffer_create(tex)");
+         uint64_t tex_dev = 0;
+         VP_CHECK(vx_buffer_address(xbuf, &tex_dev), "vx_buffer_address(tex)");
+         VP_CHECK(vx_enqueue_write(q, xbuf, 0, texbuf.data(), texbuf_bytes,
+                                   0, NULL, NULL), "vx_enqueue_write(tex)");
+
+         uint32_t logw = vp_log2u(tex->width);
+         uint32_t logh = vp_log2u(tex->height);
+         DCR(VX_DCR_TEX_STAGE,        0);
+         DCR(VX_DCR_TEX_LOGDIM,       (logh << 16) | logw);
+         DCR(VX_DCR_TEX_FORMAT,       VX_TEX_FORMAT_A8R8G8B8);
+         DCR(VX_DCR_TEX_FILTER,       tex->filter);
+         DCR(VX_DCR_TEX_WRAP,         (tex->wrap_v << 16) | tex->wrap_u);
+         DCR(VX_DCR_TEX_ADDR,         tex_dev / 64);
+         DCR(VX_DCR_TEX_MIPOFF_BASE,  0);   /* mip 0 at the buffer base */
+      }
+
       /* dispatch the fragment-shader kernel; threads poll vx_rast() */
       vx_launch_info_t li = {
          sizeof(li), NULL, kbuf, abuf, 1,
@@ -202,6 +266,7 @@ vp_raster_draw(vx_device_h dev,
    }
 
 done:
+   if (xbuf) vx_buffer_release(xbuf);
    if (abuf) vx_buffer_release(abuf);
    if (zbuf) vx_buffer_release(zbuf);
    if (cbuf) vx_buffer_release(cbuf);

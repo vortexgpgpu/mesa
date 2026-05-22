@@ -36,6 +36,18 @@ struct vp_om_params {
    uint32_t colormask;      /* VX_DCR_OM_CBUF_WRITEMASK */
 };
 
+/* The texture bound for a draw -- mip 0 of the sampler-view image,
+ * plus the sampler's filter/wrap. width/height must be powers of two.
+ * NULL passed to vp_raster_draw means an untextured draw. */
+struct vp_tex_params {
+   const void *pixels;      /* width*height R8G8B8A8 host pixels */
+   uint32_t    width;
+   uint32_t    height;
+   uint32_t    filter;      /* VX_TEX_FILTER_* */
+   uint32_t    wrap_u;      /* VX_TEX_WRAP_* */
+   uint32_t    wrap_v;
+};
+
 /* Rasterize the Vortex-VS-transformed vertices on the hardware RASTER
  * unit and shade them with the fragment-shader kernel `fs_vxbin`; the
  * kernel submits fragments to the OM unit, which depth-tests, blends
@@ -47,6 +59,8 @@ struct vp_om_params {
  *   color         a width*height R8G8B8A8 host buffer -- on entry the
  *                 cleared framebuffer, on return the rendered image.
  *   om            depth/blend state for the OM unit.
+ *   tex           the texture bound to TEX stage 0, or NULL for an
+ *                 untextured draw.
  *
  * Returns true on success; false leaves `color` untouched so the
  * caller can fall back. */
@@ -55,7 +69,8 @@ bool vp_raster_draw(vx_device_h dev,
                     const void *xverts, uint32_t vertex_count,
                     const struct vp_vs_layout *layout,
                     void *color, uint32_t width, uint32_t height,
-                    const struct vp_om_params *om);
+                    const struct vp_om_params *om,
+                    const struct vp_tex_params *tex);
 
 #ifdef __cplusplus
 }

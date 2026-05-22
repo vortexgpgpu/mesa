@@ -61,6 +61,15 @@ struct vp_blend_cso {
    uint32_t colormask;         /* VX_DCR_OM_CBUF_WRITEMASK (RGBA bits) */
 };
 
+/* Captured texture-sampler state (Phase 6), VX TEX-encoded. lavapipe
+ * routes both image views and samplers through create_texture_handle,
+ * so vortexpipe captures the sampler's filter/wrap there. */
+struct vp_sampler_cso {
+   uint32_t filter;            /* VX_TEX_FILTER_* */
+   uint32_t wrap_u;            /* VX_TEX_WRAP_* */
+   uint32_t wrap_v;
+};
+
 /* Per-context vortexpipe state, keyed by the llvmpipe pipe_context *. */
 struct vp_context {
    vx_device_h dev;                       /* borrowed from vp_screen */
@@ -121,6 +130,17 @@ struct vp_context {
                                   const struct pipe_blend_state *);
    void  (*lp_bind_blend_state)(struct pipe_context *, void *);
    void  (*lp_delete_blend_state)(struct pipe_context *, void *);
+   /* Phase 6: texture + sampler, captured from create_texture_handle.
+    * lavapipe routes an image view (texture, state==NULL) and a
+    * sampler (state, view==NULL) through that one entry point; gfx-v1
+    * binds the latest of each to TEX stage 0. cur_sampler points at
+    * cur_sampler_store once a sampler has been seen. */
+   struct pipe_resource  *cur_tex;        /* bound FS texture, or NULL */
+   struct vp_sampler_cso *cur_sampler;    /* &cur_sampler_store, or NULL */
+   struct vp_sampler_cso  cur_sampler_store;
+   uint64_t (*lp_create_texture_handle)(struct pipe_context *,
+                                        struct pipe_sampler_view *,
+                                        const struct pipe_sampler_state *);
    void  (*lp_context_destroy)(struct pipe_context *);
 };
 

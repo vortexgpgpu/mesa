@@ -51,12 +51,19 @@
 
 /* graphics::rast_prim_t layout (sw/common/graphics.h, FIXEDPOINT):
  * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v}, each a
- * rast_attrib_t {x,y,z} of fixed24. r/g/b are the colour planes. */
+ * rast_attrib_t {x,y,z} of fixed24. r/g/b/a are the colour planes,
+ * u/v the texcoord planes. */
 #define VP_RAST_PRIM_STRIDE 120
 #define VP_RAST_ATTR_Z       36
 #define VP_RAST_ATTR_R       48
 #define VP_RAST_ATTR_G       60
 #define VP_RAST_ATTR_B       72
+#define VP_RAST_ATTR_A       84
+#define VP_RAST_ATTR_U       96
+#define VP_RAST_ATTR_V      108
+
+/* TEX unit: coordinates are S.23 fixed-point (VX_types.h VX_TEX_FXD_FRAC). */
+#define VP_TEX_FXD_FRAC      23
 
 /* riscv32 module target (XLEN=32 build). */
 #define VP_TRIPLE      "riscv32-unknown-elf"
@@ -272,6 +279,12 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
          if (!e || e->out_off < 0) { t->ok = false; return; }
          addr = LLVMBuildAdd(t->b, t->fs_in_base,
             LLVMConstInt(t->i32, (unsigned)e->out_off, false), "fsin");
+      } else if (v->data.mode == nir_var_uniform) {
+         /* a combined image-sampler handle. gfx-v1 binds a single
+          * texture to TEX stage 0 through DCRs, so the deref carries
+          * no address -- emit_tex ignores the texture/sampler deref
+          * sources. A placeholder keeps the SSA chain well-formed. */
+         addr = LLVMConstInt(t->i32, 0, false);
       } else {
          mesa_logw("vortexpipe: vp_nir_to_llvm: deref of unsupported "
                    "var mode %d", (int)v->data.mode);
@@ -318,7 +331,16 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       ssa_set(t, in->def.index, 0, t->vid);
       break;
    case nir_intrinsic_load_const_buf_base_addr_lvp: {
-      /* SSBO base address = arg_block[index] (array of i64). */
+      /* SSBO/UBO base address = arg_block[index] (array of i64). A
+       * fragment shader has no arg block -- the only descriptor it
+       * touches in gfx-v1 is the combined image-sampler, which is
+       * bound to TEX stage 0 by DCRs and addressed by stage, not by
+       * a handle. So the value only ever feeds a vx_tex handle source
+       * (which emit_tex ignores); a placeholder keeps it well-formed. */
+      if (!t->arg) {
+         ssa_set(t, in->def.index, 0, LLVMConstInt(t->i64, 0, false));
+         break;
+      }
       LLVMValueRef idx = intr_src(t, in, 0);
       LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
       LLVMValueRef v   = LLVMBuildLoad2(t->b, t->i64, gep, "bufbase");
@@ -382,6 +404,69 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    }
 }
 
+/* vx_tex(): sample TEX stage 0 (custom-1, funct3=1, R4-type, funct2=
+ * stage). Returns the filtered texel as a packed A8R8G8B8 word. */
+static LLVMValueRef
+emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
+            LLVMValueRef lod)
+{
+   const char *s = ".insn r4 43, 1, 0, $0, $1, $2, $3";
+   LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 3, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r,r,r", 8,
+                                      /*HasSideEffects*/ true,
+                                      /*IsAlignStack*/ false,
+                                      LLVMInlineAsmDialectATT,
+                                      /*CanThrow*/ false);
+   LLVMValueRef a[3] = { u, v, lod };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 3, "tex");
+}
+
+/* A NIR texture op: gfx-v1 supports a plain 2D `texture()` sampling
+ * the single bound texture (TEX stage 0) at LOD 0. The interpolated
+ * texcoord is the coord source; the texture/sampler deref sources are
+ * fixed-function (TEX DCRs) and ignored. The result vec4 is the
+ * unpacked A8R8G8B8 texel as four floats in [0,1]. */
+static void
+emit_tex(struct vp_tr *t, nir_tex_instr *tex)
+{
+   LLVMValueRef u = NULL, v = NULL;
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      if (tex->src[i].src_type == nir_tex_src_coord) {
+         u = ssa_get(t, tex->src[i].src.ssa->index, 0);
+         v = ssa_get(t, tex->src[i].src.ssa->index, 1);
+      }
+   }
+   if (tex->op != nir_texop_tex || !u || !v) {
+      mesa_logw("vortexpipe: vp_nir_to_llvm: unsupported texture op");
+      t->ok = false;
+      return;
+   }
+
+   /* float UV -> the TEX unit's S.23 fixed-point coordinate. */
+   LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+   LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
+      LLVMBuildBitCast(t->b, u, t->f32, ""), scale, ""), t->i32, "");
+   LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
+      LLVMBuildBitCast(t->b, v, t->f32, ""), scale, ""), t->i32, "");
+
+   LLVMValueRef texel = emit_vx_tex(t, ux, vx,
+                                    LLVMConstInt(t->i32, 0, false));
+
+   /* unpack A8R8G8B8 -> {r,g,b,a} floats in [0,1]. */
+   static const unsigned shift[4] = { 16, 8, 0, 24 };
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
+      LLVMValueRef byte = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, texel,
+                       LLVMConstInt(t->i32, shift[c], false), ""),
+         LLVMConstInt(t->i32, 0xff, false), "");
+      LLVMValueRef f = LLVMBuildFMul(t->b,
+         LLVMBuildUIToFP(t->b, byte, t->f32, ""),
+         LLVMConstReal(t->f32, 1.0 / 255.0), "");
+      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
+   }
+}
+
 static bool
 emit_instr(struct vp_tr *t, nir_instr *instr)
 {
@@ -397,6 +482,9 @@ emit_instr(struct vp_tr *t, nir_instr *instr)
       break;
    case nir_instr_type_intrinsic:
       emit_intrinsic(t, nir_instr_as_intrinsic(instr));
+      break;
+   case nir_instr_type_tex:
+      emit_tex(t, nir_instr_as_tex(instr));
       break;
    case nir_instr_type_jump:
       break;   /* straight-line: only the implicit return */
@@ -463,8 +551,11 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
       } else {
          off = (int)next;
          next += 16;
-         if (out_vs && out_vs->num_varyings < VP_VS_MAX_VARYINGS)
-            out_vs->varying_loc[out_vs->num_varyings] = var->data.location;
+         if (out_vs && out_vs->num_varyings < VP_VS_MAX_VARYINGS) {
+            out_vs->varying_loc[out_vs->num_varyings]   = var->data.location;
+            out_vs->varying_comps[out_vs->num_varyings] =
+               glsl_get_components(var->type);
+         }
          if (out_vs)
             out_vs->num_varyings++;
       }
@@ -615,6 +706,40 @@ emit_arg_i32(struct vp_tr *t, LLVMValueRef arg, unsigned k)
                          t->i32, "");
 }
 
+/* Fill the fragment shader's input varyings for one covered pixel.
+ * The RASTER unit interpolates a fixed set of attribute planes --
+ * colour (rgba) and one texcoord (uv); each FS input variable is
+ * filled from one or the other by its component count: a <=2-component
+ * varying is the texcoord, a wider one is the colour. This is the
+ * gfx-v1 fixed-function varying mapping -- a real GPU interpolates
+ * arbitrary user varyings, gfx-v1 has exactly these planes. */
+static void
+emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
+                      LLVMValueRef in_addr,
+                      LLVMValueRef dx, LLVMValueRef dy)
+{
+   static const unsigned colour[4]   = {
+      VP_RAST_ATTR_R, VP_RAST_ATTR_G, VP_RAST_ATTR_B, VP_RAST_ATTR_A };
+   static const unsigned texcoord[2] = {
+      VP_RAST_ATTR_U, VP_RAST_ATTR_V };
+
+   for (unsigned i = 0; i < t->nvars; i++) {
+      const nir_variable *var = t->vars[i].var;
+      if (!var || var->data.mode != nir_var_shader_in ||
+          t->vars[i].out_off < 0)
+         continue;
+      unsigned nc = glsl_get_components(var->type);
+      const unsigned *plane  = (nc <= 2) ? texcoord : colour;
+      unsigned        planes = (nc <= 2) ? 2u : 4u;
+      LLVMValueRef    slot   = addk(t, in_addr, (unsigned)t->vars[i].out_off);
+      for (unsigned c = 0; c < nc && c < planes; c++) {
+         LLVMValueRef f = emit_interp(t, addk(t, prim, plane[c]), dx, dy);
+         emit_store_i32(t, addk(t, slot, c * 4),
+                        LLVMBuildBitCast(t->b, f, t->i32, ""));
+      }
+   }
+}
+
 /* Build kernel_main: the rasterizer poll-loop wrapper that drives the
  * translated fragment body `fs_main`. arg block: [0]=primitive buffer,
  * [1]=colour buffer, [2]=colour-buffer row pitch (bytes). */
@@ -696,16 +821,9 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
       LLVMValueRef dx = LLVMBuildFMul(t->b, recip, f0, "dx");
       LLVMValueRef dy = LLVMBuildFMul(t->b, recip, f1, "dy");
 
-      /* interpolate the colour and hand it to the FS as input slot 0. */
-      LLVMValueRef cr = emit_interp(t, addk(t, prim, VP_RAST_ATTR_R), dx, dy);
-      LLVMValueRef cg = emit_interp(t, addk(t, prim, VP_RAST_ATTR_G), dx, dy);
-      LLVMValueRef cb = emit_interp(t, addk(t, prim, VP_RAST_ATTR_B), dx, dy);
-      emit_store_i32(t, in_addr,
-         LLVMBuildBitCast(t->b, cr, t->i32, ""));
-      emit_store_i32(t, addk(t, in_addr, 4),
-         LLVMBuildBitCast(t->b, cg, t->i32, ""));
-      emit_store_i32(t, addk(t, in_addr, 8),
-         LLVMBuildBitCast(t->b, cb, t->i32, ""));
+      /* interpolate the RASTER attribute planes into the FS input
+       * varyings (colour and/or texcoord, by declaration). */
+      emit_fs_fill_varyings(t, prim, in_addr, dx, dy);
 
       /* run the programmable fragment shader */
       LLVMValueRef cargs[2] = { in_scr, out_scr };

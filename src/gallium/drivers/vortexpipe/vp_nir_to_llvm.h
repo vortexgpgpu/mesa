@@ -25,9 +25,10 @@ struct nir_shader;
 #define VP_VS_MAX_VARYINGS 15
 
 struct vp_vs_layout {
-   unsigned stride;                         /* bytes per output vertex */
-   unsigned num_varyings;                   /* generic varyings (after POS) */
-   int      varying_loc[VP_VS_MAX_VARYINGS]; /* VARYING_SLOT_* per varying */
+   unsigned stride;                          /* bytes per output vertex */
+   unsigned num_varyings;                    /* generic varyings (after POS) */
+   int      varying_loc[VP_VS_MAX_VARYINGS];  /* VARYING_SLOT_* per varying */
+   unsigned varying_comps[VP_VS_MAX_VARYINGS];/* component count per varying */
 };
 
 /* Translate a NIR shader (compute or vertex) to LLVM IR. On success
