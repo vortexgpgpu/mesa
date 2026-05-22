@@ -13,7 +13,11 @@
  *
  * Paths come from VORTEX_HOME (the Vortex tree) and TOOLDIR (the
  * $HOME/tools install root) -- the meson-baked defaults below,
- * overridable by the VORTEX_HOME / VORTEX_TOOLDIR env vars.
+ * overridable by the VORTEX_HOME / VORTEX_TOOLDIR env vars. The
+ * Vortex out-of-tree build dir (where libvortex2.a is built) is
+ * VORTEX_HOME/build by convention; VORTEX_BUILD overrides it for
+ * trees configured under a differently named build dir (e.g. the
+ * CI build32/build64).
  */
 
 #define _GNU_SOURCE
@@ -79,6 +83,14 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
       return false;
    }
 
+   /* Build dir holding libvortex2.a -- VORTEX_HOME/build by default. */
+   char bd_buf[512];
+   const char *bd = getenv("VORTEX_BUILD");
+   if (!bd || !*bd) {
+      snprintf(bd_buf, sizeof bd_buf, "%s/build", vh);
+      bd = bd_buf;
+   }
+
    char dir[] = "/tmp/vortexpipe.XXXXXX";
    if (!mkdtemp(dir)) {
       mesa_logw("vortexpipe: mkdtemp failed");
@@ -106,11 +118,11 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
             "%s "
             "-Wl,-Bstatic,--gc-sections,-T,%s/sw/kernel/scripts/link32.ld,"
             "--defsym=STARTUP_ADDR=0x80000000 "
-            "%s/build/sw/kernel/libvortex2.a "
+            "%s/sw/kernel/libvortex2.a "
             "-L%s/libc32/lib -lm -lc "
             "%s/libcrt32/lib/baremetal/libclang_rt.builtins-riscv32.a "
             "-o %s 2>%s/clang.log",
-            td, p_ll, vh, vh, td, td, p_elf, dir) < 0) {
+            td, p_ll, vh, bd, td, td, p_elf, dir) < 0) {
          cmd = NULL;
          ok = false;
       }
