@@ -40,6 +40,7 @@ struct vp_cso {
    void  *lp_cso;          /* llvmpipe's shader-state object */
    void  *vxbin;           /* compiled Vortex kernel image, or NULL */
    size_t vxbin_size;
+   unsigned lmem_size;     /* compute: shared-memory bytes (nir shared_size) */
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
 };
 

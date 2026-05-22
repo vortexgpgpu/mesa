@@ -42,7 +42,8 @@ bool
 vp_launch(vx_device_h dev,
           const void *vxbin, size_t vxbin_size,
           void *ssbo_host, uint32_t ssbo_bytes,
-          const uint32_t grid[3], const uint32_t block[3])
+          const uint32_t grid[3], const uint32_t block[3],
+          uint32_t lmem_size)
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
@@ -98,7 +99,7 @@ vp_launch(vx_device_h dev,
       .kernel = kbuf, .args = abuf, .ndim = ndim,
       .grid_dim  = { grid[0],  grid[1],  grid[2]  },
       .block_dim = { block[0], block[1], block[2] },
-      .lmem_size = 0,
+      .lmem_size = lmem_size,
    };
    VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
 

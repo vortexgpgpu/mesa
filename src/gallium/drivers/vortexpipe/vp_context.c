@@ -113,6 +113,8 @@ vp_create_compute_state(struct pipe_context *pipe,
    /* Translate NIR -> LLVM IR -> Vortex .vxbin and retain it. */
    if (state->ir_type == PIPE_SHADER_IR_NIR) {
       char *ir = NULL;
+      /* shared-memory size -> the launch's local-memory allocation. */
+      cso->lmem_size = ((struct nir_shader *)state->prog)->info.shared_size;
       if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL)) {
          if (vp_compile_vxbin(ir, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
@@ -179,7 +181,8 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
                                       vp->cur_cso->vxbin,
                                       vp->cur_cso->vxbin_size,
                                       (void *)(uintptr_t)ssbo_host,
-                                      ssbo_bytes, info->grid, info->block);
+                                      ssbo_bytes, info->grid, info->block,
+                                      vp->cur_cso->lmem_size);
          }
       }
    }

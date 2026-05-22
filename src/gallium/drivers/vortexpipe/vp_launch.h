@@ -24,13 +24,16 @@ extern "C" {
  * The single shader-storage buffer's data is at ssbo_host[0,
  * ssbo_bytes): it is copied to device memory, the kernel runs over
  * grid x block, and the result is copied back into ssbo_host.
+ * `lmem_size` is the per-workgroup shared-memory allocation (0 if the
+ * kernel declares none).
  *
  * Returns true on success (add1/vecadd-class single-SSBO kernels).
  */
 bool vp_launch(vx_device_h dev,
                const void *vxbin, size_t vxbin_size,
                void *ssbo_host, uint32_t ssbo_bytes,
-               const uint32_t grid[3], const uint32_t block[3]);
+               const uint32_t grid[3], const uint32_t block[3],
+               uint32_t lmem_size);
 
 /* The vertex-buffer geometry feeding a VS kernel: a single interleaved
  * host vertex buffer plus the per-attribute layout. The VS kernel
