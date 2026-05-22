@@ -97,6 +97,16 @@ option(
 )
 
 option(
+  'vortex-runtime',
+  type : 'string',
+  value : '',
+  description : 'Path to the Vortex source tree (VORTEX_HOME). Required ' +
+                'by the vortexpipe gallium driver: headers are taken from ' +
+                '<path>/sw/runtime/include and libvortex-simx.so from ' +
+                '<path>/build/sw/runtime.',
+)
+
+option(
   'gallium-vdpau',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},
