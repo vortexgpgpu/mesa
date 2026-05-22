@@ -42,6 +42,25 @@ struct vp_cso {
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
 };
 
+/* Captured + VX-encoded output-merger state (Phase 5). create_*_state
+ * translates the Gallium depth/blend state to the Vortex OM encoding
+ * once and registers it (keyed by the llvmpipe cso, via vp_reg);
+ * create returns llvmpipe's cso unchanged so csos made before
+ * vortexpipe's hooks were armed (util_blitter's) pass straight
+ * through. Stencil is left disabled for gfx-v1. */
+struct vp_dsa_cso {
+   bool     depth_test;
+   bool     depth_write;
+   uint32_t depth_func;        /* VX_OM_DEPTH_FUNC_* */
+};
+
+struct vp_blend_cso {
+   bool     blend_enable;
+   uint32_t blend_mode;        /* VX_DCR_OM_BLEND_MODE packed word */
+   uint32_t blend_func;        /* VX_DCR_OM_BLEND_FUNC packed word */
+   uint32_t colormask;         /* VX_DCR_OM_CBUF_WRITEMASK (RGBA bits) */
+};
+
 /* Per-context vortexpipe state, keyed by the llvmpipe pipe_context *. */
 struct vp_context {
    vx_device_h dev;                       /* borrowed from vp_screen */
@@ -85,11 +104,23 @@ struct vp_context {
     * llvmpipe's rasterizer (see vp_draw_vbo). */
    void *passthrough_vs;
    void *velems;
-   /* Phase 4: the bound colour render target (set_framebuffer_state). */
+   /* Phase 4/5: the bound render targets (set_framebuffer_state). */
    void (*lp_set_framebuffer_state)(struct pipe_context *,
                                     const struct pipe_framebuffer_state *);
    struct pipe_resource *fb_color;
+   struct pipe_resource *fb_depth;       /* depth/stencil attachment, or NULL */
    unsigned              fb_width, fb_height;
+   /* Phase 5: output-merger state (depth-stencil-alpha + blend). */
+   struct vp_dsa_cso   *cur_dsa;
+   struct vp_blend_cso *cur_blend;
+   void *(*lp_create_dsa_state)(struct pipe_context *,
+                                const struct pipe_depth_stencil_alpha_state *);
+   void  (*lp_bind_dsa_state)(struct pipe_context *, void *);
+   void  (*lp_delete_dsa_state)(struct pipe_context *, void *);
+   void *(*lp_create_blend_state)(struct pipe_context *,
+                                  const struct pipe_blend_state *);
+   void  (*lp_bind_blend_state)(struct pipe_context *, void *);
+   void  (*lp_delete_blend_state)(struct pipe_context *, void *);
    void  (*lp_context_destroy)(struct pipe_context *);
 };
 

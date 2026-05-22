@@ -53,6 +53,7 @@
  * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v}, each a
  * rast_attrib_t {x,y,z} of fixed24. r/g/b are the colour planes. */
 #define VP_RAST_PRIM_STRIDE 120
+#define VP_RAST_ATTR_Z       36
 #define VP_RAST_ATTR_R       48
 #define VP_RAST_ATTR_G       60
 #define VP_RAST_ATTR_B       72
@@ -548,6 +549,26 @@ emit_vx_rast(struct vp_tr *t)
    return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, "rast");
 }
 
+/* vx_om: submit a fragment to the output-merger unit (custom-1,
+ * funct3=2, R4-type). pos_face = (y<<16)|(x<<1)|face; the OM does
+ * depth/stencil/blend and writes the colour + depth buffers. */
+static void
+emit_vx_om(struct vp_tr *t, LLVMValueRef pos_face,
+           LLVMValueRef color, LLVMValueRef depth)
+{
+   const char *s = ".insn r4 43, 2, 0, x0, $0, $1, $2";
+   LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                       args, 3, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,r,r", 5,
+                                      /*HasSideEffects*/ true,
+                                      /*IsAlignStack*/ false,
+                                      LLVMInlineAsmDialectATT,
+                                      /*CanThrow*/ false);
+   LLVMValueRef a[3] = { pos_face, color, depth };
+   LLVMBuildCall2(t->b, fnty, ia, a, 3, "");
+}
+
 /* reinterpret a raw fixed-point i32 as float: (float)raw / 2^frac */
 static LLVMValueRef
 emit_fixed_to_float(struct vp_tr *t, LLVMValueRef raw, unsigned frac)
@@ -611,11 +632,11 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
    LLVMBasicBlockRef body  = LLVMAppendBasicBlockInContext(t->ctx, fn, "body");
    LLVMBasicBlockRef exit  = LLVMAppendBasicBlockInContext(t->ctx, fn, "exit");
 
-   /* entry: read the arg block, allocate per-pixel scratch. */
+   /* entry: read the arg block, allocate per-pixel scratch. The
+    * colour/depth buffers are reached by the OM unit through its
+    * DCRs, so the kernel only needs the primitive buffer (arg[0]). */
    LLVMPositionBuilderAtEnd(t->b, entry);
-   LLVMValueRef prim_base  = emit_arg_i32(t, arg, 0);
-   LLVMValueRef cbuf_base  = emit_arg_i32(t, arg, 1);
-   LLVMValueRef cbuf_pitch = emit_arg_i32(t, arg, 2);
+   LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
    LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16),
                                           "fs_in");
    LLVMValueRef out_scr = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4),
@@ -700,18 +721,27 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
          rgba = LLVMBuildOr(t->b, rgba, bc, "");
       }
 
-      /* framebuffer write: cbuf_base + px*4 + py*pitch. */
+      /* interpolate the fragment depth (rast_attribs.z, [0,1]) and
+       * convert to the OM's 24-bit fixed-point depth. */
+      LLVMValueRef dz = emit_interp(t, addk(t, prim, VP_RAST_ATTR_Z),
+                                    dx, dy);
+      LLVMValueRef depth_i = LLVMBuildFPToUI(t->b,
+         LLVMBuildFMul(t->b, dz, LLVMConstReal(t->f32, 16777216.0), ""),
+         t->i32, "");
+
+      /* submit the fragment to the OM unit: it does depth/stencil/
+       * blend and writes the colour + depth buffers. pos_face packs
+       * (y<<16)|(x<<1)|face -- face 0 (front). */
       LLVMValueRef px_i = LLVMBuildAdd(t->b,
          LLVMBuildShl(t->b, qx, LLVMConstInt(t->i32, 1, false), ""),
          LLVMConstInt(t->i32, i & 1, false), "");
       LLVMValueRef py_i = LLVMBuildAdd(t->b,
          LLVMBuildShl(t->b, qy, LLVMConstInt(t->i32, 1, false), ""),
          LLVMConstInt(t->i32, i >> 1, false), "");
-      LLVMValueRef faddr = LLVMBuildAdd(t->b, cbuf_base,
-         LLVMBuildAdd(t->b,
-            LLVMBuildMul(t->b, px_i, LLVMConstInt(t->i32, 4, false), ""),
-            LLVMBuildMul(t->b, py_i, cbuf_pitch, ""), ""), "");
-      emit_store_i32(t, faddr, rgba);
+      LLVMValueRef pos_face = LLVMBuildOr(t->b,
+         LLVMBuildShl(t->b, py_i, LLVMConstInt(t->i32, 16, false), ""),
+         LLVMBuildShl(t->b, px_i, LLVMConstInt(t->i32, 1, false), ""), "");
+      emit_vx_om(t, pos_face, rgba, depth_i);
       LLVMBuildBr(t->b, nxt);
 
       LLVMPositionBuilderAtEnd(t->b, nxt);   /* fall through to next pixel */

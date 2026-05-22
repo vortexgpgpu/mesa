@@ -2,14 +2,14 @@
  * Copyright © 2026  Vortex GPGPU
  * SPDX-License-Identifier: MIT
  *
- * vp_raster -- Phase 4 Step 3: hardware-rasterizer draw orchestration.
+ * vp_raster -- Phase 4/5: hardware-rasterizer + output-merger draw
+ * orchestration.
  *
- * graphics::Binning() does the triangle setup + tile binning -- the
- * same host-side step the draw3d/raster regression tests use -- and
- * produces the tile + primitive buffers the RASTER unit consumes.
- * vp_raster_draw() uploads those, programs the RASTER DCRs, and
- * dispatches the fragment-shader kernel, which polls vx_rast() for
- * quads and writes the colour buffer.
+ * graphics::Binning() does triangle setup + tile binning; vp_raster_draw
+ * uploads the tile/primitive buffers, programs the RASTER and OM DCRs,
+ * and dispatches the fragment-shader kernel. The kernel polls vx_rast()
+ * for quads and submits shaded fragments to the OM unit via vx_om(),
+ * which depth-tests, blends and writes the colour + depth buffers.
  */
 
 #include "vp_raster.h"
@@ -21,15 +21,8 @@
 #include <unistd.h>
 
 #include "gfxutil.h"             /* graphics::Binning, cocogfx::CGLTrace */
+#include "VX_types.h"            /* VX_DCR_RASTER_*, VX_DCR_OM_*, VX_OM_* */
 #include "util/log.h"
-
-/* RASTER DCRs (VX_types.h). */
-#define VX_DCR_RASTER_TBUF_ADDR    0x040
-#define VX_DCR_RASTER_TILE_COUNT   0x041
-#define VX_DCR_RASTER_PBUF_ADDR    0x042
-#define VX_DCR_RASTER_PBUF_STRIDE  0x043
-#define VX_DCR_RASTER_SCISSOR_X    0x044
-#define VX_DCR_RASTER_SCISSOR_Y    0x045
 
 /* Tile size must match the hardware (VX_config.h RASTER_TILE_LOGSIZE). */
 #ifndef RASTER_TILE_LOGSIZE
@@ -49,12 +42,18 @@
       }                                                                 \
    } while (0)
 
+/* enqueue one DCR write, bailing to `done` on failure */
+#define DCR(addr, val)                                                  \
+   VP_CHECK(vx_enqueue_dcr_write(q, (addr), (uint32_t)(val), 0, NULL, NULL), \
+            #addr)
+
 extern "C" bool
 vp_raster_draw(vx_device_h dev,
                const void *fs_vxbin, size_t fs_vxbin_size,
                const void *xverts, uint32_t vertex_count,
                const struct vp_vs_layout *layout,
-               void *color, uint32_t width, uint32_t height)
+               void *color, uint32_t width, uint32_t height,
+               const struct vp_om_params *om)
 {
    /* ---- triangle setup + binning ---------------------------------- *
     * Convert the VS output records to CGLTrace vertices: slot 0 is the
@@ -86,11 +85,11 @@ vp_raster_draw(vx_device_h dev,
       return false;
    }
 
-   /* ---- dispatch on the RASTER unit ------------------------------- */
+   /* ---- dispatch on the RASTER + OM units ------------------------- */
    bool ok = false;
    vx_queue_h  q    = NULL;
    vx_buffer_h kbuf = NULL, tbuf = NULL, pbuf = NULL,
-               cbuf = NULL, abuf = NULL;
+               cbuf = NULL, zbuf = NULL, abuf = NULL;
    char vxpath[] = "/tmp/vortexpipe-fs.XXXXXX";
    int  vxfd = -1;
    const uint32_t cbuf_bytes = width * height * 4;
@@ -116,26 +115,35 @@ vp_raster_draw(vx_device_h dev,
       VP_CHECK(vx_buffer_load_kernel_file(dev, q, vxpath, &kbuf),
                "vx_buffer_load_kernel_file");
 
-      /* tile / primitive / colour device buffers */
+      /* tile / primitive / colour / depth device buffers */
       VP_CHECK(vx_buffer_create(dev, tilebuf.size(), 0, &tbuf),
                "vx_buffer_create(tiles)");
       VP_CHECK(vx_buffer_create(dev, primbuf.size(), 0, &pbuf),
                "vx_buffer_create(prims)");
       VP_CHECK(vx_buffer_create(dev, cbuf_bytes, 0, &cbuf),
                "vx_buffer_create(color)");
+      VP_CHECK(vx_buffer_create(dev, cbuf_bytes, 0, &zbuf),
+               "vx_buffer_create(depth)");
 
-      uint64_t tile_dev = 0, prim_dev = 0, color_dev = 0;
+      uint64_t tile_dev = 0, prim_dev = 0, color_dev = 0, depth_dev = 0;
       VP_CHECK(vx_buffer_address(tbuf, &tile_dev),  "vx_buffer_address(tiles)");
       VP_CHECK(vx_buffer_address(pbuf, &prim_dev),  "vx_buffer_address(prims)");
       VP_CHECK(vx_buffer_address(cbuf, &color_dev), "vx_buffer_address(color)");
+      VP_CHECK(vx_buffer_address(zbuf, &depth_dev), "vx_buffer_address(depth)");
 
-      /* arg block: [0]=prim buffer, [1]=colour buffer, [2]=row pitch */
+      /* the FS kernel only needs the primitive buffer; the OM reaches
+       * the colour/depth buffers through its DCRs. */
       uint64_t argblk[8] = { 0 };
       argblk[0] = prim_dev;
-      argblk[1] = color_dev;
-      argblk[2] = width * 4;
       VP_CHECK(vx_buffer_create(dev, sizeof(argblk), 0, &abuf),
                "vx_buffer_create(args)");
+
+      /* clear the depth buffer to the far value (GREATER/GEQUAL clear
+       * to 0, every other compare to max). */
+      uint8_t zfill = (om->depth_func == VX_OM_DEPTH_FUNC_GREATER ||
+                       om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL)
+                         ? 0x00 : 0xFF;
+      std::vector<uint8_t> zclear(cbuf_bytes, zfill);
 
       /* upload everything (the colour buffer carries the cleared image) */
       VP_CHECK(vx_enqueue_write(q, tbuf, 0, tilebuf.data(), tilebuf.size(),
@@ -144,28 +152,41 @@ vp_raster_draw(vx_device_h dev,
                                 0, NULL, NULL), "vx_enqueue_write(prims)");
       VP_CHECK(vx_enqueue_write(q, cbuf, 0, color, cbuf_bytes,
                                 0, NULL, NULL), "vx_enqueue_write(color)");
+      VP_CHECK(vx_enqueue_write(q, zbuf, 0, zclear.data(), cbuf_bytes,
+                                0, NULL, NULL), "vx_enqueue_write(depth)");
       VP_CHECK(vx_enqueue_write(q, abuf, 0, argblk, sizeof(argblk),
                                 0, NULL, NULL), "vx_enqueue_write(args)");
 
-      /* program the RASTER DCRs (addresses are 64-byte block indices) */
-      VP_CHECK(vx_enqueue_dcr_write(q, VX_DCR_RASTER_TBUF_ADDR,
-                                    (uint32_t)(tile_dev / 64), 0, NULL, NULL),
-               "dcr(TBUF_ADDR)");
-      VP_CHECK(vx_enqueue_dcr_write(q, VX_DCR_RASTER_TILE_COUNT,
-                                    num_tiles, 0, NULL, NULL),
-               "dcr(TILE_COUNT)");
-      VP_CHECK(vx_enqueue_dcr_write(q, VX_DCR_RASTER_PBUF_ADDR,
-                                    (uint32_t)(prim_dev / 64), 0, NULL, NULL),
-               "dcr(PBUF_ADDR)");
-      VP_CHECK(vx_enqueue_dcr_write(q, VX_DCR_RASTER_PBUF_STRIDE,
-                                    VP_RAST_PRIM_STRIDE, 0, NULL, NULL),
-               "dcr(PBUF_STRIDE)");
-      VP_CHECK(vx_enqueue_dcr_write(q, VX_DCR_RASTER_SCISSOR_X,
-                                    (width << 16) | 0, 0, NULL, NULL),
-               "dcr(SCISSOR_X)");
-      VP_CHECK(vx_enqueue_dcr_write(q, VX_DCR_RASTER_SCISSOR_Y,
-                                    (height << 16) | 0, 0, NULL, NULL),
-               "dcr(SCISSOR_Y)");
+      /* RASTER DCRs (addresses are 64-byte block indices) */
+      DCR(VX_DCR_RASTER_TBUF_ADDR,   tile_dev / 64);
+      DCR(VX_DCR_RASTER_TILE_COUNT,  num_tiles);
+      DCR(VX_DCR_RASTER_PBUF_ADDR,   prim_dev / 64);
+      DCR(VX_DCR_RASTER_PBUF_STRIDE, VP_RAST_PRIM_STRIDE);
+      DCR(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
+      DCR(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
+
+      /* OM DCRs: colour + depth buffers, depth test, blend. Stencil is
+       * disabled for gfx-v1 (ALWAYS / KEEP). */
+      DCR(VX_DCR_OM_CBUF_ADDR,        color_dev / 64);
+      DCR(VX_DCR_OM_CBUF_PITCH,       width * 4);
+      DCR(VX_DCR_OM_CBUF_WRITEMASK,   om->colormask);
+      DCR(VX_DCR_OM_ZBUF_ADDR,        depth_dev / 64);
+      DCR(VX_DCR_OM_ZBUF_PITCH,       width * 4);
+      DCR(VX_DCR_OM_DEPTH_FUNC,
+          om->depth_test ? om->depth_func : VX_OM_DEPTH_FUNC_ALWAYS);
+      DCR(VX_DCR_OM_DEPTH_WRITEMASK,
+          (om->depth_test && om->depth_write) ? 1u : 0u);
+      DCR(VX_DCR_OM_STENCIL_FUNC,      VX_OM_DEPTH_FUNC_ALWAYS);
+      DCR(VX_DCR_OM_STENCIL_ZPASS,     VX_OM_STENCIL_OP_KEEP);
+      DCR(VX_DCR_OM_STENCIL_ZFAIL,     VX_OM_STENCIL_OP_KEEP);
+      DCR(VX_DCR_OM_STENCIL_FAIL,      VX_OM_STENCIL_OP_KEEP);
+      DCR(VX_DCR_OM_STENCIL_REF,       0);
+      DCR(VX_DCR_OM_STENCIL_MASK,      0xFF);
+      DCR(VX_DCR_OM_STENCIL_WRITEMASK, 0);
+      DCR(VX_DCR_OM_BLEND_MODE,        om->blend_mode);
+      DCR(VX_DCR_OM_BLEND_FUNC,        om->blend_func);
+      DCR(VX_DCR_OM_BLEND_CONST,       0);
+      DCR(VX_DCR_OM_LOGIC_OP,          0);
 
       /* dispatch the fragment-shader kernel; threads poll vx_rast() */
       vx_launch_info_t li = {
@@ -182,6 +203,7 @@ vp_raster_draw(vx_device_h dev,
 
 done:
    if (abuf) vx_buffer_release(abuf);
+   if (zbuf) vx_buffer_release(zbuf);
    if (cbuf) vx_buffer_release(cbuf);
    if (pbuf) vx_buffer_release(pbuf);
    if (tbuf) vx_buffer_release(tbuf);

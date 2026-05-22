@@ -26,6 +26,7 @@
 
 #include "pipe/p_state.h"     /* full struct pipe_compute_state */
 #include "util/format/u_formats.h"  /* PIPE_FORMAT_* */
+#include "util/blend.h"             /* PIPE_BLENDFACTOR_*, PIPE_BLEND_* */
 #include "util/hash_table.h"
 #include "util/simple_mtx.h"
 #include "util/u_memory.h"
@@ -327,8 +328,9 @@ vp_delete_fs_state(struct pipe_context *pipe, void *p)
 
 /* ---- graphics: framebuffer interception (Phase 4) ------------------ */
 
-/* Capture colour attachment 0 so the Vortex raster path can round-trip
- * it; everything else stays with llvmpipe. */
+/* Capture colour attachment 0 and the depth/stencil attachment so the
+ * Vortex raster path can round-trip them; everything else stays with
+ * llvmpipe. */
 static void
 vp_set_framebuffer_state(struct pipe_context *pipe,
                          const struct pipe_framebuffer_state *fb)
@@ -336,49 +338,251 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
    struct vp_context *vp = vp_reg_get(pipe);
    vp->fb_color  = (fb && fb->nr_cbufs > 0 && fb->cbufs[0])
                       ? fb->cbufs[0]->texture : NULL;
+   vp->fb_depth  = (fb && fb->zsbuf) ? fb->zsbuf->texture : NULL;
    vp->fb_width  = fb ? fb->width  : 0;
    vp->fb_height = fb ? fb->height : 0;
    vp->lp_set_framebuffer_state(pipe, fb);
 }
 
-/* Copy colour attachment 0 into a tight w*h R8G8B8A8 host buffer. The
- * Vortex fragment kernel renders into a linear buffer, so the draw
- * path round-trips: read the (llvmpipe-cleared) attachment, run the
- * raster path, write the result back with vp_fb_color_write. */
+/* Copy a render-target attachment between a tight w*h 32-bpp host
+ * buffer and the (tiled) Gallium resource. The Vortex raster path
+ * round-trips colour + depth this way: read the llvmpipe-cleared
+ * attachment, run the raster/OM path, write the result back. */
+static bool
+vp_resource_rw(struct pipe_context *pipe, struct pipe_resource *res,
+               unsigned w, unsigned h, void *host, bool write)
+{
+   if (!res)
+      return false;
+   struct pipe_transfer *xfer = NULL;
+   uint8_t *map = pipe_texture_map(pipe, res, 0, 0,
+                                   write ? PIPE_MAP_WRITE : PIPE_MAP_READ,
+                                   0, 0, w, h, &xfer);
+   if (!map)
+      return false;
+   for (unsigned y = 0; y < h; y++) {
+      uint8_t *m = map + (size_t)y * xfer->stride;
+      uint8_t *t = (uint8_t *)host + (size_t)y * w * 4;
+      if (write)
+         memcpy(m, t, (size_t)w * 4);
+      else
+         memcpy(t, m, (size_t)w * 4);
+   }
+   pipe_texture_unmap(pipe, xfer);
+   return true;
+}
+
 static bool
 vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
 {
-   if (!vp->fb_color)
-      return false;
-   struct pipe_transfer *xfer = NULL;
-   uint8_t *map = pipe_texture_map(pipe, vp->fb_color, 0, 0, PIPE_MAP_READ,
-                                   0, 0, vp->fb_width, vp->fb_height, &xfer);
-   if (!map)
-      return false;
-   for (unsigned y = 0; y < vp->fb_height; y++)
-      memcpy((uint8_t *)dst + (size_t)y * vp->fb_width * 4,
-             map + (size_t)y * xfer->stride, (size_t)vp->fb_width * 4);
-   pipe_texture_unmap(pipe, xfer);
-   return true;
+   return vp_resource_rw(pipe, vp->fb_color, vp->fb_width, vp->fb_height,
+                         dst, false);
 }
 
 static bool
 vp_fb_color_write(struct pipe_context *pipe, struct vp_context *vp,
                   const void *src)
 {
-   if (!vp->fb_color)
-      return false;
-   struct pipe_transfer *xfer = NULL;
-   uint8_t *map = pipe_texture_map(pipe, vp->fb_color, 0, 0, PIPE_MAP_WRITE,
-                                   0, 0, vp->fb_width, vp->fb_height, &xfer);
-   if (!map)
-      return false;
-   for (unsigned y = 0; y < vp->fb_height; y++)
-      memcpy(map + (size_t)y * xfer->stride,
-             (const uint8_t *)src + (size_t)y * vp->fb_width * 4,
-             (size_t)vp->fb_width * 4);
-   pipe_texture_unmap(pipe, xfer);
-   return true;
+   return vp_resource_rw(pipe, vp->fb_color, vp->fb_width, vp->fb_height,
+                         (void *)src, true);
+}
+
+static bool
+vp_fb_depth_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
+{
+   return vp_resource_rw(pipe, vp->fb_depth, vp->fb_width, vp->fb_height,
+                         dst, false);
+}
+
+static bool
+vp_fb_depth_write(struct pipe_context *pipe, struct vp_context *vp,
+                  const void *src)
+{
+   return vp_resource_rw(pipe, vp->fb_depth, vp->fb_width, vp->fb_height,
+                         (void *)src, true);
+}
+
+/* ---- graphics: output-merger state (Phase 5) ----------------------- */
+
+/* VX OM encodings (VX_types.h) -- depth-compare function and blend. */
+#define VX_OM_DEPTH_FUNC_ALWAYS              0
+#define VX_OM_DEPTH_FUNC_NEVER               1
+#define VX_OM_DEPTH_FUNC_LESS                2
+#define VX_OM_DEPTH_FUNC_LEQUAL              3
+#define VX_OM_DEPTH_FUNC_EQUAL               4
+#define VX_OM_DEPTH_FUNC_GEQUAL              5
+#define VX_OM_DEPTH_FUNC_GREATER             6
+#define VX_OM_DEPTH_FUNC_NOTEQUAL            7
+#define VX_OM_BLEND_MODE_ADD                 0
+#define VX_OM_BLEND_MODE_SUB                 1
+#define VX_OM_BLEND_MODE_REV_SUB             2
+#define VX_OM_BLEND_MODE_MIN                 3
+#define VX_OM_BLEND_MODE_MAX                 4
+#define VX_OM_BLEND_FUNC_ZERO                0
+#define VX_OM_BLEND_FUNC_ONE                 1
+#define VX_OM_BLEND_FUNC_SRC_RGB             2
+#define VX_OM_BLEND_FUNC_ONE_MINUS_SRC_RGB   3
+#define VX_OM_BLEND_FUNC_DST_RGB             4
+#define VX_OM_BLEND_FUNC_ONE_MINUS_DST_RGB   5
+#define VX_OM_BLEND_FUNC_SRC_A               6
+#define VX_OM_BLEND_FUNC_ONE_MINUS_SRC_A     7
+#define VX_OM_BLEND_FUNC_DST_A               8
+#define VX_OM_BLEND_FUNC_ONE_MINUS_DST_A     9
+#define VX_OM_BLEND_FUNC_CONST_RGB           10
+#define VX_OM_BLEND_FUNC_ONE_MINUS_CONST_RGB 11
+
+static uint32_t
+vp_vx_depth_func(unsigned pf)
+{
+   switch (pf) {
+   case PIPE_FUNC_NEVER:    return VX_OM_DEPTH_FUNC_NEVER;
+   case PIPE_FUNC_LESS:     return VX_OM_DEPTH_FUNC_LESS;
+   case PIPE_FUNC_EQUAL:    return VX_OM_DEPTH_FUNC_EQUAL;
+   case PIPE_FUNC_LEQUAL:   return VX_OM_DEPTH_FUNC_LEQUAL;
+   case PIPE_FUNC_GREATER:  return VX_OM_DEPTH_FUNC_GREATER;
+   case PIPE_FUNC_NOTEQUAL: return VX_OM_DEPTH_FUNC_NOTEQUAL;
+   case PIPE_FUNC_GEQUAL:   return VX_OM_DEPTH_FUNC_GEQUAL;
+   default:                 return VX_OM_DEPTH_FUNC_ALWAYS;
+   }
+}
+
+static uint32_t
+vp_vx_blend_factor(unsigned bf)
+{
+   switch (bf) {
+   case PIPE_BLENDFACTOR_ZERO:            return VX_OM_BLEND_FUNC_ZERO;
+   case PIPE_BLENDFACTOR_ONE:             return VX_OM_BLEND_FUNC_ONE;
+   case PIPE_BLENDFACTOR_SRC_COLOR:       return VX_OM_BLEND_FUNC_SRC_RGB;
+   case PIPE_BLENDFACTOR_INV_SRC_COLOR:   return VX_OM_BLEND_FUNC_ONE_MINUS_SRC_RGB;
+   case PIPE_BLENDFACTOR_DST_COLOR:       return VX_OM_BLEND_FUNC_DST_RGB;
+   case PIPE_BLENDFACTOR_INV_DST_COLOR:   return VX_OM_BLEND_FUNC_ONE_MINUS_DST_RGB;
+   case PIPE_BLENDFACTOR_SRC_ALPHA:       return VX_OM_BLEND_FUNC_SRC_A;
+   case PIPE_BLENDFACTOR_INV_SRC_ALPHA:   return VX_OM_BLEND_FUNC_ONE_MINUS_SRC_A;
+   case PIPE_BLENDFACTOR_DST_ALPHA:       return VX_OM_BLEND_FUNC_DST_A;
+   case PIPE_BLENDFACTOR_INV_DST_ALPHA:   return VX_OM_BLEND_FUNC_ONE_MINUS_DST_A;
+   case PIPE_BLENDFACTOR_CONST_COLOR:     return VX_OM_BLEND_FUNC_CONST_RGB;
+   case PIPE_BLENDFACTOR_INV_CONST_COLOR: return VX_OM_BLEND_FUNC_ONE_MINUS_CONST_RGB;
+   default:                               return VX_OM_BLEND_FUNC_ONE;
+   }
+}
+
+static uint32_t
+vp_vx_blend_mode(unsigned bm)
+{
+   switch (bm) {
+   case PIPE_BLEND_SUBTRACT:         return VX_OM_BLEND_MODE_SUB;
+   case PIPE_BLEND_REVERSE_SUBTRACT: return VX_OM_BLEND_MODE_REV_SUB;
+   case PIPE_BLEND_MIN:              return VX_OM_BLEND_MODE_MIN;
+   case PIPE_BLEND_MAX:              return VX_OM_BLEND_MODE_MAX;
+   default:                          return VX_OM_BLEND_MODE_ADD;
+   }
+}
+
+/* depth-stencil-alpha state: capture depth test / func / writemask
+ * into a vp_dsa_cso registered under the llvmpipe cso. Stencil + the
+ * alpha test are gfx-v1 deferred (left disabled). create returns
+ * llvmpipe's cso so blitter csos made before our hooks pass through. */
+static void *
+vp_create_dsa_state(struct pipe_context *pipe,
+                    const struct pipe_depth_stencil_alpha_state *s)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   void *lp_cso = vp->lp_create_dsa_state(pipe, s);
+
+   struct vp_dsa_cso *cso = CALLOC_STRUCT(vp_dsa_cso);
+   if (cso) {
+      cso->depth_test  = s->depth_enabled;
+      cso->depth_write = s->depth_writemask;
+      cso->depth_func  = vp_vx_depth_func(s->depth_func);
+      vp_reg_put(lp_cso, cso);
+   }
+   return lp_cso;
+}
+
+static void
+vp_bind_dsa_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->cur_dsa = p ? vp_reg_get(p) : NULL;   /* NULL for blitter csos */
+   vp->lp_bind_dsa_state(pipe, p);
+   if (vp->cur_dsa)
+      vp_dbg("vortexpipe: OM depth test=%d func=%u write=%d",
+             vp->cur_dsa->depth_test, vp->cur_dsa->depth_func,
+             vp->cur_dsa->depth_write);
+}
+
+static void
+vp_delete_dsa_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context *vp  = vp_reg_get(pipe);
+   struct vp_dsa_cso *cso = p ? vp_reg_get(p) : NULL;
+   if (cso) {
+      if (vp->cur_dsa == cso)
+         vp->cur_dsa = NULL;
+      vp_reg_del(p);
+      FREE(cso);
+   }
+   vp->lp_delete_dsa_state(pipe, p);
+}
+
+/* blend state: capture render-target 0's blend equation / factors and
+ * the colour write mask, translated to the packed OM DCR words. */
+static void *
+vp_create_blend_state(struct pipe_context *pipe,
+                      const struct pipe_blend_state *s)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   void *lp_cso = vp->lp_create_blend_state(pipe, s);
+
+   struct vp_blend_cso *cso = CALLOC_STRUCT(vp_blend_cso);
+   if (cso) {
+      const struct pipe_rt_blend_state *rt = &s->rt[0];
+      cso->blend_enable = rt->blend_enable;
+      cso->colormask    = rt->colormask;
+      if (rt->blend_enable) {
+         uint32_t m = vp_vx_blend_mode(rt->rgb_func);
+         cso->blend_mode = (m << 16) | (m << 0);
+         cso->blend_func =
+            (vp_vx_blend_factor(rt->alpha_dst_factor) << 24) |
+            (vp_vx_blend_factor(rt->rgb_dst_factor)   << 16) |
+            (vp_vx_blend_factor(rt->alpha_src_factor) << 8)  |
+            (vp_vx_blend_factor(rt->rgb_src_factor)   << 0);
+      } else {
+         /* passthrough: dst = src*ONE + dst*ZERO */
+         cso->blend_mode = (VX_OM_BLEND_MODE_ADD << 16) | VX_OM_BLEND_MODE_ADD;
+         cso->blend_func =
+            (VX_OM_BLEND_FUNC_ZERO << 24) | (VX_OM_BLEND_FUNC_ZERO << 16) |
+            (VX_OM_BLEND_FUNC_ONE  << 8)  | (VX_OM_BLEND_FUNC_ONE  << 0);
+      }
+      vp_reg_put(lp_cso, cso);
+   }
+   return lp_cso;
+}
+
+static void
+vp_bind_blend_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->cur_blend = p ? vp_reg_get(p) : NULL;   /* NULL for blitter csos */
+   vp->lp_bind_blend_state(pipe, p);
+   if (vp->cur_blend)
+      vp_dbg("vortexpipe: OM blend enable=%d mode=%#x func=%#x mask=%#x",
+             vp->cur_blend->blend_enable, vp->cur_blend->blend_mode,
+             vp->cur_blend->blend_func, vp->cur_blend->colormask);
+}
+
+static void
+vp_delete_blend_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context   *vp  = vp_reg_get(pipe);
+   struct vp_blend_cso *cso = p ? vp_reg_get(p) : NULL;
+   if (cso) {
+      if (vp->cur_blend == cso)
+         vp->cur_blend = NULL;
+      vp_reg_del(p);
+      FREE(cso);
+   }
+   vp->lp_delete_blend_state(pipe, p);
 }
 
 /* A passthrough vertex shader: copies N input attributes straight to
@@ -508,18 +712,44 @@ vp_draw_vbo(struct pipe_context *pipe,
          if (sw_raster < 0)
             sw_raster = getenv("VORTEXPIPE_SW_RASTER") != NULL;
 
-         /* Vortex hardware raster path: round-trip the colour
-          * attachment through the RASTER unit + fragment kernel. */
+         /* Vortex hardware raster + OM path: round-trip the colour
+          * attachment through the RASTER unit + fragment kernel; the
+          * OM unit depth-tests and blends. */
          if (!sw_raster && fs && fs->vxbin &&
              vp->fb_color && vp->fb_width && vp->fb_height) {
             uint32_t w = vp->fb_width, h = vp->fb_height;
+
+            /* gather the OM state from the bound depth/blend csos */
+            struct vp_om_params om = { 0 };
+            if (vp->cur_dsa) {
+               om.depth_test  = vp->cur_dsa->depth_test;
+               om.depth_func  = vp->cur_dsa->depth_func;
+               om.depth_write = vp->cur_dsa->depth_write;
+            }
+            if (vp->cur_blend) {
+               om.blend_mode = vp->cur_blend->blend_mode;
+               om.blend_func = vp->cur_blend->blend_func;
+               om.colormask  = vp->cur_blend->colormask;
+            } else {
+               /* no blend cso bound: passthrough (src*ONE + dst*ZERO) */
+               om.blend_mode = (VX_OM_BLEND_MODE_ADD << 16)
+                             | VX_OM_BLEND_MODE_ADD;
+               om.blend_func = (VX_OM_BLEND_FUNC_ZERO << 24)
+                             | (VX_OM_BLEND_FUNC_ZERO << 16)
+                             | (VX_OM_BLEND_FUNC_ONE  << 8)
+                             | (VX_OM_BLEND_FUNC_ONE  << 0);
+               om.colormask  = 0xf;
+            }
+
             void *cbuf = malloc((size_t)w * h * 4);
             if (cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
                 vp_raster_draw(vp->dev, fs->vxbin, fs->vxbin_size,
-                               xverts, count, &vs->vs_layout, cbuf, w, h) &&
+                               xverts, count, &vs->vs_layout,
+                               cbuf, w, h, &om) &&
                 vp_fb_color_write(pipe, vp, cbuf)) {
-               vp_dbg("vortexpipe: draw_vbo -> Vortex RASTER unit "
-                      "(%u verts, %ux%u)", count, w, h);
+               vp_dbg("vortexpipe: draw_vbo -> Vortex RASTER+OM "
+                      "(%u verts, %ux%u, depth_test=%d)",
+                      count, w, h, om.depth_test);
                free(cbuf);
                free(xverts);
                return;
@@ -549,15 +779,19 @@ vp_context_destroy(struct pipe_context *pipe)
    struct vp_context *vp = vp_reg_get(pipe);
    void (*lp_destroy)(struct pipe_context *) = vp->lp_context_destroy;
 
-   /* release the cached Phase 3 draw-integration objects */
+   /* release the cached Phase 3 draw-integration objects (need a
+    * live pipe) */
    if (vp->passthrough_vs)
       vp->lp_delete_vs_state(pipe, vp->passthrough_vs);
    if (vp->velems)
       pipe->delete_vertex_elements_state(pipe, vp->velems);
 
+   /* llvmpipe_destroy tears down util_blitter, which calls back into
+    * our delete_*_state hooks -- and those need `vp`. So destroy the
+    * llvmpipe context first, then drop vortexpipe's own state. */
+   lp_destroy(pipe);
    vp_reg_del(pipe);
    FREE(vp);
-   lp_destroy(pipe);
 }
 
 /* ---- context creation ----------------------------------------------- */
@@ -589,6 +823,12 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_bind_fs_state        = pipe->bind_fs_state;
    vp->lp_delete_fs_state      = pipe->delete_fs_state;
    vp->lp_set_framebuffer_state = pipe->set_framebuffer_state;
+   vp->lp_create_dsa_state     = pipe->create_depth_stencil_alpha_state;
+   vp->lp_bind_dsa_state       = pipe->bind_depth_stencil_alpha_state;
+   vp->lp_delete_dsa_state     = pipe->delete_depth_stencil_alpha_state;
+   vp->lp_create_blend_state   = pipe->create_blend_state;
+   vp->lp_bind_blend_state     = pipe->bind_blend_state;
+   vp->lp_delete_blend_state   = pipe->delete_blend_state;
    vp->lp_context_destroy      = pipe->destroy;
    vp_reg_put(pipe, vp);
 
@@ -606,6 +846,12 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->bind_fs_state        = vp_bind_fs_state;
    pipe->delete_fs_state      = vp_delete_fs_state;
    pipe->set_framebuffer_state = vp_set_framebuffer_state;
+   pipe->create_depth_stencil_alpha_state = vp_create_dsa_state;
+   pipe->bind_depth_stencil_alpha_state   = vp_bind_dsa_state;
+   pipe->delete_depth_stencil_alpha_state = vp_delete_dsa_state;
+   pipe->create_blend_state   = vp_create_blend_state;
+   pipe->bind_blend_state     = vp_bind_blend_state;
+   pipe->delete_blend_state   = vp_delete_blend_state;
    pipe->destroy              = vp_context_destroy;
 
    vp_dbg("vortexpipe: context created -- compute hooks intercepted");
