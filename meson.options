@@ -107,6 +107,16 @@ option(
 )
 
 option(
+  'vortex-tooldir',
+  type : 'string',
+  value : '',
+  description : 'Path to the Vortex toolchain install root (TOOLDIR, ' +
+                'usually $HOME/tools). vortexpipe uses it to find ' +
+                'llvm-vortex, libc32 and libcrt32 when compiling shader ' +
+                'kernels to .vxbin.',
+)
+
+option(
   'gallium-vdpau',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},

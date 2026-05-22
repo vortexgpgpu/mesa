@@ -20,7 +20,15 @@ dep_vortex_rt = cc.find_library(
 
 files_vortexpipe = files(
   'vp_public.h',
+  'vp_private.h',
   'vp_screen.c',
+  'vp_context.c',
+  'vp_nir_to_llvm.h',
+  'vp_nir_to_llvm.c',
+  'vp_compile.h',
+  'vp_compile.c',
+  'vp_launch.h',
+  'vp_launch.c',
 )
 
 libvortexpipe = static_library(
@@ -37,9 +45,13 @@ libvortexpipe = static_library(
     '-I' + join_paths(vortex_home, 'sw/runtime/include'),
     # generated VX_config.h (produced by the Vortex out-of-tree build)
     '-I' + join_paths(vortex_home, 'build/sw'),
+    # baked-in toolchain paths for vp_compile.c (.vxbin generation)
+    '-DVP_VORTEX_HOME="' + vortex_home + '"',
+    '-DVP_TOOLDIR="' + get_option('vortex-tooldir') + '"',
   ],
   gnu_symbol_visibility : 'hidden',
-  dependencies : [idep_nir, idep_mesautil],
+  # dep_llvm: vp_nir_to_llvm.c emits IR via the LLVM C API.
+  dependencies : [idep_nir, idep_mesautil, dep_llvm],
 )
 
 driver_vortexpipe = declare_dependency(
