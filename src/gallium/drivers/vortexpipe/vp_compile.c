@@ -107,12 +107,24 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
 
    /* compile + link the IR into a Vortex KMU kernel ELF */
    if (ok) {
+      /* Device flags mirror the canonical Vortex kernel toolchain
+       * invocation in tests/regression/common.mk: the llvm-vortex
+       * clang with +xvortex (the Vortex ISA extension) and +zicond,
+       * --sysroot / --gcc-toolchain pointing at the riscv32 GNU
+       * toolchain, and -disable-loop-idiom-all. The Vortex
+       * branch-divergence pass is part of the +xvortex backend and is
+       * left at its default (enabled): it is what lowers divergent
+       * SIMT control flow into correct masked execution, so we must
+       * never pass -mllvm -vortex-branch-divergence=0. */
       if (asprintf(&cmd,
             "%s/llvm-vortex/bin/clang --target=riscv32-unknown-elf "
+            "--sysroot=%s/riscv32-gnu-toolchain/riscv32-unknown-elf "
+            "--gcc-toolchain=%s/riscv32-gnu-toolchain "
             "-march=rv32imaf -mabi=ilp32f "
             "-Xclang -target-feature -Xclang +xvortex "
             "-Xclang -target-feature -Xclang +zicond "
-            "-mllvm -disable-loop-idiom-all -Wno-override-module "
+            "-mllvm -disable-loop-idiom-all "
+            "-Wno-unused-command-line-argument -Wno-override-module "
             "-O3 -mcmodel=medany -nostartfiles -nostdlib "
             "-fdata-sections -ffunction-sections -fuse-ld=lld "
             "%s "
@@ -122,7 +134,7 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
             "-L%s/libc32/lib -lm -lc "
             "%s/libcrt32/lib/baremetal/libclang_rt.builtins-riscv32.a "
             "-o %s 2>%s/clang.log",
-            td, p_ll, vh, bd, td, td, p_elf, dir) < 0) {
+            td, td, td, p_ll, vh, bd, td, td, p_elf, dir) < 0) {
          cmd = NULL;
          ok = false;
       }

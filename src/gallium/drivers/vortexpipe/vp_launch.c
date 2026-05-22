@@ -38,16 +38,127 @@
       }                                                                 \
    } while (0)
 
+/* A buffer descriptor's lp_jit_buffer occupies the first bytes of its
+ * struct lp_descriptor slot: the data pointer at +0 (8 bytes), the
+ * byte size at +8 (4 bytes). VP_DESC_STRIDE lives in vp_launch.h. */
+#define VP_JIT_BUF_PTR   0
+#define VP_JIT_BUF_SIZE  8
+
+/* ---- acceleration-structure (BVH) device copy (Phase 7.6) --------- *
+ *
+ * lavapipe builds the BVH on the CPU; the Vortex traversal kernel
+ * walks it, so it must be copied into Vortex device memory. Layout
+ * constants mirror struct lvp_bvh_header / lvp_bvh_instance_node in
+ * src/gallium/frontends/lavapipe/lvp_acceleration_structure.h:
+ *
+ *   lvp_bvh_header { vk_aabb bounds;          // 24 B
+ *                    uint32 serialization_size, instance_count,
+ *                           leaf_nodes_offset, padding; }
+ *
+ * A box node's two children are BVH-relative uint32 offsets, so they
+ * survive the copy unchanged. Only an instance node's bvh_ptr is an
+ * absolute pointer (TLAS -> BLAS) and is relocated to the device copy.
+ * serialization_size folds in a fixed serialization header plus eight
+ * bytes per instance, so the buffer size is recoverable from it. */
+#define VP_BVH_SERIALIZATION_SIZE  24   /* uint32, after vk_aabb bounds */
+#define VP_BVH_INSTANCE_COUNT      28   /* uint32 */
+#define VP_BVH_LEAF_NODES_OFFSET   32   /* uint32 */
+#define VP_BVH_INSTANCE_NODE_SIZE  120  /* sizeof(struct lvp_bvh_instance_node) */
+#define VP_ACCEL_SERIALIZATION_HDR 56   /* sizeof(lvp_accel_struct_serialization_header) */
+#define VP_BVH_MAX_BYTES           (16u << 20)
+#define VP_MAX_BVH                 64
+
+/* Device buffers + host staging blobs created while copying one
+ * acceleration structure's BVHs; both must outlive vx_queue_finish. */
+struct vp_as_ctx {
+   vx_device_h dev;
+   vx_queue_h  q;
+   vx_buffer_h bufs[VP_MAX_BVH];
+   unsigned    n_bufs;
+   void       *stages[VP_MAX_BVH];
+   unsigned    n_stages;
+   bool        ok;
+};
+
+/* Copy one lavapipe BVH (TLAS or BLAS) into Vortex device memory and
+ * return its device address. A TLAS's instance nodes carry absolute
+ * bvh_ptr links to their BLASes; those are copied recursively and the
+ * link rewritten to the device address. Box-node children are
+ * BVH-relative and need no fixup. */
+static uint64_t
+vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
+{
+   const uint8_t *h = bvh_host;
+   uint32_t ser = 0, inst = 0, leaf_off = 0;
+   memcpy(&ser,      h + VP_BVH_SERIALIZATION_SIZE, sizeof ser);
+   memcpy(&inst,     h + VP_BVH_INSTANCE_COUNT,     sizeof inst);
+   memcpy(&leaf_off, h + VP_BVH_LEAF_NODES_OFFSET,  sizeof leaf_off);
+
+   if (ser <= VP_ACCEL_SERIALIZATION_HDR + 8u * inst) {
+      mesa_logw("vortexpipe: launch: implausible BVH header");
+      c->ok = false;
+      return 0;
+   }
+   uint32_t size = ser - VP_ACCEL_SERIALIZATION_HDR - 8u * inst;
+   if (size == 0 || size > VP_BVH_MAX_BYTES ||
+       c->n_stages >= VP_MAX_BVH || c->n_bufs >= VP_MAX_BVH) {
+      mesa_logw("vortexpipe: launch: BVH too large / too many BVHs");
+      c->ok = false;
+      return 0;
+   }
+
+   /* private copy so instance-node bvh_ptr fields can be relocated */
+   uint8_t *stage = malloc(size);
+   if (!stage) {
+      c->ok = false;
+      return 0;
+   }
+   memcpy(stage, bvh_host, size);
+   c->stages[c->n_stages++] = stage;
+
+   for (uint32_t i = 0; i < inst; i++) {
+      uint8_t  *node = stage + leaf_off + (size_t)i * VP_BVH_INSTANCE_NODE_SIZE;
+      uint64_t  blas_host = 0;
+      memcpy(&blas_host, node, sizeof blas_host);   /* lvp_bvh_instance_node.bvh_ptr */
+      if (blas_host) {
+         uint64_t blas_dev = vp_copy_as(c, (const void *)(uintptr_t)blas_host);
+         if (!c->ok)
+            return 0;
+         memcpy(node, &blas_dev, sizeof blas_dev);
+      }
+   }
+
+   vx_buffer_h b = NULL;
+   uint64_t dev_addr = 0;
+   if (vx_buffer_create(c->dev, size, 0, &b) != VX_SUCCESS) {
+      c->ok = false;
+      return 0;
+   }
+   c->bufs[c->n_bufs++] = b;
+   if (vx_buffer_address(b, &dev_addr) != VX_SUCCESS ||
+       vx_enqueue_write(c->q, b, 0, stage, size, 0, NULL, NULL) != VX_SUCCESS) {
+      c->ok = false;
+      return 0;
+   }
+   return dev_addr;
+}
+
 bool
 vp_launch(vx_device_h dev,
           const void *vxbin, size_t vxbin_size,
-          void *ssbo_host, uint32_t ssbo_bytes,
+          const void *desc_host, uint32_t desc_bytes,
+          const struct vp_desc *descs, uint32_t num_descs,
           const uint32_t grid[3], const uint32_t block[3],
           uint32_t lmem_size)
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
-   vx_buffer_h kbuf = NULL, abuf = NULL, sbuf = NULL;
+   vx_buffer_h kbuf = NULL, abuf = NULL, dbuf = NULL;
+   vx_buffer_h res[VP_MAX_DESCS]      = { 0 };  /* per-descriptor device buffer */
+   void       *res_host[VP_MAX_DESCS] = { 0 };  /* its host backing            */
+   uint32_t    res_bytes[VP_MAX_DESCS]= { 0 };
+   struct vp_as_ctx asc = { .ok = true };       /* acceleration-structure BVHs */
+   uint8_t    *stage = NULL;
    char vxpath[] = "/tmp/vortexpipe-k.XXXXXX";
    int  vxfd = -1;
 
@@ -65,29 +176,83 @@ vp_launch(vx_device_h dev,
    }
    close(vxfd);
 
+   /* A private copy of the descriptor buffer: vp_launch rewrites the
+    * resource pointers inside it to device addresses. It must outlive
+    * vx_queue_finish (vx_enqueue_write reads it asynchronously). */
+   stage = malloc(desc_bytes);
+   if (!stage) {
+      mesa_logw("vortexpipe: launch: descriptor staging OOM");
+      unlink(vxpath);
+      return false;
+   }
+   memcpy(stage, desc_host, desc_bytes);
+
    vx_queue_info_t qi = {
       .struct_size = sizeof(qi), .next = NULL,
       .priority = VX_QUEUE_PRIORITY_NORMAL, .flags = 0,
    };
    VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
+   asc.dev = dev;
+   asc.q   = q;
 
    VP_CHECK(vx_buffer_load_kernel_file(dev, q, vxpath, &kbuf),
             "vx_buffer_load_kernel_file");
 
-   /* SSBO device buffer + its device address */
-   VP_CHECK(vx_buffer_create(dev, ssbo_bytes, 0, &sbuf), "vx_buffer_create(ssbo)");
-   uint64_t ssbo_dev = 0;
-   VP_CHECK(vx_buffer_address(sbuf, &ssbo_dev), "vx_buffer_address");
+   /* Relocate each descriptor into the staged descriptor blob:
+    *  - VP_DESC_BUFFER: copy the resource into device memory, rewrite
+    *    lp_jit_buffer.ptr so load_ssbo/store_ssbo dereference on-device.
+    *  - VP_DESC_AS: copy the BVH (TLAS + its BLASes) into device
+    *    memory with instance-node links relocated, rewrite the
+    *    accel_struct device address. */
+   for (uint32_t i = 0; i < num_descs; i++) {
+      uint8_t *slot = stage + descs[i].offset;
 
-   /* arg block: i64[VP_ARG_SLOTS]; slot 1 -> SSBO device address */
+      if (descs[i].kind == VP_DESC_AS) {
+         uint64_t tlas_host = 0;
+         memcpy(&tlas_host, slot, sizeof tlas_host);   /* lp_descriptor.accel_struct */
+         if (!tlas_host)
+            continue;
+         uint64_t tlas_dev = vp_copy_as(&asc, (const void *)(uintptr_t)tlas_host);
+         if (!asc.ok) {
+            mesa_logw("vortexpipe: launch: acceleration-structure copy failed");
+            goto done;
+         }
+         memcpy(slot, &tlas_dev, sizeof tlas_dev);
+         continue;
+      }
+
+      /* VP_DESC_BUFFER */
+      uint64_t host_ptr = 0;
+      uint32_t size = 0;
+      memcpy(&host_ptr, slot + VP_JIT_BUF_PTR,  sizeof host_ptr);
+      memcpy(&size,     slot + VP_JIT_BUF_SIZE, sizeof size);
+      if (!host_ptr || !size)
+         continue;
+      VP_CHECK(vx_buffer_create(dev, size, 0, &res[i]),
+               "vx_buffer_create(resource)");
+      uint64_t dev_addr = 0;
+      VP_CHECK(vx_buffer_address(res[i], &dev_addr), "vx_buffer_address");
+      VP_CHECK(vx_enqueue_write(q, res[i], 0, (void *)(uintptr_t)host_ptr,
+                                size, 0, NULL, NULL),
+               "vx_enqueue_write(resource)");
+      memcpy(slot + VP_JIT_BUF_PTR, &dev_addr, sizeof dev_addr);
+      res_host[i]  = (void *)(uintptr_t)host_ptr;
+      res_bytes[i] = size;
+   }
+
+   /* upload the relocated descriptor buffer */
+   VP_CHECK(vx_buffer_create(dev, desc_bytes, 0, &dbuf),
+            "vx_buffer_create(descriptors)");
+   uint64_t desc_dev = 0;
+   VP_CHECK(vx_buffer_address(dbuf, &desc_dev), "vx_buffer_address(descriptors)");
+   VP_CHECK(vx_enqueue_write(q, dbuf, 0, stage, desc_bytes, 0, NULL, NULL),
+            "vx_enqueue_write(descriptors)");
+
+   /* arg block: i64[VP_ARG_SLOTS]; slot 1 -> set-0 descriptor buffer */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
-   argblk[1] = ssbo_dev;
+   argblk[1] = desc_dev;
    VP_CHECK(vx_buffer_create(dev, sizeof(argblk), 0, &abuf),
             "vx_buffer_create(args)");
-
-   /* upload SSBO data + arg block */
-   VP_CHECK(vx_enqueue_write(q, sbuf, 0, ssbo_host, ssbo_bytes, 0, NULL, NULL),
-            "vx_enqueue_write(ssbo)");
    VP_CHECK(vx_enqueue_write(q, abuf, 0, argblk, sizeof(argblk), 0, NULL, NULL),
             "vx_enqueue_write(args)");
 
@@ -103,18 +268,29 @@ vp_launch(vx_device_h dev,
    };
    VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
 
-   /* read the result back into the host SSBO */
-   VP_CHECK(vx_enqueue_read(q, ssbo_host, sbuf, 0, ssbo_bytes, 0, NULL, NULL),
-            "vx_enqueue_read");
+   /* copy every buffer back into its host backing */
+   for (uint32_t i = 0; i < num_descs; i++) {
+      if (!res[i])
+         continue;
+      VP_CHECK(vx_enqueue_read(q, res_host[i], res[i], 0, res_bytes[i],
+                               0, NULL, NULL), "vx_enqueue_read(resource)");
+   }
    VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish");
 
    ok = true;
 
 done:
-   if (sbuf) vx_buffer_release(sbuf);
+   for (uint32_t i = 0; i < VP_MAX_DESCS; i++)
+      if (res[i]) vx_buffer_release(res[i]);
+   for (unsigned i = 0; i < asc.n_bufs; i++)
+      if (asc.bufs[i]) vx_buffer_release(asc.bufs[i]);
+   for (unsigned i = 0; i < asc.n_stages; i++)
+      free(asc.stages[i]);
+   if (dbuf) vx_buffer_release(dbuf);
    if (abuf) vx_buffer_release(abuf);
    if (kbuf) vx_buffer_release(kbuf);
    if (q)    vx_queue_release(q);
+   free(stage);
    unlink(vxpath);
    return ok;
 }

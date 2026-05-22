@@ -115,6 +115,9 @@ vp_create_compute_state(struct pipe_context *pipe,
       char *ir = NULL;
       /* shared-memory size -> the launch's local-memory allocation. */
       cso->lmem_size = ((struct nir_shader *)state->prog)->info.shared_size;
+      /* the set-0 descriptors the kernel reaches -> launch relocation. */
+      vp_scan_descriptors((struct nir_shader *)state->prog,
+                          cso->descs, &cso->num_descs);
       if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL)) {
          if (vp_compile_vxbin(ir, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
@@ -155,35 +158,36 @@ vp_delete_compute_state(struct pipe_context *pipe, void *p)
 static void
 vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 {
-   struct vp_context *vp = vp_reg_get(pipe);
+   struct vp_context *vp  = vp_reg_get(pipe);
+   struct vp_cso     *cso = vp->cur_cso;
    bool ran_on_vortex = false;
 
-   /* Run on Vortex when we have a compiled kernel and lavapipe's
-    * descriptor buffer for set 0 (constant-buffer index 1). */
-   if (vp->dev && vp->cur_cso && vp->cur_cso->vxbin && vp->cbuf[1]) {
+   /* Run on Vortex when the kernel compiled and we have set 0's
+    * descriptor buffer (constant-buffer index 1) plus the descriptor
+    * table vp_create_compute_state scanned out of the NIR. */
+   if (vp->dev && cso && cso->vxbin && cso->num_descs && vp->cbuf[1]) {
+      /* The device descriptor buffer must span every descriptor the
+       * kernel reaches: the highest offset plus one struct lp_descriptor. */
+      uint32_t desc_bytes = 0;
+      for (uint32_t i = 0; i < cso->num_descs; i++) {
+         uint32_t end = cso->descs[i].offset + VP_DESC_STRIDE;
+         if (end > desc_bytes)
+            desc_bytes = end;
+      }
       struct pipe_transfer *xfer = NULL;
       void *desc_host = pipe_buffer_map(pipe, vp->cbuf[1],
                                         PIPE_MAP_READ, &xfer);
       if (desc_host) {
-         /* lp_descriptor[0]: a struct lp_jit_buffer -- offset 0 is the
-          * host data pointer, offset 8 the buffer size in bytes. */
-         const uint8_t *d = (const uint8_t *)desc_host + vp->cbuf_off[1];
-         uint64_t ssbo_host  = *(const uint64_t *)(d + 0);
-         uint32_t ssbo_bytes = *(const uint32_t *)(d + 8);
+         vp_dbg("vortexpipe: launch_grid -> Vortex grid=[%u,%u,%u] "
+                "block=[%u,%u,%u] descs=%u",
+                info->grid[0], info->grid[1], info->grid[2],
+                info->block[0], info->block[1], info->block[2],
+                cso->num_descs);
+         ran_on_vortex = vp_launch(vp->dev, cso->vxbin, cso->vxbin_size,
+                                   (uint8_t *)desc_host + vp->cbuf_off[1],
+                                   desc_bytes, cso->descs, cso->num_descs,
+                                   info->grid, info->block, cso->lmem_size);
          pipe_buffer_unmap(pipe, xfer);
-         if (ssbo_host && ssbo_bytes) {
-            vp_dbg("vortexpipe: launch_grid -> Vortex "
-                      "grid=[%u,%u,%u] block=[%u,%u,%u] ssbo=%uB",
-                      info->grid[0], info->grid[1], info->grid[2],
-                      info->block[0], info->block[1], info->block[2],
-                      ssbo_bytes);
-            ran_on_vortex = vp_launch(vp->dev,
-                                      vp->cur_cso->vxbin,
-                                      vp->cur_cso->vxbin_size,
-                                      (void *)(uintptr_t)ssbo_host,
-                                      ssbo_bytes, info->grid, info->block,
-                                      vp->cur_cso->lmem_size);
-         }
       }
    }
 

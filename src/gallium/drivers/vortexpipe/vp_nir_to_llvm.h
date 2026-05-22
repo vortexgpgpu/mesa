@@ -43,6 +43,25 @@ bool vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
 /* Release a string returned via vp_nir_to_llvm()'s out_ir. */
 void vp_free_ir(char *ir);
 
+/* A descriptor a compute kernel reaches through set-0's descriptor
+ * buffer (constant-buffer index 1):
+ *  - VP_DESC_BUFFER: an SSBO -- lp_jit_buffer{ptr,size} at `offset`.
+ *  - VP_DESC_AS: an acceleration structure -- accel_struct device
+ *    address at `offset`. */
+enum vp_desc_kind { VP_DESC_BUFFER, VP_DESC_AS };
+struct vp_desc {
+   unsigned          offset;   /* byte offset in the set-0 descriptor buffer */
+   enum vp_desc_kind kind;
+};
+#define VP_MAX_DESCS 16
+
+/* Scan a compute NIR for the set-0 descriptors it accesses (load_ssbo
+ * / store_ssbo / load_ubo against constant-buffer index 1). Fills
+ * out[0..*num_out) with the distinct descriptors found, capped at
+ * VP_MAX_DESCS. */
+void vp_scan_descriptors(struct nir_shader *nir,
+                         struct vp_desc *out, unsigned *num_out);
+
 #ifdef __cplusplus
 }
 #endif

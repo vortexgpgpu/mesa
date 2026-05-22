@@ -35,13 +35,17 @@ struct vp_screen {
 
 /* A compiled compute state: llvmpipe's cso plus the Vortex kernel
  * image. vortexpipe's create_compute_state returns one of these
- * (not the raw llvmpipe cso); bind/delete unwrap it. */
+ * (not the raw llvmpipe cso); bind/delete unwrap it. The descriptor
+ * table (vp_desc, from vp_nir_to_llvm.h) is discovered by scanning
+ * the NIR and drives vp_launch_grid's descriptor-buffer relocation. */
 struct vp_cso {
    void  *lp_cso;          /* llvmpipe's shader-state object */
    void  *vxbin;           /* compiled Vortex kernel image, or NULL */
    size_t vxbin_size;
    unsigned lmem_size;     /* compute: shared-memory bytes (nir shared_size) */
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
+   struct vp_desc descs[VP_MAX_DESCS];  /* set-0 descriptors the kernel uses */
+   unsigned        num_descs;
 };
 
 /* Captured + VX-encoded output-merger state (Phase 5). create_*_state

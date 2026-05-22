@@ -672,11 +672,35 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       break;
    }
    /* buffer load: base (i64) + offset; one load per component, the
-    * width taken from the def's bit size (32- or 64-bit). load_ubo
-    * and load_ssbo share the (base, offset) operand shape. */
+    * width taken from the def's bit size (32- or 64-bit).
+    *
+    * load_ssbo and load_ubo differ in operand 0:
+    *  - load_ubo's is a constant-buffer INDEX; the descriptor lives at
+    *    arg[index] + offset and IS the value the shader wants (lavapipe
+    *    lowers an acceleration-structure read to load_ubo(cbuf,0), and
+    *    the descriptor slot holds the AS device address verbatim).
+    *  - load_ssbo's is the device ADDRESS of the buffer's descriptor
+    *    (a struct lp_descriptor / lp_jit_buffer); the buffer's data
+    *    pointer is the first 8 bytes of that descriptor, so the access
+    *    dereferences one level: data = *(i64*)desc + offset.
+    * vp_launch builds the device descriptor buffer with these pointer
+    * fields rewritten from host to Vortex device addresses. */
    case nir_intrinsic_load_ssbo:
    case nir_intrinsic_load_ubo: {
-      LLVMValueRef base = intr_src(t, in, 0);                 /* i64 */
+      LLVMValueRef base;
+      if (in->intrinsic == nir_intrinsic_load_ubo) {
+         if (t->arg) {
+            LLVMValueRef idx = intr_src(t, in, 0);
+            LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
+            base = LLVMBuildLoad2(t->b, t->i64, gep, "ubobase");
+         } else {
+            base = LLVMConstInt(t->i64, 0, false);
+         }
+      } else {
+         LLVMValueRef desc = intr_src(t, in, 0);              /* descriptor addr */
+         LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
+         base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase"); /* lp_jit_buffer.ptr */
+      }
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 1),
                                         t->i64, "");
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
@@ -691,7 +715,11 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       break;
    }
    case nir_intrinsic_store_ssbo: {
-      LLVMValueRef base = intr_src(t, in, 1);                 /* i64 */
+      /* operand 1 is the buffer descriptor's device address; the data
+       * pointer is its first 8 bytes (see load_ssbo above). */
+      LLVMValueRef desc = intr_src(t, in, 1);
+      LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
+      LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase");
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 2),
                                         t->i64, "");
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
@@ -1527,4 +1555,92 @@ vp_free_ir(char *ir)
 {
    if (ir)
       LLVMDisposeMessage(ir);
+}
+
+/* ---- descriptor scan (Phase 7.5) ----------------------------------- *
+ *
+ * A compute kernel reaches its set-0 resources through the descriptor
+ * buffer bound at constant-buffer index 1. vp_launch_grid must copy
+ * that buffer (and the resources it points at) into Vortex device
+ * memory, which means it needs to know each descriptor's byte offset
+ * and kind. lavapipe's lowered NIR encodes exactly that:
+ *
+ *   load_ssbo  (desc_addr, off)         -- SSBO   at desc_addr
+ *   store_ssbo (val, desc_addr, off)    -- SSBO   at desc_addr
+ *   load_ubo   (cbuf_index, off)        -- AS     at cbuf[index]+off
+ *
+ * where desc_addr is load_const_buf_base_addr_lvp(1) optionally plus a
+ * constant byte offset. */
+
+/* Resolve an SSBO descriptor-address SSA value to its byte offset in
+ * the set-0 descriptor buffer: load_const_buf_base_addr_lvp(1) is
+ * offset 0, that plus a constant is the constant. -1 if unrecognized. */
+static int
+vp_desc_addr_offset(nir_def *def)
+{
+   nir_instr *p = def->parent_instr;
+   if (p->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *i = nir_instr_as_intrinsic(p);
+      if (i->intrinsic == nir_intrinsic_load_const_buf_base_addr_lvp)
+         return 0;
+   } else if (p->type == nir_instr_type_alu) {
+      nir_alu_instr *a = nir_instr_as_alu(p);
+      if (a->op == nir_op_iadd) {
+         for (int s = 0; s < 2; s++) {
+            nir_instr *o = a->src[s].src.ssa->parent_instr;
+            if (o->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(o)->intrinsic ==
+                   nir_intrinsic_load_const_buf_base_addr_lvp &&
+                nir_src_is_const(a->src[!s].src))
+               return (int)nir_src_as_uint(a->src[!s].src);
+         }
+      }
+   }
+   return -1;
+}
+
+void
+vp_scan_descriptors(struct nir_shader *nir,
+                    struct vp_desc *out, unsigned *num_out)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(blk, impl) {
+         nir_foreach_instr(instr, blk) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            int off = -1;
+            enum vp_desc_kind kind = VP_DESC_BUFFER;
+            switch (in->intrinsic) {
+            case nir_intrinsic_load_ssbo:
+               off = vp_desc_addr_offset(in->src[0].ssa);
+               break;
+            case nir_intrinsic_store_ssbo:
+               off = vp_desc_addr_offset(in->src[1].ssa);
+               break;
+            case nir_intrinsic_load_ubo:
+               /* lavapipe lowers an acceleration-structure read to
+                * load_ubo(cbuf_index, byte_offset). */
+               if (nir_src_is_const(in->src[1]))
+                  off = (int)nir_src_as_uint(in->src[1]);
+               kind = VP_DESC_AS;
+               break;
+            default:
+               continue;
+            }
+            if (off < 0)
+               continue;
+            bool dup = false;
+            for (unsigned k = 0; k < n; k++)
+               if (out[k].offset == (unsigned)off) { dup = true; break; }
+            if (dup || n >= VP_MAX_DESCS)
+               continue;
+            out[n].offset = (unsigned)off;
+            out[n].kind   = kind;
+            n++;
+         }
+      }
+   }
+   *num_out = n;
 }

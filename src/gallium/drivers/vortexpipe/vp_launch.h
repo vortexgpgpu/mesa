@@ -14,24 +14,33 @@
 #include <stdbool.h>
 
 #include "vortex2.h"
+#include "vp_nir_to_llvm.h"      /* struct vp_desc */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/* struct lp_descriptor stride in lavapipe's set descriptor buffer:
+ * binding N's descriptor starts at N * VP_DESC_STRIDE. */
+#define VP_DESC_STRIDE 256
+
 /* Run a compiled Vortex compute kernel (.vxbin) on `dev`.
  *
- * The single shader-storage buffer's data is at ssbo_host[0,
- * ssbo_bytes): it is copied to device memory, the kernel runs over
- * grid x block, and the result is copied back into ssbo_host.
- * `lmem_size` is the per-workgroup shared-memory allocation (0 if the
- * kernel declares none).
+ * `desc_host[0, desc_bytes)` is set 0's descriptor buffer -- an array
+ * of struct lp_descriptor the kernel reaches through arg slot 1.
+ * `descs[0, num_descs)` (from vp_scan_descriptors) names the buffer
+ * descriptors inside it: each is copied to Vortex device memory and
+ * its lp_jit_buffer.ptr rewritten to the device address, so the
+ * kernel's load_ssbo/store_ssbo dereference resolves on-device. The
+ * kernel runs over grid x block; writable buffers are copied back.
+ * `lmem_size` is the per-workgroup shared-memory allocation.
  *
- * Returns true on success (add1/vecadd-class single-SSBO kernels).
+ * Returns true on success.
  */
 bool vp_launch(vx_device_h dev,
                const void *vxbin, size_t vxbin_size,
-               void *ssbo_host, uint32_t ssbo_bytes,
+               const void *desc_host, uint32_t desc_bytes,
+               const struct vp_desc *descs, uint32_t num_descs,
                const uint32_t grid[3], const uint32_t block[3],
                uint32_t lmem_size);
 
