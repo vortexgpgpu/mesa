@@ -117,3 +117,75 @@ done:
    unlink(vxpath);
    return ok;
 }
+
+bool
+vp_launch_vs(vx_device_h dev,
+             const void *vxbin, size_t vxbin_size,
+             void *out_host, uint32_t out_bytes,
+             uint32_t vertex_count)
+{
+   bool ok = false;
+   vx_queue_h  q    = NULL;
+   vx_buffer_h kbuf = NULL, abuf = NULL, obuf = NULL;
+   char vxpath[] = "/tmp/vortexpipe-vs.XXXXXX";
+   int  vxfd = -1;
+
+   vxfd = mkstemp(vxpath);
+   if (vxfd < 0) {
+      mesa_logw("vortexpipe: vs launch: mkstemp failed");
+      return false;
+   }
+   if (write(vxfd, vxbin, vxbin_size) != (ssize_t)vxbin_size) {
+      mesa_logw("vortexpipe: vs launch: writing .vxbin failed");
+      close(vxfd);
+      unlink(vxpath);
+      return false;
+   }
+   close(vxfd);
+
+   vx_queue_info_t qi = {
+      .struct_size = sizeof(qi), .next = NULL,
+      .priority = VX_QUEUE_PRIORITY_NORMAL, .flags = 0,
+   };
+   VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
+   VP_CHECK(vx_buffer_load_kernel_file(dev, q, vxpath, &kbuf),
+            "vx_buffer_load_kernel_file");
+
+   /* output vertex-record buffer + its device address */
+   VP_CHECK(vx_buffer_create(dev, out_bytes, 0, &obuf),
+            "vx_buffer_create(out)");
+   uint64_t out_dev = 0;
+   VP_CHECK(vx_buffer_address(obuf, &out_dev), "vx_buffer_address");
+
+   /* arg block: slot 0 -> output buffer device address */
+   uint64_t argblk[VP_ARG_SLOTS] = { 0 };
+   argblk[0] = out_dev;
+   VP_CHECK(vx_buffer_create(dev, sizeof(argblk), 0, &abuf),
+            "vx_buffer_create(args)");
+   VP_CHECK(vx_enqueue_write(q, abuf, 0, argblk, sizeof(argblk), 0, NULL, NULL),
+            "vx_enqueue_write(args)");
+
+   /* one thread per vertex: a single block of `vertex_count` */
+   vx_launch_info_t li = {
+      .struct_size = sizeof(li), .next = NULL,
+      .kernel = kbuf, .args = abuf, .ndim = 1,
+      .grid_dim  = { 1, 1, 1 },
+      .block_dim = { vertex_count, 1, 1 },
+      .lmem_size = 0,
+   };
+   VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
+
+   VP_CHECK(vx_enqueue_read(q, out_host, obuf, 0, out_bytes, 0, NULL, NULL),
+            "vx_enqueue_read");
+   VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish");
+
+   ok = true;
+
+done:
+   if (obuf) vx_buffer_release(obuf);
+   if (abuf) vx_buffer_release(abuf);
+   if (kbuf) vx_buffer_release(kbuf);
+   if (q)    vx_queue_release(q);
+   unlink(vxpath);
+   return ok;
+}

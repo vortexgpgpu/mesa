@@ -32,6 +32,15 @@ bool vp_launch(vx_device_h dev,
                void *ssbo_host, uint32_t ssbo_bytes,
                const uint32_t grid[3], const uint32_t block[3]);
 
+/* Run a compiled Vortex vertex-shader kernel (.vxbin) on `dev`
+ * (Phase 3). One thread per vertex; the kernel writes one transformed
+ * record per vertex into a device buffer (arg slot 0). On success
+ * the `out_bytes` of output are copied into out_host. */
+bool vp_launch_vs(vx_device_h dev,
+                  const void *vxbin, size_t vxbin_size,
+                  void *out_host, uint32_t out_bytes,
+                  uint32_t vertex_count);
+
 #ifdef __cplusplus
 }
 #endif

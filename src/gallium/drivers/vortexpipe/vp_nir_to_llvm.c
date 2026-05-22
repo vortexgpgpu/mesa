@@ -4,17 +4,19 @@
  *
  * vp_nir_to_llvm -- scalar NIR -> LLVM-IR translator (Shape C).
  *
- * Phase 2 #3: per-instruction scalar emission.
- * Phase 2 #4a: emit a Vortex KMU kernel -- the function is
- *   `void main(ptr %arg)`, marked `vortex.kernel` via
- *   @llvm.global.annotations, targeting riscv32. The device-ABI
- *   intrinsics are lowered inline: workgroup/local id via `csrr`
- *   of the KMU CTA CSRs; the SSBO base address via a load from the
- *   %arg block (an array of i64 buffer addresses that vortexpipe's
- *   launch_grid fills -- increment #5).
+ * Emits a Vortex KMU kernel: `void kernel_main(ptr %arg)`, marked
+ * `vortex.kernel` via @llvm.global.annotations, targeting riscv32.
+ * Two shader stages are handled:
  *
- * NIR SSA values are untyped bit patterns; each component is held
- * as an LLVM iN and ops bit-cast to the type they need.
+ *   - Compute: one thread per work-item. SSBO base addresses come
+ *     from the lavapipe descriptor buffer, reached through %arg.
+ *   - Vertex (Phase 3): one thread per vertex. gl_VertexIndex is the
+ *     CTA thread id; the kernel writes one padded-vec4 record per
+ *     vertex into the output buffer whose device address is %arg[0].
+ *
+ * NIR SSA values are untyped bit patterns; each component is held as
+ * an LLVM iN and ops bit-cast to the type they need. NIR derefs
+ * resolve to i32 byte addresses (riscv32 pointers).
  *
  * See docs/proposals/vulkan_support_proposal.md §3 in the Vortex tree.
  */
@@ -27,12 +29,14 @@
 #include <string.h>
 
 #include "nir.h"
+#include "compiler/glsl_types.h"
 #include "util/log.h"
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
 
-#define VP_MAXC 4   /* max vector components per NIR def */
+#define VP_MAXC 4    /* max vector components per NIR def */
+#define VP_MAXV 64   /* max tracked variables per shader */
 
 /* KMU CTA CSRs (VX_types.h): per-thread / per-block index registers. */
 #define VX_CSR_CTA_THREAD_ID_X 0xCD3   /* local invocation id, +c for y/z */
@@ -42,15 +46,31 @@
 #define VP_TRIPLE      "riscv32-unknown-elf"
 #define VP_DATALAYOUT  "e-m:e-p:32:32-i64:64-n32-S128"
 
+/* A tracked NIR variable: either a function_temp (LLVM alloca) or a
+ * shader_out (byte offset of its slot in the per-vertex record). */
+struct vp_var {
+   const nir_variable *var;
+   LLVMValueRef        alloca;     /* function_temp storage, else NULL */
+   int                 out_off;    /* shader_out slot offset, else -1 */
+};
+
 struct vp_tr {
    LLVMContextRef ctx;
    LLVMModuleRef  mod;
    LLVMBuilderRef b;
    LLVMTypeRef    i8, i32, i64, f32, ptr;
    LLVMValueRef   arg;          /* the kernel's %arg parameter (ptr) */
-   /* SSA map: [def index][component] -> iN value (bit pattern) */
+   /* SSA map: [def index][component] -> iN value (bit pattern).
+    * For a deref instr, component 0 holds the i32 byte address. */
    LLVMValueRef  *val;
    unsigned       nval;
+   /* vertex-shader state (is_vs only) */
+   bool           is_vs;
+   LLVMValueRef   vid;          /* i32 vertex id */
+   LLVMValueRef   out_base;     /* i32 output-buffer device address */
+   unsigned       out_stride;   /* bytes per output vertex record */
+   struct vp_var  vars[VP_MAXV];
+   unsigned       nvars;
    bool           ok;
 };
 
@@ -96,6 +116,35 @@ emit_csr_read(struct vp_tr *t, unsigned csr, const char *name)
    return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, name);
 }
 
+/* byte size of a glsl type (32-bit scalars/vectors, arrays thereof) */
+static unsigned
+glsl_bytes(const struct glsl_type *gt)
+{
+   if (glsl_type_is_array(gt))
+      return glsl_get_length(gt) * glsl_bytes(glsl_get_array_element(gt));
+   return glsl_get_components(gt) * 4u;
+}
+
+/* LLVM storage type for a glsl type (every scalar is an i32). */
+static LLVMTypeRef
+glsl_to_llvm(struct vp_tr *t, const struct glsl_type *gt)
+{
+   if (glsl_type_is_array(gt))
+      return LLVMArrayType(glsl_to_llvm(t, glsl_get_array_element(gt)),
+                           glsl_get_length(gt));
+   unsigned n = glsl_get_components(gt);
+   return n > 1 ? LLVMArrayType(t->i32, n) : t->i32;
+}
+
+static struct vp_var *
+vp_var_find(struct vp_tr *t, const nir_variable *v)
+{
+   for (unsigned i = 0; i < t->nvars; i++)
+      if (t->vars[i].var == v)
+         return &t->vars[i];
+   return NULL;
+}
+
 static void
 emit_load_const(struct vp_tr *t, nir_load_const_instr *lc)
 {
@@ -115,6 +164,12 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
       switch (alu->op) {
       case nir_op_mov:
          r = alu_src(t, alu, 0, c);
+         break;
+      /* vecN: component c is built from source operand c. */
+      case nir_op_vec2:
+      case nir_op_vec3:
+      case nir_op_vec4:
+         r = alu_src(t, alu, c, 0);
          break;
       case nir_op_iadd:
          r = LLVMBuildAdd(t->b, alu_src(t, alu, 0, c),
@@ -156,6 +211,63 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
    }
 }
 
+/* A NIR deref resolves to an i32 byte address, stored in component 0
+ * of its SSA def. function_temp vars are LLVM allocas; shader_out
+ * vars address into the per-vertex output record. */
+static void
+emit_deref(struct vp_tr *t, nir_deref_instr *d)
+{
+   LLVMValueRef addr = NULL;
+
+   switch (d->deref_type) {
+   case nir_deref_type_var: {
+      nir_variable *v = d->var;
+      if (v->data.mode == nir_var_function_temp) {
+         struct vp_var *e = vp_var_find(t, v);
+         if (!e) {
+            if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+            LLVMValueRef a = LLVMBuildAlloca(t->b,
+               glsl_to_llvm(t, v->type), v->name ? v->name : "tmp");
+            e = &t->vars[t->nvars++];
+            e->var = v; e->alloca = a; e->out_off = -1;
+         }
+         addr = LLVMBuildPtrToInt(t->b, e->alloca, t->i32, "");
+      } else if (v->data.mode == nir_var_shader_out) {
+         struct vp_var *e = vp_var_find(t, v);
+         if (!e || e->out_off < 0) { t->ok = false; return; }
+         /* out_base + vid * stride + slot_offset */
+         LLVMValueRef voff = LLVMBuildMul(t->b, t->vid,
+            LLVMConstInt(t->i32, t->out_stride, false), "");
+         addr = LLVMBuildAdd(t->b, t->out_base, voff, "");
+         addr = LLVMBuildAdd(t->b, addr,
+            LLVMConstInt(t->i32, (unsigned)e->out_off, false), "vsout");
+      } else {
+         mesa_logw("vortexpipe: vp_nir_to_llvm: deref of unsupported "
+                   "var mode %d", (int)v->data.mode);
+         t->ok = false;
+         return;
+      }
+      break;
+   }
+   case nir_deref_type_array: {
+      LLVMValueRef base = ssa_get(t, d->parent.ssa->index, 0);
+      LLVMValueRef idx  = ssa_get(t, d->arr.index.ssa->index, 0);
+      if (!base || !idx) { t->ok = false; return; }
+      LLVMValueRef off = LLVMBuildMul(t->b, idx,
+         LLVMConstInt(t->i32, glsl_bytes(d->type), false), "");
+      addr = LLVMBuildAdd(t->b, base, off, "elem");
+      break;
+   }
+   default:
+      mesa_logw("vortexpipe: vp_nir_to_llvm: unhandled deref type %d",
+                (int)d->deref_type);
+      t->ok = false;
+      return;
+   }
+
+   ssa_set(t, d->def.index, 0, addr);
+}
+
 static void
 emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
 {
@@ -168,6 +280,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          ssa_set(t, in->def.index, c, emit_csr_read(t, base + c, "id"));
       break;
    }
+   /* gl_VertexIndex: one Vortex thread per vertex, so it is the CTA
+    * thread id (vp_draw_vbo launches a single block of `count`). */
+   case nir_intrinsic_load_vertex_id:
+   case nir_intrinsic_load_vertex_id_zero_base:
+      ssa_set(t, in->def.index, 0, t->vid);
+      break;
    case nir_intrinsic_load_const_buf_base_addr_lvp: {
       /* SSBO base address = arg_block[index] (array of i64). */
       LLVMValueRef idx = intr_src(t, in, 0);
@@ -196,6 +314,36 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMBuildStore(t->b, val, ptr);
       break;
    }
+   /* deref load/store: the deref operand is an i32 byte address;
+    * each 32-bit component is a separate riscv32 load/store. */
+   case nir_intrinsic_load_deref: {
+      LLVMValueRef addr = intr_src(t, in, 0);
+      if (!addr) { t->ok = false; break; }
+      for (unsigned c = 0; c < in->def.num_components; c++) {
+         LLVMValueRef a = LLVMBuildAdd(t->b, addr,
+            LLVMConstInt(t->i32, c * 4u, false), "");
+         LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, t->i32, p, "ld"));
+      }
+      break;
+   }
+   case nir_intrinsic_store_deref: {
+      LLVMValueRef addr = intr_src(t, in, 0);
+      if (!addr) { t->ok = false; break; }
+      unsigned mask = nir_intrinsic_write_mask(in);
+      unsigned nc   = nir_src_num_components(in->src[1]);
+      for (unsigned c = 0; c < nc; c++) {
+         if (!(mask & (1u << c)))
+            continue;
+         LLVMValueRef v = ssa_get(t, in->src[1].ssa->index, c);
+         if (!v) { t->ok = false; break; }
+         LLVMValueRef a = LLVMBuildAdd(t->b, addr,
+            LLVMConstInt(t->i32, c * 4u, false), "");
+         LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         LLVMBuildStore(t->b, v, p);
+      }
+      break;
+   }
    default:
       mesa_logw("vortexpipe: vp_nir_to_llvm: unhandled intrinsic '%s'",
                 nir_intrinsic_infos[in->intrinsic].name);
@@ -212,6 +360,9 @@ emit_instr(struct vp_tr *t, nir_instr *instr)
       break;
    case nir_instr_type_alu:
       emit_alu(t, nir_instr_as_alu(instr));
+      break;
+   case nir_instr_type_deref:
+      emit_deref(t, nir_instr_as_deref(instr));
       break;
    case nir_instr_type_intrinsic:
       emit_intrinsic(t, nir_instr_as_intrinsic(instr));
@@ -265,11 +416,45 @@ emit_kernel_annotation(struct vp_tr *t, LLVMValueRef fn)
    LLVMSetSection(g, "llvm.metadata");
 }
 
+/* Scan the shader's outputs and assign each a 16-byte slot in the
+ * per-vertex record: slot 0 is gl_Position, slots 1.. are the
+ * generic varyings in declaration order. */
+static void
+vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
+                struct vp_vs_layout *out_vs)
+{
+   unsigned next = 16;   /* slot 0 reserved for gl_Position */
+   nir_foreach_shader_out_variable(var, nir) {
+      if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      int off;
+      if (var->data.location == VARYING_SLOT_POS) {
+         off = 0;
+      } else {
+         off = (int)next;
+         next += 16;
+         if (out_vs && out_vs->num_varyings < VP_VS_MAX_VARYINGS)
+            out_vs->varying_loc[out_vs->num_varyings] = var->data.location;
+         if (out_vs)
+            out_vs->num_varyings++;
+      }
+      t->vars[t->nvars].var     = var;
+      t->vars[t->nvars].alloca  = NULL;
+      t->vars[t->nvars].out_off = off;
+      t->nvars++;
+   }
+   t->out_stride = next;   /* 16 * (1 + num_varyings) */
+   if (out_vs)
+      out_vs->stride = t->out_stride;
+}
+
 bool
-vp_nir_to_llvm(struct nir_shader *nir, char **out_ir)
+vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
+               struct vp_vs_layout *out_vs)
 {
    if (out_ir)
       *out_ir = NULL;
+   if (out_vs)
+      memset(out_vs, 0, sizeof *out_vs);
    if (!nir)
       return false;
 
@@ -280,9 +465,10 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir)
    }
 
    struct vp_tr t = {0};
-   t.ok  = true;
-   t.ctx = LLVMContextCreate();
-   t.mod = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
+   t.ok    = true;
+   t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
+   t.ctx   = LLVMContextCreate();
+   t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
    LLVMSetTarget(t.mod, VP_TRIPLE);
    LLVMSetDataLayout(t.mod, VP_DATALAYOUT);
    t.b   = LLVMCreateBuilderInContext(t.ctx);
@@ -305,6 +491,15 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir)
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t.ctx, fn, "entry");
    LLVMPositionBuilderAtEnd(t.b, entry);
 
+   /* Vertex-shader prologue: assign output slots, then read the
+    * vertex id and the output-buffer base from %arg[0]. */
+   if (t.is_vs) {
+      vs_scan_outputs(&t, nir, out_vs);
+      t.vid = emit_csr_read(&t, VX_CSR_CTA_THREAD_ID_X, "vid");
+      LLVMValueRef ob64 = LLVMBuildLoad2(t.b, t.i64, t.arg, "outbase64");
+      t.out_base = LLVMBuildTrunc(t.b, ob64, t.i32, "outbase");
+   }
+
    nir_foreach_function_impl(impl, nir) {
       t.nval = impl->ssa_alloc;
       t.val  = calloc((size_t)t.nval * VP_MAXC, sizeof(LLVMValueRef));
@@ -319,7 +514,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir)
    done:
       free(t.val);
       t.val = NULL;
-      break;   /* one entrypoint impl for compute */
+      break;   /* one entrypoint impl per shader */
    }
 
    LLVMBuildRetVoid(t.b);
@@ -331,8 +526,8 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir)
    bool ok = t.ok &&
              LLVMVerifyModule(t.mod, LLVMReturnStatusAction, &err) == 0;
    if (ok) {
-      vp_dbg("vortexpipe: vp_nir_to_llvm: translated shader to a "
-                "Vortex kernel module");
+      vp_dbg("vortexpipe: vp_nir_to_llvm: translated %s shader to a "
+             "Vortex kernel module", t.is_vs ? "vertex" : "compute");
       char *ir = LLVMPrintModuleToString(t.mod);
       if (getenv("VORTEXPIPE_DEBUG_IR"))
          fprintf(stderr, "=== vortexpipe: generated LLVM IR ===\n%s"

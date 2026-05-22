@@ -22,6 +22,7 @@
 #include "pipe/p_context.h"
 
 #include "vortex2.h"
+#include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
 
 /* Per-screen vortexpipe state, keyed by the llvmpipe pipe_screen *. */
 struct vp_screen {
@@ -35,15 +36,17 @@ struct vp_screen {
  * image. vortexpipe's create_compute_state returns one of these
  * (not the raw llvmpipe cso); bind/delete unwrap it. */
 struct vp_cso {
-   void  *lp_cso;          /* llvmpipe's compute-state object */
+   void  *lp_cso;          /* llvmpipe's shader-state object */
    void  *vxbin;           /* compiled Vortex kernel image, or NULL */
    size_t vxbin_size;
+   struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
 };
 
 /* Per-context vortexpipe state, keyed by the llvmpipe pipe_context *. */
 struct vp_context {
    vx_device_h dev;                       /* borrowed from vp_screen */
    struct vp_cso *cur_cso;                /* bound compute state */
+   struct vp_cso *cur_vs;                 /* bound vertex shader (Phase 3) */
    /* compute constant buffers, by index -- lavapipe binds the
     * descriptor buffer for descriptor set N at index N+1. */
    struct pipe_resource *cbuf[8];
@@ -61,6 +64,22 @@ struct vp_context {
                                   enum pipe_shader_type, unsigned, unsigned,
                                   const struct pipe_shader_buffer *,
                                   unsigned);
+   /* graphics (Phase 3): vertex-shader state + the draw entry. */
+   void *(*lp_create_vs_state)(struct pipe_context *,
+                               const struct pipe_shader_state *);
+   void  (*lp_bind_vs_state)(struct pipe_context *, void *);
+   void  (*lp_delete_vs_state)(struct pipe_context *, void *);
+   void  (*lp_draw_vbo)(struct pipe_context *,
+                        const struct pipe_draw_info *,
+                        unsigned drawid_offset,
+                        const struct pipe_draw_indirect_info *,
+                        const struct pipe_draw_start_count_bias *,
+                        unsigned num_draws);
+   /* Phase 3 draw integration: a cached passthrough VS + vertex-
+    * elements state that feed the Vortex-transformed vertices into
+    * llvmpipe's rasterizer (see vp_draw_vbo). */
+   void *passthrough_vs;
+   void *velems;
    void  (*lp_context_destroy)(struct pipe_context *);
 };
 
