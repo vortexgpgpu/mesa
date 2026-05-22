@@ -197,6 +197,7 @@ with_gallium_virgl = gallium_drivers.contains('virgl')
 with_gallium_lima = gallium_drivers.contains('lima')
 with_gallium_zink = gallium_drivers.contains('zink')
 with_gallium_d3d12 = gallium_drivers.contains('d3d12')
+with_gallium_vortexpipe = gallium_drivers.contains('vortexpipe')
 with_gallium_asahi = gallium_drivers.contains('asahi')
 foreach gallium_driver : gallium_drivers
   pre_args += '-DHAVE_@0@'.format(gallium_driver.to_upper())
@@ -269,7 +270,7 @@ if with_any_vk and host_machine.system() == 'windows' and meson.version().versio
   error('Vulkan drivers on Windows require meson 1.3 or newer')
 endif
 
-with_any_llvmpipe = with_gallium_llvmpipe or with_swrast_vk
+with_any_llvmpipe = with_gallium_llvmpipe or with_swrast_vk or with_gallium_vortexpipe
 with_gallium_or_lvp = with_gallium or with_swrast_vk
 
 freedreno_kmds = get_option('freedreno-kmds')

@@ -28,6 +28,10 @@
 #include "llvmpipe/lp_public.h"
 #endif
 
+#ifdef GALLIUM_VORTEXPIPE
+#include "vortexpipe/vp_public.h"
+#endif
+
 #ifdef GALLIUM_VIRGL
 #include "virgl/virgl_public.h"
 #include "virgl/vtest/virgl_vtest_public.h"
@@ -37,6 +41,11 @@ static inline struct pipe_screen *
 sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config *config, const char *driver)
 {
    struct pipe_screen *screen = NULL;
+
+#if defined(GALLIUM_VORTEXPIPE)
+   if (screen == NULL && strcmp(driver, "vortexpipe") == 0)
+      screen = vortexpipe_create_screen(winsys);
+#endif
 
 #if defined(GALLIUM_LLVMPIPE)
    if (screen == NULL && (strcmp(driver, "llvmpipe") == 0 || !driver[0]))
@@ -74,7 +83,10 @@ sw_screen_create_vk(struct sw_winsys *winsys, const struct pipe_screen_config *c
 {
    UNUSED bool only_sw = debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false);
    const char *drivers[] = {
-      (sw_vk ? "" : debug_get_option("GALLIUM_DRIVER", "")),
+      /* Honor GALLIUM_DRIVER on the Vulkan (sw_vk) path too, so
+       * GALLIUM_DRIVER=vortexpipe selects the Vortex driver under
+       * lavapipe. Empty default falls through to llvmpipe. */
+      debug_get_option("GALLIUM_DRIVER", ""),
 #if defined(GALLIUM_D3D12)
       (sw_vk || only_sw) ? "" : "d3d12",
 #endif

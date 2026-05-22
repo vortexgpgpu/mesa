@@ -71,6 +71,18 @@ else
   driver_swrast = declare_dependency()
 endif
 
+# vortexpipe is a thin driver layered on llvmpipe; build it after the
+# llvmpipe subdir (it links driver_llvmpipe) and fold it into the
+# swrast dependency so lavapipe links it in.
+if with_gallium_vortexpipe
+  subdir('drivers/vortexpipe')
+  driver_swrast = declare_dependency(
+    dependencies : [ driver_swrast, driver_vortexpipe ],
+  )
+else
+  driver_vortexpipe = declare_dependency()
+endif
+
 if with_gallium_asahi
   subdir('winsys/asahi/drm')
   subdir('drivers/asahi')
