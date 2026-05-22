@@ -47,6 +47,7 @@ struct vp_context {
    vx_device_h dev;                       /* borrowed from vp_screen */
    struct vp_cso *cur_cso;                /* bound compute state */
    struct vp_cso *cur_vs;                 /* bound vertex shader (Phase 3) */
+   struct vp_cso *cur_fs;                 /* bound fragment shader (Phase 4) */
    /* compute constant buffers, by index -- lavapipe binds the
     * descriptor buffer for descriptor set N at index N+1. */
    struct pipe_resource *cbuf[8];
@@ -75,11 +76,20 @@ struct vp_context {
                         const struct pipe_draw_indirect_info *,
                         const struct pipe_draw_start_count_bias *,
                         unsigned num_draws);
+   void *(*lp_create_fs_state)(struct pipe_context *,
+                               const struct pipe_shader_state *);
+   void  (*lp_bind_fs_state)(struct pipe_context *, void *);
+   void  (*lp_delete_fs_state)(struct pipe_context *, void *);
    /* Phase 3 draw integration: a cached passthrough VS + vertex-
     * elements state that feed the Vortex-transformed vertices into
     * llvmpipe's rasterizer (see vp_draw_vbo). */
    void *passthrough_vs;
    void *velems;
+   /* Phase 4: the bound colour render target (set_framebuffer_state). */
+   void (*lp_set_framebuffer_state)(struct pipe_context *,
+                                    const struct pipe_framebuffer_state *);
+   struct pipe_resource *fb_color;
+   unsigned              fb_width, fb_height;
    void  (*lp_context_destroy)(struct pipe_context *);
 };
 

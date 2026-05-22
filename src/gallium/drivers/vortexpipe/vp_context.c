@@ -16,11 +16,13 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "vp_private.h"
 #include "vp_nir_to_llvm.h"
 #include "vp_compile.h"
 #include "vp_launch.h"
+#include "vp_raster.h"
 
 #include "pipe/p_state.h"     /* full struct pipe_compute_state */
 #include "util/format/u_formats.h"  /* PIPE_FORMAT_* */
@@ -269,6 +271,116 @@ vp_delete_vs_state(struct pipe_context *pipe, void *p)
    FREE(cso);
 }
 
+/* ---- graphics: fragment-shader hooks (Phase 4) --------------------- */
+
+/* The driver JIT-compiles the fragment shader at pipeline creation,
+ * the same NIR -> LLVM -> .vxbin path the vertex/compute stages use
+ * (a real GPU driver compiles every stage; nothing is prebuilt). */
+static void *
+vp_create_fs_state(struct pipe_context *pipe,
+                   const struct pipe_shader_state *state)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+
+   struct vp_cso *cso = CALLOC_STRUCT(vp_cso);
+   if (!cso)
+      return NULL;
+   cso->lp_cso = vp->lp_create_fs_state(pipe, state);
+
+   if (state->type == PIPE_SHADER_IR_NIR) {
+      char *ir = NULL;
+      if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir, NULL)) {
+         if (vp_compile_vxbin(ir, &cso->vxbin, &cso->vxbin_size))
+            vp_dbg("vortexpipe: compiled fragment shader -> %zu-byte .vxbin",
+                   cso->vxbin_size);
+         else
+            mesa_logw("vortexpipe: FS .vxbin compile failed");
+         vp_free_ir(ir);
+      } else {
+         mesa_logw("vortexpipe: FS NIR->LLVM unavailable; "
+                   "fragment stage runs on llvmpipe");
+      }
+   }
+   return cso;
+}
+
+static void
+vp_bind_fs_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context *vp  = vp_reg_get(pipe);
+   struct vp_cso     *cso = p;
+   vp->cur_fs = cso;
+   vp->lp_bind_fs_state(pipe, cso ? cso->lp_cso : NULL);
+}
+
+static void
+vp_delete_fs_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context *vp  = vp_reg_get(pipe);
+   struct vp_cso     *cso = p;
+   if (vp->cur_fs == cso)
+      vp->cur_fs = NULL;
+   vp->lp_delete_fs_state(pipe, cso->lp_cso);
+   vp_free_blob(cso->vxbin);
+   FREE(cso);
+}
+
+/* ---- graphics: framebuffer interception (Phase 4) ------------------ */
+
+/* Capture colour attachment 0 so the Vortex raster path can round-trip
+ * it; everything else stays with llvmpipe. */
+static void
+vp_set_framebuffer_state(struct pipe_context *pipe,
+                         const struct pipe_framebuffer_state *fb)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->fb_color  = (fb && fb->nr_cbufs > 0 && fb->cbufs[0])
+                      ? fb->cbufs[0]->texture : NULL;
+   vp->fb_width  = fb ? fb->width  : 0;
+   vp->fb_height = fb ? fb->height : 0;
+   vp->lp_set_framebuffer_state(pipe, fb);
+}
+
+/* Copy colour attachment 0 into a tight w*h R8G8B8A8 host buffer. The
+ * Vortex fragment kernel renders into a linear buffer, so the draw
+ * path round-trips: read the (llvmpipe-cleared) attachment, run the
+ * raster path, write the result back with vp_fb_color_write. */
+static bool
+vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
+{
+   if (!vp->fb_color)
+      return false;
+   struct pipe_transfer *xfer = NULL;
+   uint8_t *map = pipe_texture_map(pipe, vp->fb_color, 0, 0, PIPE_MAP_READ,
+                                   0, 0, vp->fb_width, vp->fb_height, &xfer);
+   if (!map)
+      return false;
+   for (unsigned y = 0; y < vp->fb_height; y++)
+      memcpy((uint8_t *)dst + (size_t)y * vp->fb_width * 4,
+             map + (size_t)y * xfer->stride, (size_t)vp->fb_width * 4);
+   pipe_texture_unmap(pipe, xfer);
+   return true;
+}
+
+static bool
+vp_fb_color_write(struct pipe_context *pipe, struct vp_context *vp,
+                  const void *src)
+{
+   if (!vp->fb_color)
+      return false;
+   struct pipe_transfer *xfer = NULL;
+   uint8_t *map = pipe_texture_map(pipe, vp->fb_color, 0, 0, PIPE_MAP_WRITE,
+                                   0, 0, vp->fb_width, vp->fb_height, &xfer);
+   if (!map)
+      return false;
+   for (unsigned y = 0; y < vp->fb_height; y++)
+      memcpy(map + (size_t)y * xfer->stride,
+             (const uint8_t *)src + (size_t)y * vp->fb_width * 4,
+             (size_t)vp->fb_width * 4);
+   pipe_texture_unmap(pipe, xfer);
+   return true;
+}
+
 /* A passthrough vertex shader: copies N input attributes straight to
  * the matching output slots. vortexpipe runs the real VS on Vortex,
  * then draws the transformed vertices through this trivial VS so
@@ -334,6 +446,33 @@ vp_get_velems(struct vp_context *vp, struct pipe_context *pipe,
    return vp->velems;
 }
 
+/* Phase 3 fallback: draw the Vortex-transformed vertices through a
+ * passthrough VS so llvmpipe does clip / raster / fragment / OM. */
+static bool
+vp_draw_passthrough(struct vp_context *vp, struct pipe_context *pipe,
+                    const struct pipe_draw_info *info, unsigned drawid_offset,
+                    void *xverts, uint32_t count)
+{
+   void *pvs    = vp_get_passthrough_vs(vp, pipe, &vp->cur_vs->vs_layout);
+   void *velems = pvs ? vp_get_velems(vp, pipe, &vp->cur_vs->vs_layout) : NULL;
+   if (!velems)
+      return false;
+
+   struct pipe_vertex_buffer vb = { 0 };
+   vb.is_user_buffer = true;
+   vb.buffer.user    = xverts;
+   vp->lp_bind_vs_state(pipe, pvs);
+   pipe->bind_vertex_elements_state(pipe, velems);
+   pipe->set_vertex_buffers(pipe, 1, &vb);
+
+   struct pipe_draw_start_count_bias d = {
+      .start = 0, .count = count, .index_bias = 0,
+   };
+   vp->lp_draw_vbo(pipe, info, drawid_offset, NULL, &d, 1);
+   vp->lp_bind_vs_state(pipe, vp->cur_vs->lp_cso);   /* restore the app VS */
+   return true;
+}
+
 static void
 vp_draw_vbo(struct pipe_context *pipe,
             const struct pipe_draw_info *info,
@@ -344,48 +483,58 @@ vp_draw_vbo(struct pipe_context *pipe,
 {
    struct vp_context *vp = vp_reg_get(pipe);
    struct vp_cso     *vs = vp->cur_vs;
+   struct vp_cso     *fs = vp->cur_fs;
 
-   /* Run the vertex stage on Vortex when we have a translated VS and
-    * the draw is a simple direct, non-indexed, non-instanced single
-    * draw. Anything else falls back wholly to llvmpipe (§4.5). */
-   bool on_vortex =
+   /* Run on Vortex only for a simple direct, non-indexed, non-
+    * instanced single draw with a translated VS; everything else
+    * falls back wholly to llvmpipe (§4.5). */
+   bool simple =
       vp->dev && vs && vs->vxbin && vs->vs_layout.stride &&
       !indirect && num_draws == 1 && info->index_size == 0 &&
       !info->primitive_restart && info->instance_count == 1 &&
       draws[0].count > 0;
 
-   if (on_vortex) {
+   if (simple) {
       uint32_t count  = draws[0].count;
       uint32_t stride = vs->vs_layout.stride;
       void    *xverts = malloc((size_t)count * stride);
-      void    *pvs    = xverts ? vp_get_passthrough_vs(vp, pipe,
-                                                       &vs->vs_layout) : NULL;
-      void    *velems = pvs ? vp_get_velems(vp, pipe, &vs->vs_layout) : NULL;
 
-      if (velems &&
+      if (xverts &&
           vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
                        xverts, count * stride, count)) {
-         /* Feed the Vortex-transformed vertices into llvmpipe: a
-          * passthrough VS + matching vertex layout, so clip / setup /
-          * rasterization / fragment / OM still run on the host CPU. */
-         struct pipe_vertex_buffer vb = { 0 };
-         vb.is_user_buffer = true;
-         vb.buffer.user    = xverts;
+         /* VORTEXPIPE_SW_RASTER forces the Phase 3 llvmpipe-raster
+          * path; otherwise rasterize on the Vortex RASTER unit. */
+         static int sw_raster = -1;
+         if (sw_raster < 0)
+            sw_raster = getenv("VORTEXPIPE_SW_RASTER") != NULL;
 
-         vp->lp_bind_vs_state(pipe, pvs);
-         pipe->bind_vertex_elements_state(pipe, velems);
-         pipe->set_vertex_buffers(pipe, 1, &vb);
+         /* Vortex hardware raster path: round-trip the colour
+          * attachment through the RASTER unit + fragment kernel. */
+         if (!sw_raster && fs && fs->vxbin &&
+             vp->fb_color && vp->fb_width && vp->fb_height) {
+            uint32_t w = vp->fb_width, h = vp->fb_height;
+            void *cbuf = malloc((size_t)w * h * 4);
+            if (cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
+                vp_raster_draw(vp->dev, fs->vxbin, fs->vxbin_size,
+                               xverts, count, &vs->vs_layout, cbuf, w, h) &&
+                vp_fb_color_write(pipe, vp, cbuf)) {
+               vp_dbg("vortexpipe: draw_vbo -> Vortex RASTER unit "
+                      "(%u verts, %ux%u)", count, w, h);
+               free(cbuf);
+               free(xverts);
+               return;
+            }
+            free(cbuf);
+         }
 
-         struct pipe_draw_start_count_bias d = {
-            .start = 0, .count = count, .index_bias = 0,
-         };
-         vp->lp_draw_vbo(pipe, info, drawid_offset, NULL, &d, 1);
-
-         vp->lp_bind_vs_state(pipe, vs->lp_cso);   /* restore the app VS */
-         vp_dbg("vortexpipe: draw_vbo ran the %u-vertex VS on Vortex",
-                count);
-         free(xverts);
-         return;
+         /* fallback: VS on Vortex, rasterization on llvmpipe */
+         if (vp_draw_passthrough(vp, pipe, info, drawid_offset,
+                                 xverts, count)) {
+            vp_dbg("vortexpipe: draw_vbo ran the %u-vertex VS on Vortex "
+                   "(llvmpipe raster)", count);
+            free(xverts);
+            return;
+         }
       }
       free(xverts);
    }
@@ -436,6 +585,10 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_bind_vs_state        = pipe->bind_vs_state;
    vp->lp_delete_vs_state      = pipe->delete_vs_state;
    vp->lp_draw_vbo             = pipe->draw_vbo;
+   vp->lp_create_fs_state      = pipe->create_fs_state;
+   vp->lp_bind_fs_state        = pipe->bind_fs_state;
+   vp->lp_delete_fs_state      = pipe->delete_fs_state;
+   vp->lp_set_framebuffer_state = pipe->set_framebuffer_state;
    vp->lp_context_destroy      = pipe->destroy;
    vp_reg_put(pipe, vp);
 
@@ -449,6 +602,10 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->bind_vs_state        = vp_bind_vs_state;
    pipe->delete_vs_state      = vp_delete_vs_state;
    pipe->draw_vbo             = vp_draw_vbo;
+   pipe->create_fs_state      = vp_create_fs_state;
+   pipe->bind_fs_state        = vp_bind_fs_state;
+   pipe->delete_fs_state      = vp_delete_fs_state;
+   pipe->set_framebuffer_state = vp_set_framebuffer_state;
    pipe->destroy              = vp_context_destroy;
 
    vp_dbg("vortexpipe: context created -- compute hooks intercepted");

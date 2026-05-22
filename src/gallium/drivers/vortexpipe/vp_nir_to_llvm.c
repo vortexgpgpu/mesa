@@ -42,6 +42,21 @@
 #define VX_CSR_CTA_THREAD_ID_X 0xCD3   /* local invocation id, +c for y/z */
 #define VX_CSR_CTA_BLOCK_ID_X  0xCD6   /* workgroup id,        +c for y/z */
 
+/* RASTER CSRs (VX_types.h) -- latched per vx_rast() pop. */
+#define VX_CSR_RASTER_BCOORD_X0 0x7C1  /* +i selects sub-pixel i (0..3) */
+#define VX_CSR_RASTER_BCOORD_Y0 0x7C5
+#define VX_CSR_RASTER_BCOORD_Z0 0x7C9
+#define VX_CSR_RASTER_PID       0x7CD
+#define VX_RASTER_DIM_BITS      15     /* pos_mask x/y field width + 1 */
+
+/* graphics::rast_prim_t layout (sw/common/graphics.h, FIXEDPOINT):
+ * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v}, each a
+ * rast_attrib_t {x,y,z} of fixed24. r/g/b are the colour planes. */
+#define VP_RAST_PRIM_STRIDE 120
+#define VP_RAST_ATTR_R       48
+#define VP_RAST_ATTR_G       60
+#define VP_RAST_ATTR_B       72
+
 /* riscv32 module target (XLEN=32 build). */
 #define VP_TRIPLE      "riscv32-unknown-elf"
 #define VP_DATALAYOUT  "e-m:e-p:32:32-i64:64-n32-S128"
@@ -69,6 +84,10 @@ struct vp_tr {
    LLVMValueRef   vid;          /* i32 vertex id */
    LLVMValueRef   out_base;     /* i32 output-buffer device address */
    unsigned       out_stride;   /* bytes per output vertex record */
+   /* fragment-shader state (is_fs only) */
+   bool           is_fs;
+   LLVMValueRef   fs_in_base;   /* i32 interpolated-varyings area */
+   LLVMValueRef   fs_out_base;  /* i32 output-colour area */
    struct vp_var  vars[VP_MAXV];
    unsigned       nvars;
    bool           ok;
@@ -235,12 +254,23 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
       } else if (v->data.mode == nir_var_shader_out) {
          struct vp_var *e = vp_var_find(t, v);
          if (!e || e->out_off < 0) { t->ok = false; return; }
-         /* out_base + vid * stride + slot_offset */
-         LLVMValueRef voff = LLVMBuildMul(t->b, t->vid,
-            LLVMConstInt(t->i32, t->out_stride, false), "");
-         addr = LLVMBuildAdd(t->b, t->out_base, voff, "");
-         addr = LLVMBuildAdd(t->b, addr,
-            LLVMConstInt(t->i32, (unsigned)e->out_off, false), "vsout");
+         LLVMValueRef off = LLVMConstInt(t->i32, (unsigned)e->out_off, false);
+         if (t->is_vs) {
+            /* vertex shader: out_base + vid * stride + slot_offset */
+            LLVMValueRef voff = LLVMBuildMul(t->b, t->vid,
+               LLVMConstInt(t->i32, t->out_stride, false), "");
+            addr = LLVMBuildAdd(t->b, t->out_base, voff, "");
+            addr = LLVMBuildAdd(t->b, addr, off, "vsout");
+         } else {
+            /* fragment shader: fs_out_base + slot_offset */
+            addr = LLVMBuildAdd(t->b, t->fs_out_base, off, "fsout");
+         }
+      } else if (v->data.mode == nir_var_shader_in && t->is_fs) {
+         /* fragment shader input: an interpolated varying. */
+         struct vp_var *e = vp_var_find(t, v);
+         if (!e || e->out_off < 0) { t->ok = false; return; }
+         addr = LLVMBuildAdd(t->b, t->fs_in_base,
+            LLVMConstInt(t->i32, (unsigned)e->out_off, false), "fsin");
       } else {
          mesa_logw("vortexpipe: vp_nir_to_llvm: deref of unsupported "
                    "var mode %d", (int)v->data.mode);
@@ -447,6 +477,252 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
       out_vs->stride = t->out_stride;
 }
 
+/* Assign each fragment-shader input varying and output a 16-byte slot,
+ * in declaration order. Inputs index the interpolated-varyings area
+ * the kernel wrapper fills; outputs index the colour-output area. */
+static void
+fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
+{
+   unsigned off = 0;
+   nir_foreach_shader_in_variable(var, nir) {
+      if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      t->vars[t->nvars].var     = var;
+      t->vars[t->nvars].alloca  = NULL;
+      t->vars[t->nvars].out_off = (int)off;
+      t->nvars++;
+      off += 16;
+   }
+   off = 0;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      t->vars[t->nvars].var     = var;
+      t->vars[t->nvars].alloca  = NULL;
+      t->vars[t->nvars].out_off = (int)off;
+      t->nvars++;
+      off += 16;
+   }
+}
+
+/* ---- fragment-kernel wrapper (Phase 4 Step 2) ----------------------- *
+ * A fragment shader runs on Vortex as a rasterizer-driven kernel: every
+ * thread polls vx_rast() for quads, the wrapper interpolates the
+ * varyings from the bcoord CSRs + the primitive buffer, calls the
+ * translated fragment-shader body (fs_main), and writes the framebuffer.
+ * The wrapper is hand-emitted -- it is the driver's fixed-function glue
+ * around the programmable stage, and the translator's first emission of
+ * control flow (a loop + per-pixel branches).                          */
+
+static LLVMValueRef
+addk(struct vp_tr *t, LLVMValueRef v, unsigned k)
+{
+   return LLVMBuildAdd(t->b, v, LLVMConstInt(t->i32, k, false), "");
+}
+
+/* load an i32 from an i32 byte address */
+static LLVMValueRef
+emit_load_i32(struct vp_tr *t, LLVMValueRef addr)
+{
+   return LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildIntToPtr(t->b, addr, t->ptr, ""), "");
+}
+
+static void
+emit_store_i32(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef val)
+{
+   LLVMBuildStore(t->b, val,
+      LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
+}
+
+/* vx_rast(): pop a quad from the raster unit (custom-1, funct3=3).
+ * Returns the pos_mask word; 0 means the queue is drained. */
+static LLVMValueRef
+emit_vx_rast(struct vp_tr *t)
+{
+   const char *s = ".insn r 43, 3, 0, $0, x0, x0";
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, NULL, 0, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r", 3,
+                                      /*HasSideEffects*/ true,
+                                      /*IsAlignStack*/ false,
+                                      LLVMInlineAsmDialectATT,
+                                      /*CanThrow*/ false);
+   return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, "rast");
+}
+
+/* reinterpret a raw fixed-point i32 as float: (float)raw / 2^frac */
+static LLVMValueRef
+emit_fixed_to_float(struct vp_tr *t, LLVMValueRef raw, unsigned frac)
+{
+   LLVMValueRef f = LLVMBuildSIToFP(t->b, raw, t->f32, "");
+   return LLVMBuildFMul(t->b, f,
+      LLVMConstReal(t->f32, 1.0 / (double)(1u << frac)), "");
+}
+
+/* interpolate one rast_attrib_t {x,y,z} plane: x*dx + y*dy + z. */
+static LLVMValueRef
+emit_interp(struct vp_tr *t, LLVMValueRef attr,
+            LLVMValueRef dx, LLVMValueRef dy)
+{
+   LLVMValueRef ax = emit_fixed_to_float(t, emit_load_i32(t, attr), 24);
+   LLVMValueRef ay = emit_fixed_to_float(t, emit_load_i32(t, addk(t, attr, 4)), 24);
+   LLVMValueRef az = emit_fixed_to_float(t, emit_load_i32(t, addk(t, attr, 8)), 24);
+   LLVMValueRef r  = LLVMBuildFMul(t->b, ax, dx, "");
+   r = LLVMBuildFAdd(t->b, r, LLVMBuildFMul(t->b, ay, dy, ""), "");
+   return LLVMBuildFAdd(t->b, r, az, "");
+}
+
+/* float colour component in [0,1] -> 8-bit integer (clamped). */
+static LLVMValueRef
+emit_to_byte(struct vp_tr *t, LLVMValueRef f)
+{
+   LLVMValueRef z = LLVMConstReal(t->f32, 0.0);
+   LLVMValueRef o = LLVMConstReal(t->f32, 1.0);
+   f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, f, z, ""),
+                       f, z, "");
+   f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, f, o, ""),
+                       f, o, "");
+   return LLVMBuildFPToUI(t->b,
+      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, 255.0), ""), t->i32, "");
+}
+
+/* read arg-block slot k (an i64 device address) truncated to i32 */
+static LLVMValueRef
+emit_arg_i32(struct vp_tr *t, LLVMValueRef arg, unsigned k)
+{
+   LLVMValueRef idx = LLVMConstInt(t->i32, k, false);
+   LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, arg, &idx, 1, "");
+   return LLVMBuildTrunc(t->b, LLVMBuildLoad2(t->b, t->i64, gep, ""),
+                         t->i32, "");
+}
+
+/* Build kernel_main: the rasterizer poll-loop wrapper that drives the
+ * translated fragment body `fs_main`. arg block: [0]=primitive buffer,
+ * [1]=colour buffer, [2]=colour-buffer row pitch (bytes). */
+static LLVMValueRef
+emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
+{
+   LLVMTypeRef  p1[1] = { t->ptr };
+   LLVMTypeRef  kty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                       p1, 1, false);
+   LLVMValueRef fn  = LLVMAddFunction(t->mod, "kernel_main", kty);
+   LLVMValueRef arg = LLVMGetParam(fn, 0);
+
+   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t->ctx, fn, "entry");
+   LLVMBasicBlockRef loop  = LLVMAppendBasicBlockInContext(t->ctx, fn, "loop");
+   LLVMBasicBlockRef body  = LLVMAppendBasicBlockInContext(t->ctx, fn, "body");
+   LLVMBasicBlockRef exit  = LLVMAppendBasicBlockInContext(t->ctx, fn, "exit");
+
+   /* entry: read the arg block, allocate per-pixel scratch. */
+   LLVMPositionBuilderAtEnd(t->b, entry);
+   LLVMValueRef prim_base  = emit_arg_i32(t, arg, 0);
+   LLVMValueRef cbuf_base  = emit_arg_i32(t, arg, 1);
+   LLVMValueRef cbuf_pitch = emit_arg_i32(t, arg, 2);
+   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16),
+                                          "fs_in");
+   LLVMValueRef out_scr = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4),
+                                          "fs_out");
+   LLVMValueRef in_addr  = LLVMBuildPtrToInt(t->b, in_scr,  t->i32, "");
+   LLVMValueRef out_addr = LLVMBuildPtrToInt(t->b, out_scr, t->i32, "");
+   LLVMBuildBr(t->b, loop);
+
+   /* loop: pop a quad; stop when the raster queue drains. */
+   LLVMPositionBuilderAtEnd(t->b, loop);
+   LLVMValueRef pos_mask = emit_vx_rast(t);
+   LLVMBuildCondBr(t->b,
+      LLVMBuildICmp(t->b, LLVMIntEQ, pos_mask,
+                    LLVMConstInt(t->i32, 0, false), ""),
+      exit, body);
+
+   /* body: unpack the quad, shade its covered sub-pixels. */
+   LLVMPositionBuilderAtEnd(t->b, body);
+   LLVMValueRef pid  = emit_csr_read(t, VX_CSR_RASTER_PID, "pid");
+   LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base,
+      LLVMBuildMul(t->b, pid,
+                   LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), ""),
+      "prim");
+   LLVMValueRef mask = LLVMBuildAnd(t->b, pos_mask,
+      LLVMConstInt(t->i32, 0xf, false), "mask");
+   unsigned dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
+   LLVMValueRef qx = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4, false), ""),
+      LLVMConstInt(t->i32, dim_mask, false), "qx");
+   LLVMValueRef qy = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask,
+                    LLVMConstInt(t->i32, 4 + VX_RASTER_DIM_BITS - 1, false), ""),
+      LLVMConstInt(t->i32, dim_mask, false), "qy");
+
+   for (unsigned i = 0; i < 4; i++) {
+      LLVMBasicBlockRef px  = LLVMAppendBasicBlockInContext(t->ctx, fn, "px");
+      LLVMBasicBlockRef nxt = LLVMAppendBasicBlockInContext(t->ctx, fn, "nxt");
+      LLVMValueRef cov = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, mask, LLVMConstInt(t->i32, i, false), ""),
+         LLVMConstInt(t->i32, 1, false), "");
+      LLVMBuildCondBr(t->b,
+         LLVMBuildICmp(t->b, LLVMIntNE, cov,
+                       LLVMConstInt(t->i32, 0, false), ""), px, nxt);
+
+      LLVMPositionBuilderAtEnd(t->b, px);
+      /* barycentric gradient: dx = F0/(F0+F1+F2), dy = F1/sum. */
+      LLVMValueRef f0 = emit_fixed_to_float(t,
+         emit_csr_read(t, VX_CSR_RASTER_BCOORD_X0 + i, "f0"), 16);
+      LLVMValueRef f1 = emit_fixed_to_float(t,
+         emit_csr_read(t, VX_CSR_RASTER_BCOORD_Y0 + i, "f1"), 16);
+      LLVMValueRef f2 = emit_fixed_to_float(t,
+         emit_csr_read(t, VX_CSR_RASTER_BCOORD_Z0 + i, "f2"), 16);
+      LLVMValueRef sum = LLVMBuildFAdd(t->b,
+         LLVMBuildFAdd(t->b, f0, f1, ""), f2, "");
+      LLVMValueRef recip = LLVMBuildFDiv(t->b,
+         LLVMConstReal(t->f32, 1.0), sum, "recip");
+      LLVMValueRef dx = LLVMBuildFMul(t->b, recip, f0, "dx");
+      LLVMValueRef dy = LLVMBuildFMul(t->b, recip, f1, "dy");
+
+      /* interpolate the colour and hand it to the FS as input slot 0. */
+      LLVMValueRef cr = emit_interp(t, addk(t, prim, VP_RAST_ATTR_R), dx, dy);
+      LLVMValueRef cg = emit_interp(t, addk(t, prim, VP_RAST_ATTR_G), dx, dy);
+      LLVMValueRef cb = emit_interp(t, addk(t, prim, VP_RAST_ATTR_B), dx, dy);
+      emit_store_i32(t, in_addr,
+         LLVMBuildBitCast(t->b, cr, t->i32, ""));
+      emit_store_i32(t, addk(t, in_addr, 4),
+         LLVMBuildBitCast(t->b, cg, t->i32, ""));
+      emit_store_i32(t, addk(t, in_addr, 8),
+         LLVMBuildBitCast(t->b, cb, t->i32, ""));
+
+      /* run the programmable fragment shader */
+      LLVMValueRef cargs[2] = { in_scr, out_scr };
+      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 2, "");
+
+      /* pack the FS output (4 floats) into an R8G8B8A8 pixel. */
+      LLVMValueRef rgba = LLVMConstInt(t->i32, 0, false);
+      for (unsigned c = 0; c < 4; c++) {
+         LLVMValueRef fc = LLVMBuildBitCast(t->b,
+            emit_load_i32(t, addk(t, out_addr, c * 4)), t->f32, "");
+         LLVMValueRef bc = LLVMBuildShl(t->b, emit_to_byte(t, fc),
+            LLVMConstInt(t->i32, c * 8, false), "");
+         rgba = LLVMBuildOr(t->b, rgba, bc, "");
+      }
+
+      /* framebuffer write: cbuf_base + px*4 + py*pitch. */
+      LLVMValueRef px_i = LLVMBuildAdd(t->b,
+         LLVMBuildShl(t->b, qx, LLVMConstInt(t->i32, 1, false), ""),
+         LLVMConstInt(t->i32, i & 1, false), "");
+      LLVMValueRef py_i = LLVMBuildAdd(t->b,
+         LLVMBuildShl(t->b, qy, LLVMConstInt(t->i32, 1, false), ""),
+         LLVMConstInt(t->i32, i >> 1, false), "");
+      LLVMValueRef faddr = LLVMBuildAdd(t->b, cbuf_base,
+         LLVMBuildAdd(t->b,
+            LLVMBuildMul(t->b, px_i, LLVMConstInt(t->i32, 4, false), ""),
+            LLVMBuildMul(t->b, py_i, cbuf_pitch, ""), ""), "");
+      emit_store_i32(t, faddr, rgba);
+      LLVMBuildBr(t->b, nxt);
+
+      LLVMPositionBuilderAtEnd(t->b, nxt);   /* fall through to next pixel */
+   }
+   LLVMBuildBr(t->b, loop);
+
+   LLVMPositionBuilderAtEnd(t->b, exit);
+   LLVMBuildRetVoid(t->b);
+   return fn;
+}
+
 bool
 vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
                struct vp_vs_layout *out_vs)
@@ -467,6 +743,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    struct vp_tr t = {0};
    t.ok    = true;
    t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
+   t.is_fs = (nir->info.stage == MESA_SHADER_FRAGMENT);
    t.ctx   = LLVMContextCreate();
    t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
    LLVMSetTarget(t.mod, VP_TRIPLE);
@@ -478,15 +755,26 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    t.f32 = LLVMFloatTypeInContext(t.ctx);
    t.ptr = LLVMPointerTypeInContext(t.ctx, 0);
 
-   /* the Vortex KMU kernel entry: void kernel_main(ptr arg).
-    * The name is fixed -- the KMU startup (vx_start.S in
-    * libvortex2.a) calls `kernel_main` from its .init. */
-   LLVMTypeRef  params[1] = { t.ptr };
-   LLVMTypeRef  fnty = LLVMFunctionType(LLVMVoidTypeInContext(t.ctx),
-                                        params, 1, false);
-   LLVMValueRef fn   = LLVMAddFunction(t.mod, "kernel_main", fnty);
-   t.arg = LLVMGetParam(fn, 0);
-   LLVMSetValueName2(t.arg, "arg", 3);
+   /* The function the NIR body is walked into. Compute and vertex
+    * shaders ARE kernel_main; a fragment shader is fs_main(in,out) --
+    * emit_fs_wrapper then builds the kernel_main that drives it. The
+    * KMU startup (vx_start.S in libvortex2.a) calls `kernel_main`. */
+   LLVMValueRef fn;
+   LLVMTypeRef  fs_main_ty = NULL;
+   if (t.is_fs) {
+      LLVMTypeRef p2[2] = { t.ptr, t.ptr };
+      fs_main_ty = LLVMFunctionType(LLVMVoidTypeInContext(t.ctx),
+                                    p2, 2, false);
+      fn = LLVMAddFunction(t.mod, "fs_main", fs_main_ty);
+      LLVMSetLinkage(fn, LLVMInternalLinkage);
+   } else {
+      LLVMTypeRef p1[1] = { t.ptr };
+      LLVMTypeRef kty = LLVMFunctionType(LLVMVoidTypeInContext(t.ctx),
+                                         p1, 1, false);
+      fn = LLVMAddFunction(t.mod, "kernel_main", kty);
+      t.arg = LLVMGetParam(fn, 0);
+      LLVMSetValueName2(t.arg, "arg", 3);
+   }
 
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t.ctx, fn, "entry");
    LLVMPositionBuilderAtEnd(t.b, entry);
@@ -498,6 +786,17 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       t.vid = emit_csr_read(&t, VX_CSR_CTA_THREAD_ID_X, "vid");
       LLVMValueRef ob64 = LLVMBuildLoad2(t.b, t.i64, t.arg, "outbase64");
       t.out_base = LLVMBuildTrunc(t.b, ob64, t.i32, "outbase");
+   }
+
+   /* Fragment-shader prologue: assign varying/output slots. fs_main's
+    * two ptr params are the per-pixel interpolated-varyings input and
+    * the colour-output area; the wrapper (emit_fs_wrapper) fills them. */
+   if (t.is_fs) {
+      fs_scan_io(&t, nir);
+      t.fs_in_base  = LLVMBuildPtrToInt(t.b, LLVMGetParam(fn, 0),
+                                        t.i32, "fsin");
+      t.fs_out_base = LLVMBuildPtrToInt(t.b, LLVMGetParam(fn, 1),
+                                        t.i32, "fsout");
    }
 
    nir_foreach_function_impl(impl, nir) {
@@ -519,15 +818,22 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
 
    LLVMBuildRetVoid(t.b);
 
+   /* Fragment shaders: wrap fs_main in the rasterizer poll-loop
+    * kernel_main. Compute/vertex shaders are already kernel_main. */
+   LLVMValueRef kfn = fn;
+   if (t.is_fs && t.ok)
+      kfn = emit_fs_wrapper(&t, fn, fs_main_ty);
+
    if (t.ok)
-      emit_kernel_annotation(&t, fn);
+      emit_kernel_annotation(&t, kfn);
 
    char *err = NULL;
    bool ok = t.ok &&
              LLVMVerifyModule(t.mod, LLVMReturnStatusAction, &err) == 0;
    if (ok) {
       vp_dbg("vortexpipe: vp_nir_to_llvm: translated %s shader to a "
-             "Vortex kernel module", t.is_vs ? "vertex" : "compute");
+             "Vortex kernel module",
+             t.is_vs ? "vertex" : t.is_fs ? "fragment" : "compute");
       char *ir = LLVMPrintModuleToString(t.mod);
       if (getenv("VORTEXPIPE_DEBUG_IR"))
          fprintf(stderr, "=== vortexpipe: generated LLVM IR ===\n%s"
