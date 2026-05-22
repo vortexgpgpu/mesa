@@ -118,15 +118,22 @@ done:
    return ok;
 }
 
+/* attribute-table entry the VS kernel reads: { device base, stride }.
+ * The table is indexed by VS input driver_location. */
+#define VP_ATTR_ENTRY_BYTES 8
+#define VP_ATTR_TABLE_LOCS  8
+
 bool
 vp_launch_vs(vx_device_h dev,
              const void *vxbin, size_t vxbin_size,
              void *out_host, uint32_t out_bytes,
-             uint32_t vertex_count)
+             uint32_t vertex_count,
+             const struct vp_vertex_input *vin)
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
-   vx_buffer_h kbuf = NULL, abuf = NULL, obuf = NULL;
+   vx_buffer_h kbuf = NULL, abuf = NULL, obuf = NULL,
+               vbuf = NULL, tbuf = NULL;
    char vxpath[] = "/tmp/vortexpipe-vs.XXXXXX";
    int  vxfd = -1;
 
@@ -157,9 +164,46 @@ vp_launch_vs(vx_device_h dev,
    uint64_t out_dev = 0;
    VP_CHECK(vx_buffer_address(obuf, &out_dev), "vx_buffer_address");
 
-   /* arg block: slot 0 -> output buffer device address */
+   /* arg block: slot 0 -> output buffer device address,
+    *            slot 1 -> vertex attribute table (0 if self-contained) */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
    argblk[0] = out_dev;
+
+   /* Vertex buffer + attribute table: upload the interleaved vertex
+    * buffer, then a table indexed by driver_location holding the
+    * device base address + stride of each attribute. The VS kernel
+    * fetches input `loc` of vertex `vid` at table[loc].base +
+    * vid*table[loc].stride.
+    *
+    * `table` is declared at function scope: vx_enqueue_write is
+    * asynchronous (the source is read at vx_queue_finish), so it must
+    * outlive the `if` block -- the same lifetime rule as argblk. */
+   uint32_t table[VP_ATTR_TABLE_LOCS * 2] = { 0 };
+   if (vin && vin->num_attrs) {
+      VP_CHECK(vx_buffer_create(dev, vin->size, 0, &vbuf),
+               "vx_buffer_create(vbuf)");
+      uint64_t vbuf_dev = 0;
+      VP_CHECK(vx_buffer_address(vbuf, &vbuf_dev), "vx_buffer_address(vbuf)");
+      VP_CHECK(vx_enqueue_write(q, vbuf, 0, vin->data, vin->size,
+                                0, NULL, NULL), "vx_enqueue_write(vbuf)");
+
+      for (uint32_t i = 0; i < vin->num_attrs; i++) {
+         uint32_t loc = vin->attr_loc[i];
+         if (loc >= VP_ATTR_TABLE_LOCS)
+            continue;
+         table[loc * 2 + 0] = (uint32_t)vbuf_dev + vin->base_offset
+                            + vin->attr_offset[i];
+         table[loc * 2 + 1] = vin->attr_stride[i];
+      }
+      VP_CHECK(vx_buffer_create(dev, sizeof(table), 0, &tbuf),
+               "vx_buffer_create(attrtab)");
+      uint64_t tbuf_dev = 0;
+      VP_CHECK(vx_buffer_address(tbuf, &tbuf_dev), "vx_buffer_address(attrtab)");
+      VP_CHECK(vx_enqueue_write(q, tbuf, 0, table, sizeof(table),
+                                0, NULL, NULL), "vx_enqueue_write(attrtab)");
+      argblk[1] = tbuf_dev;
+   }
+
    VP_CHECK(vx_buffer_create(dev, sizeof(argblk), 0, &abuf),
             "vx_buffer_create(args)");
    VP_CHECK(vx_enqueue_write(q, abuf, 0, argblk, sizeof(argblk), 0, NULL, NULL),
@@ -182,6 +226,8 @@ vp_launch_vs(vx_device_h dev,
    ok = true;
 
 done:
+   if (tbuf) vx_buffer_release(tbuf);
+   if (vbuf) vx_buffer_release(vbuf);
    if (obuf) vx_buffer_release(obuf);
    if (abuf) vx_buffer_release(abuf);
    if (kbuf) vx_buffer_release(kbuf);

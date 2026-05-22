@@ -29,6 +29,7 @@ struct vp_vs_layout {
    unsigned num_varyings;                    /* generic varyings (after POS) */
    int      varying_loc[VP_VS_MAX_VARYINGS];  /* VARYING_SLOT_* per varying */
    unsigned varying_comps[VP_VS_MAX_VARYINGS];/* component count per varying */
+   bool     needs_vertex_input;              /* VS fetches vertex attributes */
 };
 
 /* Translate a NIR shader (compute or vertex) to LLVM IR. On success

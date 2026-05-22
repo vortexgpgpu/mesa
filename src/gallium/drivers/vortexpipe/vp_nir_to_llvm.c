@@ -92,6 +92,7 @@ struct vp_tr {
    LLVMValueRef   vid;          /* i32 vertex id */
    LLVMValueRef   out_base;     /* i32 output-buffer device address */
    unsigned       out_stride;   /* bytes per output vertex record */
+   LLVMValueRef   attr_table;   /* i32 addr of the {base,stride}[] table */
    /* fragment-shader state (is_fs only) */
    bool           is_fs;
    LLVMValueRef   fs_in_base;   /* i32 interpolated-varyings area */
@@ -141,6 +142,25 @@ emit_csr_read(struct vp_tr *t, unsigned csr, const char *name)
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
    return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, name);
+}
+
+/* VS vertex-input fetch: the device address of attribute `loc` for the
+ * current vertex. The attribute table (arg slot 1) holds, per VS input
+ * driver_location, a { device base, stride } pair; the attribute lives
+ * at base + vid*stride (vp_launch_vs builds the table). */
+static LLVMValueRef
+emit_vs_attr_addr(struct vp_tr *t, unsigned loc)
+{
+   LLVMValueRef ent = LLVMBuildAdd(t->b, t->attr_table,
+      LLVMConstInt(t->i32, loc * 8u, false), "");
+   LLVMValueRef base = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildIntToPtr(t->b, ent, t->ptr, ""), "attrbase");
+   LLVMValueRef stride = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildIntToPtr(t->b,
+         LLVMBuildAdd(t->b, ent, LLVMConstInt(t->i32, 4, false), ""),
+         t->ptr, ""), "attrstride");
+   return LLVMBuildAdd(t->b, base,
+      LLVMBuildMul(t->b, t->vid, stride, ""), "vsin");
 }
 
 /* byte size of a glsl type (32-bit scalars/vectors, arrays thereof) */
@@ -279,6 +299,10 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
          if (!e || e->out_off < 0) { t->ok = false; return; }
          addr = LLVMBuildAdd(t->b, t->fs_in_base,
             LLVMConstInt(t->i32, (unsigned)e->out_off, false), "fsin");
+      } else if (v->data.mode == nir_var_shader_in && t->is_vs) {
+         /* vertex shader input: a per-vertex attribute fetched from
+          * the bound vertex buffer (deref-based NIR path). */
+         addr = emit_vs_attr_addr(t, v->data.driver_location);
       } else if (v->data.mode == nir_var_uniform) {
          /* a combined image-sampler handle. gfx-v1 binds a single
           * texture to TEX stage 0 through DCRs, so the deref carries
@@ -330,6 +354,20 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_vertex_id_zero_base:
       ssa_set(t, in->def.index, 0, t->vid);
       break;
+   /* vertex-attribute fetch (lowered-IO NIR path): read each component
+    * from the bound vertex buffer at attr base + component offset. */
+   case nir_intrinsic_load_input: {
+      unsigned loc  = nir_intrinsic_base(in);
+      unsigned comp = nir_intrinsic_component(in);
+      LLVMValueRef attr = emit_vs_attr_addr(t, loc);
+      for (unsigned c = 0; c < in->def.num_components; c++) {
+         LLVMValueRef a = LLVMBuildAdd(t->b, attr,
+            LLVMConstInt(t->i32, (comp + c) * 4u, false), "");
+         LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, t->i32, p, "in"));
+      }
+      break;
+   }
    case nir_intrinsic_load_const_buf_base_addr_lvp: {
       /* SSBO/UBO base address = arg_block[index] (array of i64). A
        * fragment shader has no arg block -- the only descriptor it
@@ -931,9 +969,17 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
     * vertex id and the output-buffer base from %arg[0]. */
    if (t.is_vs) {
       vs_scan_outputs(&t, nir, out_vs);
+      if (out_vs)
+         out_vs->needs_vertex_input = (nir->info.inputs_read != 0);
       t.vid = emit_csr_read(&t, VX_CSR_CTA_THREAD_ID_X, "vid");
       LLVMValueRef ob64 = LLVMBuildLoad2(t.b, t.i64, t.arg, "outbase64");
       t.out_base = LLVMBuildTrunc(t.b, ob64, t.i32, "outbase");
+      /* arg slot 1: the vertex-attribute table (vp_launch_vs) -- 0 for
+       * a self-contained VS that fetches no vertex-buffer inputs. */
+      LLVMValueRef one = LLVMConstInt(t.i32, 1, false);
+      LLVMValueRef atp = LLVMBuildGEP2(t.b, t.i64, t.arg, &one, 1, "");
+      t.attr_table = LLVMBuildTrunc(t.b,
+         LLVMBuildLoad2(t.b, t.i64, atp, "attrtab64"), t.i32, "attrtab");
    }
 
    /* Fragment-shader prologue: assign varying/output slots. fs_main's

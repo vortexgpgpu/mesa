@@ -20,6 +20,7 @@
 
 #include "pipe/p_screen.h"
 #include "pipe/p_context.h"
+#include "pipe/p_state.h"      /* struct pipe_vertex_buffer (stored by value) */
 
 #include "vortex2.h"
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
@@ -68,6 +69,20 @@ struct vp_sampler_cso {
    uint32_t filter;            /* VX_TEX_FILTER_* */
    uint32_t wrap_u;            /* VX_TEX_WRAP_* */
    uint32_t wrap_v;
+};
+
+/* Captured vertex-input layout. The VS kernel fetches one thread's
+ * vertex attributes from device memory, so vortexpipe needs the
+ * per-attribute byte offset + stride; like the depth/blend csos it is
+ * registered (keyed by the llvmpipe cso, via vp_reg). gfx-v1 supports
+ * a single interleaved vertex buffer with 32-bit (float) components --
+ * what tests/vulkan/draw3d feeds. */
+#define VP_MAX_ATTR 8
+struct vp_velems_cso {
+   unsigned num;
+   uint32_t src_offset[VP_MAX_ATTR];   /* attribute byte offset in a vertex */
+   uint32_t src_stride[VP_MAX_ATTR];   /* bytes between consecutive vertices */
+   uint8_t  buffer_index[VP_MAX_ATTR]; /* which bound vertex buffer */
 };
 
 /* Per-context vortexpipe state, keyed by the llvmpipe pipe_context *. */
@@ -141,6 +156,18 @@ struct vp_context {
    uint64_t (*lp_create_texture_handle)(struct pipe_context *,
                                         struct pipe_sampler_view *,
                                         const struct pipe_sampler_state *);
+   /* Vertex input: the bound vertex-elements layout + vertex buffers,
+    * so the VS kernel can fetch per-vertex attributes from device
+    * memory (see vp_launch_vs / the VS load_input path). */
+   struct vp_velems_cso     *cur_velems;
+   struct pipe_vertex_buffer vbufs[VP_MAX_ATTR];
+   unsigned                  num_vbufs;
+   void *(*lp_create_vertex_elements_state)(struct pipe_context *, unsigned,
+                                            const struct pipe_vertex_element *);
+   void  (*lp_bind_vertex_elements_state)(struct pipe_context *, void *);
+   void  (*lp_delete_vertex_elements_state)(struct pipe_context *, void *);
+   void  (*lp_set_vertex_buffers)(struct pipe_context *, unsigned,
+                                  const struct pipe_vertex_buffer *);
    void  (*lp_context_destroy)(struct pipe_context *);
 };
 

@@ -384,6 +384,73 @@ vp_create_texture_handle(struct pipe_context *pipe,
    return vp->lp_create_texture_handle(pipe, view, state);
 }
 
+/* ---- graphics: vertex input ---------------------------------------- *
+ * The VS runs as a Vortex compute kernel that fetches each thread's
+ * vertex attributes from device memory, so vortexpipe captures the
+ * vertex-elements layout + the bound vertex buffers and hands them to
+ * vp_launch_vs. The velems cso is registered in the pointer registry
+ * (keyed by the llvmpipe cso) like the depth/blend csos -- csos made
+ * by util_blitter before the hooks armed pass straight through. */
+static void *
+vp_create_vertex_elements_state(struct pipe_context *pipe, unsigned num,
+                                const struct pipe_vertex_element *elements)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   void *lp_cso = vp->lp_create_vertex_elements_state(pipe, num, elements);
+
+   struct vp_velems_cso *cso = CALLOC_STRUCT(vp_velems_cso);
+   if (cso && num <= VP_MAX_ATTR) {
+      cso->num = num;
+      for (unsigned i = 0; i < num; i++) {
+         cso->src_offset[i]   = elements[i].src_offset;
+         cso->src_stride[i]   = elements[i].src_stride;
+         cso->buffer_index[i] = elements[i].vertex_buffer_index;
+      }
+      vp_reg_put(lp_cso, cso);
+   } else {
+      /* >VP_MAX_ATTR attributes: leave unregistered -> the draw sees
+       * cur_velems == NULL and falls back to llvmpipe. */
+      FREE(cso);
+   }
+   return lp_cso;
+}
+
+static void
+vp_bind_vertex_elements_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->cur_velems = p ? vp_reg_get(p) : NULL;
+   vp->lp_bind_vertex_elements_state(pipe, p);
+}
+
+static void
+vp_delete_vertex_elements_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context    *vp  = vp_reg_get(pipe);
+   struct vp_velems_cso *cso = p ? vp_reg_get(p) : NULL;
+   if (cso) {
+      if (vp->cur_velems == cso)
+         vp->cur_velems = NULL;
+      vp_reg_del(p);
+      FREE(cso);
+   }
+   vp->lp_delete_vertex_elements_state(pipe, p);
+}
+
+static void
+vp_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
+                      const struct pipe_vertex_buffer *buffers)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->num_vbufs = 0;
+   if (buffers && count <= VP_MAX_ATTR) {
+      for (unsigned i = 0; i < count; i++)
+         vp->vbufs[i] = buffers[i];
+      vp->num_vbufs = count;
+   }
+   vp->lp_set_vertex_buffers(pipe, count, buffers);
+}
+
 /* ---- graphics: framebuffer interception (Phase 4) ------------------ */
 
 /* Capture colour attachment 0 and the depth/stencil attachment so the
@@ -735,6 +802,50 @@ vp_draw_passthrough(struct vp_context *vp, struct pipe_context *pipe,
    return true;
 }
 
+/* Fill `vin` with the bound vertex-buffer geometry so the VS kernel
+ * can fetch per-vertex attributes. gfx-v1 supports a single
+ * resource-backed interleaved vertex buffer; returns false (the draw
+ * then falls back to llvmpipe) for anything else. On success *xfer
+ * holds the buffer mapping the caller must unmap. */
+static bool
+vp_gather_vertex_input(struct pipe_context *pipe, struct vp_context *vp,
+                       const struct pipe_draw_start_count_bias *draws,
+                       struct vp_vertex_input *vin,
+                       struct pipe_transfer **xfer)
+{
+   struct vp_velems_cso *ve = vp->cur_velems;
+   if (!ve || ve->num == 0 || ve->num > VP_MAX_ATTR || vp->num_vbufs == 0)
+      return false;
+   for (unsigned i = 0; i < ve->num; i++)
+      if (ve->buffer_index[i] != 0)        /* single vertex buffer only */
+         return false;
+
+   const struct pipe_vertex_buffer *vb = &vp->vbufs[0];
+   if (vb->is_user_buffer || !vb->buffer.resource)
+      return false;
+
+   struct pipe_resource *res = vb->buffer.resource;
+   uint8_t *map = pipe_buffer_map(pipe, res, PIPE_MAP_READ, xfer);
+   if (!map)
+      return false;
+
+   vin->data        = map;
+   vin->size        = res->width0;
+   vin->base_offset = vb->buffer_offset;
+   vin->num_attrs   = ve->num;
+   for (unsigned i = 0; i < ve->num; i++) {
+      /* the velems index is the VS input driver_location; fold the
+       * draw's first-vertex offset into the attribute base. */
+      vin->attr_loc[i]    = i;
+      vin->attr_offset[i] = ve->src_offset[i]
+                          + draws[0].start * ve->src_stride[i];
+      vin->attr_stride[i] = ve->src_stride[i];
+   }
+   vp_dbg("vortexpipe: vertex-input: %u attrs, vbuf %u bytes",
+          vin->num_attrs, vin->size);
+   return true;
+}
+
 static void
 vp_draw_vbo(struct pipe_context *pipe,
             const struct pipe_draw_info *info,
@@ -761,9 +872,21 @@ vp_draw_vbo(struct pipe_context *pipe,
       uint32_t stride = vs->vs_layout.stride;
       void    *xverts = malloc((size_t)count * stride);
 
-      if (xverts &&
-          vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
-                       xverts, count * stride, count)) {
+      /* Gather the vertex-buffer geometry if the VS fetches inputs;
+       * if it needs them and we can't supply them, fall back wholly. */
+      struct vp_vertex_input vin = { 0 };
+      struct pipe_transfer  *vxfer = NULL;
+      bool vin_ok = !vs->vs_layout.needs_vertex_input ||
+                    vp_gather_vertex_input(pipe, vp, draws, &vin, &vxfer);
+
+      bool vs_ok = xverts && vin_ok &&
+         vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
+                      xverts, count * stride, count,
+                      vs->vs_layout.needs_vertex_input ? &vin : NULL);
+      if (vxfer)
+         pipe_buffer_unmap(pipe, vxfer);
+
+      if (vs_ok) {
          /* VORTEXPIPE_SW_RASTER forces the Phase 3 llvmpipe-raster
           * path; otherwise rasterize on the Vortex RASTER unit. */
          static int sw_raster = -1;
@@ -923,6 +1046,10 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_bind_blend_state     = pipe->bind_blend_state;
    vp->lp_delete_blend_state   = pipe->delete_blend_state;
    vp->lp_create_texture_handle = pipe->create_texture_handle;
+   vp->lp_create_vertex_elements_state = pipe->create_vertex_elements_state;
+   vp->lp_bind_vertex_elements_state   = pipe->bind_vertex_elements_state;
+   vp->lp_delete_vertex_elements_state = pipe->delete_vertex_elements_state;
+   vp->lp_set_vertex_buffers   = pipe->set_vertex_buffers;
    vp->lp_context_destroy      = pipe->destroy;
    vp_reg_put(pipe, vp);
 
@@ -947,6 +1074,10 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->bind_blend_state     = vp_bind_blend_state;
    pipe->delete_blend_state   = vp_delete_blend_state;
    pipe->create_texture_handle = vp_create_texture_handle;
+   pipe->create_vertex_elements_state = vp_create_vertex_elements_state;
+   pipe->bind_vertex_elements_state   = vp_bind_vertex_elements_state;
+   pipe->delete_vertex_elements_state = vp_delete_vertex_elements_state;
+   pipe->set_vertex_buffers   = vp_set_vertex_buffers;
    pipe->destroy              = vp_context_destroy;
 
    vp_dbg("vortexpipe: context created -- compute hooks intercepted");
