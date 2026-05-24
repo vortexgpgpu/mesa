@@ -153,7 +153,9 @@ vp_launch(vx_device_h dev,
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
-   vx_buffer_h kbuf = NULL, abuf = NULL, dbuf = NULL;
+   vx_module_h kmod = NULL;
+   vx_kernel_h kbuf = NULL;
+   vx_buffer_h dbuf = NULL;
    vx_buffer_h res[VP_MAX_DESCS]      = { 0 };  /* per-descriptor device buffer */
    void       *res_host[VP_MAX_DESCS] = { 0 };  /* its host backing            */
    uint32_t    res_bytes[VP_MAX_DESCS]= { 0 };
@@ -162,7 +164,7 @@ vp_launch(vx_device_h dev,
    char vxpath[] = "/tmp/vortexpipe-k.XXXXXX";
    int  vxfd = -1;
 
-   /* materialize the .vxbin in a temp file for vx_buffer_load_kernel_file */
+   /* materialize the .vxbin in a temp file for vx_module_load_file */
    vxfd = mkstemp(vxpath);
    if (vxfd < 0) {
       mesa_logw("vortexpipe: launch: mkstemp failed");
@@ -195,8 +197,10 @@ vp_launch(vx_device_h dev,
    asc.dev = dev;
    asc.q   = q;
 
-   VP_CHECK(vx_buffer_load_kernel_file(dev, q, vxpath, &kbuf),
-            "vx_buffer_load_kernel_file");
+   VP_CHECK(vx_module_load_file(dev, vxpath, &kmod),
+            "vx_module_load_file");
+   VP_CHECK(vx_module_get_kernel(kmod, "kernel_main", &kbuf),
+            "vx_module_get_kernel");
 
    /* Relocate each descriptor into the staged descriptor blob:
     *  - VP_DESC_BUFFER: copy the resource into device memory, rewrite
@@ -248,20 +252,21 @@ vp_launch(vx_device_h dev,
    VP_CHECK(vx_enqueue_write(q, dbuf, 0, stage, desc_bytes, 0, NULL, NULL),
             "vx_enqueue_write(descriptors)");
 
-   /* arg block: i64[VP_ARG_SLOTS]; slot 1 -> set-0 descriptor buffer */
+   /* arg block: i64[VP_ARG_SLOTS]; slot 1 -> set-0 descriptor buffer.
+    * In the current vortex2 API the runtime stages the arg blob into a
+    * scratch slot at launch time — we pass it inline via args_host
+    * instead of allocating an args buffer. */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
    argblk[1] = desc_dev;
-   VP_CHECK(vx_buffer_create(dev, sizeof(argblk), 0, &abuf),
-            "vx_buffer_create(args)");
-   VP_CHECK(vx_enqueue_write(q, abuf, 0, argblk, sizeof(argblk), 0, NULL, NULL),
-            "vx_enqueue_write(args)");
 
    /* dispatch */
    uint32_t ndim = (grid[2] > 1 || block[2] > 1) ? 3
                  : (grid[1] > 1 || block[1] > 1) ? 2 : 1;
    vx_launch_info_t li = {
       .struct_size = sizeof(li), .next = NULL,
-      .kernel = kbuf, .args = abuf, .ndim = ndim,
+      .kernel = kbuf,
+      .args_host = argblk, .args_size = sizeof(argblk),
+      .ndim = ndim,
       .grid_dim  = { grid[0],  grid[1],  grid[2]  },
       .block_dim = { block[0], block[1], block[2] },
       .lmem_size = lmem_size,
@@ -287,8 +292,8 @@ done:
    for (unsigned i = 0; i < asc.n_stages; i++)
       free(asc.stages[i]);
    if (dbuf) vx_buffer_release(dbuf);
-   if (abuf) vx_buffer_release(abuf);
-   if (kbuf) vx_buffer_release(kbuf);
+   if (kbuf) vx_kernel_release(kbuf);
+   if (kmod) vx_module_release(kmod);
    if (q)    vx_queue_release(q);
    free(stage);
    unlink(vxpath);
@@ -309,8 +314,9 @@ vp_launch_vs(vx_device_h dev,
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
-   vx_buffer_h kbuf = NULL, abuf = NULL, obuf = NULL,
-               vbuf = NULL, tbuf = NULL;
+   vx_module_h kmod = NULL;
+   vx_kernel_h kbuf = NULL;
+   vx_buffer_h obuf = NULL, vbuf = NULL, tbuf = NULL;
    char vxpath[] = "/tmp/vortexpipe-vs.XXXXXX";
    int  vxfd = -1;
 
@@ -332,8 +338,10 @@ vp_launch_vs(vx_device_h dev,
       .priority = VX_QUEUE_PRIORITY_NORMAL, .flags = 0,
    };
    VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
-   VP_CHECK(vx_buffer_load_kernel_file(dev, q, vxpath, &kbuf),
-            "vx_buffer_load_kernel_file");
+   VP_CHECK(vx_module_load_file(dev, vxpath, &kmod),
+            "vx_module_load_file");
+   VP_CHECK(vx_module_get_kernel(kmod, "kernel_main", &kbuf),
+            "vx_module_get_kernel");
 
    /* output vertex-record buffer + its device address */
    VP_CHECK(vx_buffer_create(dev, out_bytes, 0, &obuf),
@@ -381,15 +389,13 @@ vp_launch_vs(vx_device_h dev,
       argblk[1] = tbuf_dev;
    }
 
-   VP_CHECK(vx_buffer_create(dev, sizeof(argblk), 0, &abuf),
-            "vx_buffer_create(args)");
-   VP_CHECK(vx_enqueue_write(q, abuf, 0, argblk, sizeof(argblk), 0, NULL, NULL),
-            "vx_enqueue_write(args)");
-
-   /* one thread per vertex: a single block of `vertex_count` */
+   /* one thread per vertex: a single block of `vertex_count`.
+    * Args passed inline via args_host (see comment in vp_launch). */
    vx_launch_info_t li = {
       .struct_size = sizeof(li), .next = NULL,
-      .kernel = kbuf, .args = abuf, .ndim = 1,
+      .kernel = kbuf,
+      .args_host = argblk, .args_size = sizeof(argblk),
+      .ndim = 1,
       .grid_dim  = { 1, 1, 1 },
       .block_dim = { vertex_count, 1, 1 },
       .lmem_size = 0,
@@ -406,8 +412,8 @@ done:
    if (tbuf) vx_buffer_release(tbuf);
    if (vbuf) vx_buffer_release(vbuf);
    if (obuf) vx_buffer_release(obuf);
-   if (abuf) vx_buffer_release(abuf);
-   if (kbuf) vx_buffer_release(kbuf);
+   if (kbuf) vx_kernel_release(kbuf);
+   if (kmod) vx_module_release(kmod);
    if (q)    vx_queue_release(q);
    unlink(vxpath);
    return ok;

@@ -23,6 +23,12 @@ bool vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size);
 
 void vp_free_blob(void *blob);
 
+/* True when $MESA_VORTEX_XLEN selects rv64 (otherwise rv32). Single
+ * source of truth for the target XLEN -- both vp_compile_vxbin and
+ * the LLVM codegen in vp_nir_to_llvm consult this. Mesa-namespaced
+ * env var so it doesn't collide with the linked Vortex runtime. */
+bool vp_xlen_is_64(void);
+
 #ifdef __cplusplus
 }
 #endif

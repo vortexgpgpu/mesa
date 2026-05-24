@@ -5,8 +5,9 @@
  * vp_nir_to_llvm -- scalar NIR -> LLVM-IR translator (Shape C).
  *
  * Emits a Vortex KMU kernel: `void kernel_main(ptr %arg)`, marked
- * `vortex.kernel` via @llvm.global.annotations, targeting riscv32.
- * Two shader stages are handled:
+ * `vortex.kernel` via @llvm.global.annotations, targeting riscv32
+ * or riscv64 depending on $MESA_VORTEX_XLEN (see vp_xlen_is_64). Two
+ * shader stages are handled:
  *
  *   - Compute: one thread per work-item. SSBO base addresses come
  *     from the lavapipe descriptor buffer, reached through %arg.
@@ -16,12 +17,13 @@
  *
  * NIR SSA values are untyped bit patterns; each component is held as
  * an LLVM iN and ops bit-cast to the type they need. NIR derefs
- * resolve to i32 byte addresses (riscv32 pointers).
+ * resolve to iptr byte addresses (i32 on rv32, i64 on rv64).
  *
  * See docs/proposals/vulkan_support_proposal.md §3 in the Vortex tree.
  */
 
 #include "vp_nir_to_llvm.h"
+#include "vp_compile.h"      /* vp_xlen_is_64 */
 #include "vp_private.h"      /* vp_dbg */
 
 #include <stdio.h>
@@ -72,9 +74,17 @@
 /* TEX unit: coordinates are S.23 fixed-point (VX_types.h VX_TEX_FXD_FRAC). */
 #define VP_TEX_FXD_FRAC      23
 
-/* riscv32 module target (XLEN=32 build). */
-#define VP_TRIPLE      "riscv32-unknown-elf"
-#define VP_DATALAYOUT  "e-m:e-p:32:32-i64:64-n32-S128"
+/* Module target -- the LLVM triple + datalayout follow $MESA_VORTEX_XLEN.
+ * rv32 datalayout: 32-bit pointers, 32-bit native int.
+ * rv64 datalayout: 64-bit pointers (p:64:64), 64-bit native int (n64). */
+static inline const char *vp_target_triple(void) {
+   return vp_xlen_is_64() ? "riscv64-unknown-elf" : "riscv32-unknown-elf";
+}
+static inline const char *vp_target_datalayout(void) {
+   return vp_xlen_is_64()
+      ? "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
+      : "e-m:e-p:32:32-i64:64-n32-S128";
+}
 
 /* A tracked NIR variable: either a function_temp (LLVM alloca) or a
  * shader_out (byte offset of its slot in the per-vertex record). */
@@ -89,27 +99,47 @@ struct vp_tr {
    LLVMModuleRef  mod;
    LLVMBuilderRef b;
    LLVMTypeRef    i8, i32, i64, f32, f64, ptr;
+   /* iptr: pointer-sized int (i32 on rv32, i64 on rv64). Every value
+    * that holds a *device byte address* uses this type, so the LLVM
+    * Add/Mul/IntToPtr ops survive on both XLENs. */
+   LLVMTypeRef    iptr;
    LLVMValueRef   arg;          /* the kernel's %arg parameter (ptr) */
    LLVMValueRef   lmem_base;    /* compute: shared-memory base (CTA LMEM) */
    LLVMBasicBlockRef entry;     /* function entry block (alloca home) */
    /* SSA map: [def index][component] -> iN value (bit pattern).
-    * For a deref instr, component 0 holds the i32 byte address. */
+    * For a deref instr, component 0 holds the iptr byte address. */
    LLVMValueRef  *val;
    unsigned       nval;
    /* vertex-shader state (is_vs only) */
    bool           is_vs;
    LLVMValueRef   vid;          /* i32 vertex id */
-   LLVMValueRef   out_base;     /* i32 output-buffer device address */
+   LLVMValueRef   out_base;     /* iptr output-buffer device address */
    unsigned       out_stride;   /* bytes per output vertex record */
-   LLVMValueRef   attr_table;   /* i32 addr of the {base,stride}[] table */
+   LLVMValueRef   attr_table;   /* iptr addr of the {base,stride}[] table */
    /* fragment-shader state (is_fs only) */
    bool           is_fs;
-   LLVMValueRef   fs_in_base;   /* i32 interpolated-varyings area */
-   LLVMValueRef   fs_out_base;  /* i32 output-colour area */
+   LLVMValueRef   fs_in_base;   /* iptr interpolated-varyings area */
+   LLVMValueRef   fs_out_base;  /* iptr output-colour area */
    struct vp_var  vars[VP_MAXV];
    unsigned       nvars;
    bool           ok;
 };
+
+/* iptr-typed constant (i32 on rv32, i64 on rv64). */
+static inline LLVMValueRef
+vp_iptr_const(struct vp_tr *t, uint64_t v)
+{
+   return LLVMConstInt(t->iptr, v, false);
+}
+
+/* ZExt an i32 value to iptr (no-op on rv32). */
+static inline LLVMValueRef
+vp_to_iptr(struct vp_tr *t, LLVMValueRef v)
+{
+   if (t->iptr == t->i32)
+      return v;
+   return LLVMBuildZExt(t->b, v, t->iptr, "");
+}
 
 static LLVMValueRef
 ssa_get(struct vp_tr *t, unsigned idx, unsigned comp)
@@ -178,20 +208,23 @@ emit_vx_barrier(struct vp_tr *t)
 /* VS vertex-input fetch: the device address of attribute `loc` for the
  * current vertex. The attribute table (arg slot 1) holds, per VS input
  * driver_location, a { device base, stride } pair; the attribute lives
- * at base + vid*stride (vp_launch_vs builds the table). */
+ * at base + vid*stride (vp_launch_vs builds the table). base/stride
+ * are i32 fields on the wire even on rv64 (the table layout is the
+ * same), so widen base to iptr before address arithmetic. */
 static LLVMValueRef
 emit_vs_attr_addr(struct vp_tr *t, unsigned loc)
 {
    LLVMValueRef ent = LLVMBuildAdd(t->b, t->attr_table,
-      LLVMConstInt(t->i32, loc * 8u, false), "");
+      vp_iptr_const(t, loc * 8u), "");
    LLVMValueRef base = LLVMBuildLoad2(t->b, t->i32,
       LLVMBuildIntToPtr(t->b, ent, t->ptr, ""), "attrbase");
    LLVMValueRef stride = LLVMBuildLoad2(t->b, t->i32,
       LLVMBuildIntToPtr(t->b,
-         LLVMBuildAdd(t->b, ent, LLVMConstInt(t->i32, 4, false), ""),
+         LLVMBuildAdd(t->b, ent, vp_iptr_const(t, 4), ""),
          t->ptr, ""), "attrstride");
-   return LLVMBuildAdd(t->b, base,
-      LLVMBuildMul(t->b, t->vid, stride, ""), "vsin");
+   LLVMValueRef offset = LLVMBuildMul(t->b, t->vid, stride, "");
+   return LLVMBuildAdd(t->b, vp_to_iptr(t, base),
+                              vp_to_iptr(t, offset), "vsin");
 }
 
 /* byte size of a glsl type (32- or 64-bit scalars/vectors, arrays). */
@@ -561,15 +594,15 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
             e = &t->vars[t->nvars++];
             e->var = v; e->alloca = a; e->out_off = -1;
          }
-         addr = LLVMBuildPtrToInt(t->b, e->alloca, t->i32, "");
+         addr = LLVMBuildPtrToInt(t->b, e->alloca, t->iptr, "");
       } else if (v->data.mode == nir_var_shader_out) {
          struct vp_var *e = vp_var_find(t, v);
          if (!e || e->out_off < 0) { t->ok = false; return; }
-         LLVMValueRef off = LLVMConstInt(t->i32, (unsigned)e->out_off, false);
+         LLVMValueRef off = vp_iptr_const(t, (unsigned)e->out_off);
          if (t->is_vs) {
             /* vertex shader: out_base + vid * stride + slot_offset */
-            LLVMValueRef voff = LLVMBuildMul(t->b, t->vid,
-               LLVMConstInt(t->i32, t->out_stride, false), "");
+            LLVMValueRef voff = LLVMBuildMul(t->b, vp_to_iptr(t, t->vid),
+               vp_iptr_const(t, t->out_stride), "");
             addr = LLVMBuildAdd(t->b, t->out_base, voff, "");
             addr = LLVMBuildAdd(t->b, addr, off, "vsout");
          } else {
@@ -581,7 +614,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
          struct vp_var *e = vp_var_find(t, v);
          if (!e || e->out_off < 0) { t->ok = false; return; }
          addr = LLVMBuildAdd(t->b, t->fs_in_base,
-            LLVMConstInt(t->i32, (unsigned)e->out_off, false), "fsin");
+            vp_iptr_const(t, (unsigned)e->out_off), "fsin");
       } else if (v->data.mode == nir_var_shader_in && t->is_vs) {
          /* vertex shader input: a per-vertex attribute fetched from
           * the bound vertex buffer (deref-based NIR path). */
@@ -591,7 +624,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
           * texture to TEX stage 0 through DCRs, so the deref carries
           * no address -- emit_tex ignores the texture/sampler deref
           * sources. A placeholder keeps the SSA chain well-formed. */
-         addr = LLVMConstInt(t->i32, 0, false);
+         addr = vp_iptr_const(t, 0);
       } else {
          mesa_logw("vortexpipe: vp_nir_to_llvm: deref of unsupported "
                    "var mode %d", (int)v->data.mode);
@@ -604,8 +637,8 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
       LLVMValueRef base = ssa_get(t, d->parent.ssa->index, 0);
       LLVMValueRef idx  = ssa_get(t, d->arr.index.ssa->index, 0);
       if (!base || !idx) { t->ok = false; return; }
-      LLVMValueRef off = LLVMBuildMul(t->b, idx,
-         LLVMConstInt(t->i32, glsl_bytes(d->type), false), "");
+      LLVMValueRef off = LLVMBuildMul(t->b, vp_to_iptr(t, idx),
+         vp_iptr_const(t, glsl_bytes(d->type)), "");
       addr = LLVMBuildAdd(t->b, base, off, "elem");
       break;
    }
@@ -648,7 +681,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMValueRef attr = emit_vs_attr_addr(t, loc);
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, attr,
-            LLVMConstInt(t->i32, (comp + c) * 4u, false), "");
+            vp_iptr_const(t, (comp + c) * 4u), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
          ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, t->i32, p, "in"));
       }
@@ -770,13 +803,13 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       if (!t->lmem_base) { t->ok = false; break; }
       LLVMValueRef addr = LLVMBuildAdd(t->b,
          LLVMBuildAdd(t->b, t->lmem_base,
-            LLVMConstInt(t->i32, nir_intrinsic_base(in), false), ""),
-         intr_src(t, in, 0), "shaddr");
+            vp_iptr_const(t, nir_intrinsic_base(in)), ""),
+         vp_to_iptr(t, intr_src(t, in, 0)), "shaddr");
       LLVMTypeRef lt  = ity(t, in->def.bit_size);
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
-            LLVMConstInt(t->i32, c * esz, false), "");
+            vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
          ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "sld"));
       }
@@ -786,8 +819,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       if (!t->lmem_base) { t->ok = false; break; }
       LLVMValueRef addr = LLVMBuildAdd(t->b,
          LLVMBuildAdd(t->b, t->lmem_base,
-            LLVMConstInt(t->i32, nir_intrinsic_base(in), false), ""),
-         intr_src(t, in, 1), "shaddr");
+            vp_iptr_const(t, nir_intrinsic_base(in)), ""),
+         vp_to_iptr(t, intr_src(t, in, 1)), "shaddr");
       unsigned mask = nir_intrinsic_write_mask(in);
       unsigned nc   = nir_src_num_components(in->src[0]);
       unsigned esz  = nir_src_bit_size(in->src[0]) / 8u;
@@ -795,7 +828,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          if (!(mask & (1u << c))) continue;
          LLVMValueRef v = ssa_get(t, in->src[0].ssa->index, c);
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
-            LLVMConstInt(t->i32, c * esz, false), "");
+            vp_iptr_const(t, c * esz), "");
          if (v)
             LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
@@ -807,8 +840,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       if (nir_intrinsic_execution_scope(in) != SCOPE_NONE)
          emit_vx_barrier(t);
       break;
-   /* deref load/store: the deref operand is an i32 byte address; each
-    * component is a separate riscv32 load/store, width from bit size. */
+   /* deref load/store: the deref operand is an iptr byte address; each
+    * component is a separate scalar load/store, width from bit size. */
    case nir_intrinsic_load_deref: {
       LLVMValueRef addr = intr_src(t, in, 0);
       if (!addr) { t->ok = false; break; }
@@ -816,7 +849,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
-            LLVMConstInt(t->i32, c * esz, false), "");
+            vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
          ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "ld"));
       }
@@ -834,7 +867,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef v = ssa_get(t, in->src[1].ssa->index, c);
          if (!v) { t->ok = false; break; }
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
-            LLVMConstInt(t->i32, c * esz, false), "");
+            vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
          LLVMBuildStore(t->b, v, p);
       }
@@ -1140,10 +1173,12 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
  * around the programmable stage, and the translator's first emission of
  * control flow (a loop + per-pixel branches).                          */
 
+/* address + constant byte offset. `v` is an iptr (i32 on rv32, i64 on
+ * rv64); the constant matches so LLVM's Add doesn't see a width mismatch. */
 static LLVMValueRef
 addk(struct vp_tr *t, LLVMValueRef v, unsigned k)
 {
-   return LLVMBuildAdd(t->b, v, LLVMConstInt(t->i32, k, false), "");
+   return LLVMBuildAdd(t->b, v, vp_iptr_const(t, k), "");
 }
 
 /* load an i32 from an i32 byte address */
@@ -1232,13 +1267,16 @@ emit_to_byte(struct vp_tr *t, LLVMValueRef f)
       LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, 255.0), ""), t->i32, "");
 }
 
-/* read arg-block slot k (an i64 device address) truncated to i32 */
+/* read arg-block slot k (an i64 device address) widened/narrowed to iptr */
 static LLVMValueRef
 emit_arg_i32(struct vp_tr *t, LLVMValueRef arg, unsigned k)
 {
    LLVMValueRef idx = LLVMConstInt(t->i32, k, false);
    LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, arg, &idx, 1, "");
-   return LLVMBuildTrunc(t->b, LLVMBuildLoad2(t->b, t->i64, gep, ""),
+   LLVMValueRef v64 = LLVMBuildLoad2(t->b, t->i64, gep, "");
+   if (t->iptr == t->i64)
+      return v64;
+   return LLVMBuildTrunc(t->b, v64,
                          t->i32, "");
 }
 
@@ -1302,8 +1340,8 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
                                           "fs_in");
    LLVMValueRef out_scr = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4),
                                           "fs_out");
-   LLVMValueRef in_addr  = LLVMBuildPtrToInt(t->b, in_scr,  t->i32, "");
-   LLVMValueRef out_addr = LLVMBuildPtrToInt(t->b, out_scr, t->i32, "");
+   LLVMValueRef in_addr  = LLVMBuildPtrToInt(t->b, in_scr,  t->iptr, "");
+   LLVMValueRef out_addr = LLVMBuildPtrToInt(t->b, out_scr, t->iptr, "");
    LLVMBuildBr(t->b, loop);
 
    /* loop: pop a quad; stop when the raster queue drains. */
@@ -1316,11 +1354,13 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
 
    /* body: unpack the quad, shade its covered sub-pixels. */
    LLVMPositionBuilderAtEnd(t->b, body);
+   /* prim_base is iptr (i64 on rv64), pid * stride is i32; widen the
+    * product before adding so LLVM's Add has matching operand widths. */
    LLVMValueRef pid  = emit_csr_read(t, VX_CSR_RASTER_PID, "pid");
+   LLVMValueRef poff = LLVMBuildMul(t->b, pid,
+      LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base,
-      LLVMBuildMul(t->b, pid,
-                   LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), ""),
-      "prim");
+                                    vp_to_iptr(t, poff), "prim");
    LLVMValueRef mask = LLVMBuildAnd(t->b, pos_mask,
       LLVMConstInt(t->i32, 0xf, false), "mask");
    unsigned dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
@@ -1430,12 +1470,14 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    t.is_fs = (nir->info.stage == MESA_SHADER_FRAGMENT);
    t.ctx   = LLVMContextCreate();
    t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
-   LLVMSetTarget(t.mod, VP_TRIPLE);
-   LLVMSetDataLayout(t.mod, VP_DATALAYOUT);
+   LLVMSetTarget(t.mod, vp_target_triple());
+   LLVMSetDataLayout(t.mod, vp_target_datalayout());
    t.b   = LLVMCreateBuilderInContext(t.ctx);
    t.i8  = LLVMInt8TypeInContext(t.ctx);
    t.i32 = LLVMInt32TypeInContext(t.ctx);
    t.i64 = LLVMInt64TypeInContext(t.ctx);
+   /* Pointer-sized int -- matches the module's target datalayout above. */
+   t.iptr = vp_xlen_is_64() ? t.i64 : t.i32;
    t.f32 = LLVMFloatTypeInContext(t.ctx);
    t.f64 = LLVMDoubleTypeInContext(t.ctx);
    t.ptr = LLVMPointerTypeInContext(t.ctx, 0);
@@ -1472,14 +1514,19 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       if (out_vs)
          out_vs->needs_vertex_input = (nir->info.inputs_read != 0);
       t.vid = emit_csr_read(&t, VX_CSR_CTA_THREAD_ID_X, "vid");
+      /* %arg[0] / %arg[1] are i64 device addresses from the host runtime.
+       * On rv64 the device stack base is 0x1FFFF0000 (33-bit), so we keep
+       * iptr width: cast the i64 down only on rv32. */
       LLVMValueRef ob64 = LLVMBuildLoad2(t.b, t.i64, t.arg, "outbase64");
-      t.out_base = LLVMBuildTrunc(t.b, ob64, t.i32, "outbase");
+      t.out_base = (t.iptr == t.i64) ? ob64
+                                     : LLVMBuildTrunc(t.b, ob64, t.i32, "outbase");
       /* arg slot 1: the vertex-attribute table (vp_launch_vs) -- 0 for
        * a self-contained VS that fetches no vertex-buffer inputs. */
       LLVMValueRef one = LLVMConstInt(t.i32, 1, false);
       LLVMValueRef atp = LLVMBuildGEP2(t.b, t.i64, t.arg, &one, 1, "");
-      t.attr_table = LLVMBuildTrunc(t.b,
-         LLVMBuildLoad2(t.b, t.i64, atp, "attrtab64"), t.i32, "attrtab");
+      LLVMValueRef at64 = LLVMBuildLoad2(t.b, t.i64, atp, "attrtab64");
+      t.attr_table = (t.iptr == t.i64) ? at64
+                                       : LLVMBuildTrunc(t.b, at64, t.i32, "attrtab");
    }
 
    /* Fragment-shader prologue: assign varying/output slots. fs_main's
@@ -1488,15 +1535,17 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    if (t.is_fs) {
       fs_scan_io(&t, nir);
       t.fs_in_base  = LLVMBuildPtrToInt(t.b, LLVMGetParam(fn, 0),
-                                        t.i32, "fsin");
+                                        t.iptr, "fsin");
       t.fs_out_base = LLVMBuildPtrToInt(t.b, LLVMGetParam(fn, 1),
-                                        t.i32, "fsout");
+                                        t.iptr, "fsout");
    }
 
    /* Compute-shader prologue: the workgroup's shared-memory base, read
-    * once so load/store_shared can address it. */
+    * once so load/store_shared can address it. CSR-read is i32; widen
+    * to iptr so address arithmetic against it has matching widths. */
    if (!t.is_vs && !t.is_fs)
-      t.lmem_base = emit_csr_read(&t, VX_CSR_CTA_LMEM_ADDR, "lmem");
+      t.lmem_base = vp_to_iptr(&t,
+         emit_csr_read(&t, VX_CSR_CTA_LMEM_ADDR, "lmem"));
 
    nir_foreach_function_impl(impl, nir) {
       t.nval = impl->ssa_alloc;

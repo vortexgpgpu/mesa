@@ -109,8 +109,10 @@ vp_raster_draw(vx_device_h dev,
    /* ---- dispatch on the RASTER + OM units ------------------------- */
    bool ok = false;
    vx_queue_h  q    = NULL;
-   vx_buffer_h kbuf = NULL, tbuf = NULL, pbuf = NULL,
-               cbuf = NULL, zbuf = NULL, abuf = NULL, xbuf = NULL;
+   vx_module_h kmod = NULL;
+   vx_kernel_h kbuf = NULL;
+   vx_buffer_h tbuf = NULL, pbuf = NULL,
+               cbuf = NULL, zbuf = NULL, xbuf = NULL;
    char vxpath[] = "/tmp/vortexpipe-fs.XXXXXX";
    int  vxfd = -1;
    const uint32_t cbuf_bytes = width * height * 4;
@@ -133,8 +135,10 @@ vp_raster_draw(vx_device_h dev,
          sizeof(qi), NULL, VX_QUEUE_PRIORITY_NORMAL, 0,
       };
       VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
-      VP_CHECK(vx_buffer_load_kernel_file(dev, q, vxpath, &kbuf),
-               "vx_buffer_load_kernel_file");
+      VP_CHECK(vx_module_load_file(dev, vxpath, &kmod),
+               "vx_module_load_file");
+      VP_CHECK(vx_module_get_kernel(kmod, "kernel_main", &kbuf),
+               "vx_module_get_kernel");
 
       /* tile / primitive / colour / depth device buffers */
       VP_CHECK(vx_buffer_create(dev, tilebuf.size(), 0, &tbuf),
@@ -156,8 +160,6 @@ vp_raster_draw(vx_device_h dev,
        * the colour/depth buffers through its DCRs. */
       uint64_t argblk[8] = { 0 };
       argblk[0] = prim_dev;
-      VP_CHECK(vx_buffer_create(dev, sizeof(argblk), 0, &abuf),
-               "vx_buffer_create(args)");
 
       /* clear the depth buffer to the far value (GREATER/GEQUAL clear
        * to 0, every other compare to max). */
@@ -181,8 +183,7 @@ vp_raster_draw(vx_device_h dev,
                                 0, NULL, NULL), "vx_enqueue_write(color)");
       VP_CHECK(vx_enqueue_write(q, zbuf, 0, zclear.data(), cbuf_bytes,
                                 0, NULL, NULL), "vx_enqueue_write(depth)");
-      VP_CHECK(vx_enqueue_write(q, abuf, 0, argblk, sizeof(argblk),
-                                0, NULL, NULL), "vx_enqueue_write(args)");
+      /* args passed inline via args_host below (no abuf needed) */
 
       /* RASTER DCRs (addresses are 64-byte block indices) */
       DCR(VX_DCR_RASTER_TBUF_ADDR,   tile_dev / 64);
@@ -252,9 +253,10 @@ vp_raster_draw(vx_device_h dev,
          DCR(VX_DCR_TEX_MIPOFF_BASE,  0);   /* mip 0 at the buffer base */
       }
 
-      /* dispatch the fragment-shader kernel; threads poll vx_rast() */
+      /* dispatch the fragment-shader kernel; threads poll vx_rast().
+       * Args passed inline via args_host (see vp_launch). */
       vx_launch_info_t li = {
-         sizeof(li), NULL, kbuf, abuf, 1,
+         sizeof(li), NULL, kbuf, argblk, sizeof(argblk), 1,
          { 1, 1, 1 }, { 4, 1, 1 }, 0,
       };
       VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
@@ -267,12 +269,12 @@ vp_raster_draw(vx_device_h dev,
 
 done:
    if (xbuf) vx_buffer_release(xbuf);
-   if (abuf) vx_buffer_release(abuf);
    if (zbuf) vx_buffer_release(zbuf);
    if (cbuf) vx_buffer_release(cbuf);
    if (pbuf) vx_buffer_release(pbuf);
    if (tbuf) vx_buffer_release(tbuf);
-   if (kbuf) vx_buffer_release(kbuf);
+   if (kbuf) vx_kernel_release(kbuf);
+   if (kmod) vx_module_release(kmod);
    if (q)    vx_queue_release(q);
    unlink(vxpath);
    return ok;

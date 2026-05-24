@@ -5,11 +5,12 @@
  * vp_compile -- Phase 2 #4b: LLVM IR -> Vortex .vxbin.
  *
  * Drives the existing Vortex device toolchain on the kernel module
- * vp_nir_to_llvm emits: llvm_vortex's clang compiles + links the IR
- * (riscv32, +xvortex) against the KMU device kernel library
- * (libvortex2.a) and the baremetal libc/compiler-rt, then vxbin.py
- * packages the ELF into a .vxbin. First cut: fork/exec the tools
- * via system(); moving in-process is a later optimization (§3 n.4).
+ * vp_nir_to_llvm emits: llvm-vortex's clang compiles + links the IR
+ * (riscv32 or riscv64, +xvortex) against the KMU device kernel
+ * library (libvortex2.a) and the baremetal libc/compiler-rt, then
+ * vxbin.py packages the ELF into a .vxbin. First cut: fork/exec the
+ * tools via system(); moving in-process is a later optimization
+ * (§3 n.4).
  *
  * Paths come from VORTEX_HOME (the Vortex tree) and TOOLDIR (the
  * $HOME/tools install root) -- the meson-baked defaults below,
@@ -18,6 +19,11 @@
  * VORTEX_HOME/build by convention; VORTEX_BUILD overrides it for
  * trees configured under a differently named build dir (e.g. the
  * CI build32/build64).
+ *
+ * The target XLEN is picked from the MESA_VORTEX_XLEN env var
+ * (default "32"; "64" selects riscv64). Mesa-namespaced so it does
+ * not collide with anything the linked Vortex runtime reads; mirrors
+ * pocl_vortex/POCL_VORTEX_XLEN in shape (one ICD, env-var dispatch).
  */
 
 #define _GNU_SOURCE
@@ -68,6 +74,16 @@ read_blob(const char *path, size_t *out_size)
    return buf;
 }
 
+/* Target XLEN from $MESA_VORTEX_XLEN (default "32"). "64" selects
+ * riscv64, anything else selects riscv32. Mesa-namespaced so it
+ * doesn't collide with the linked Vortex runtime. */
+bool
+vp_xlen_is_64(void)
+{
+   const char *s = getenv("MESA_VORTEX_XLEN");
+   return s && strcmp(s, "64") == 0;
+}
+
 bool
 vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
 {
@@ -82,6 +98,16 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
       mesa_logw("vortexpipe: VORTEX_HOME / TOOLDIR not configured");
       return false;
    }
+   const bool is64 = vp_xlen_is_64();
+   const char *target  = is64 ? "riscv64-unknown-elf" : "riscv32-unknown-elf";
+   const char *gnu_dir = is64 ? "riscv64-gnu-toolchain" : "riscv32-gnu-toolchain";
+   const char *march   = is64 ? "rv64imafd" : "rv32imaf";
+   const char *mabi    = is64 ? "lp64d"     : "ilp32f";
+   const char *linker  = is64 ? "link64.ld" : "link32.ld";
+   const char *libc    = is64 ? "libc64"    : "libc32";
+   const char *libcrt  = is64 ? "libcrt64"  : "libcrt32";
+   const char *crt_a   = is64 ? "libclang_rt.builtins-riscv64.a"
+                              : "libclang_rt.builtins-riscv32.a";
 
    /* Build dir holding libvortex2.a -- VORTEX_HOME/build by default. */
    char bd_buf[512];
@@ -110,17 +136,17 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
       /* Device flags mirror the canonical Vortex kernel toolchain
        * invocation in tests/regression/common.mk: the llvm-vortex
        * clang with +xvortex (the Vortex ISA extension) and +zicond,
-       * --sysroot / --gcc-toolchain pointing at the riscv32 GNU
-       * toolchain, and -disable-loop-idiom-all. The Vortex
-       * branch-divergence pass is part of the +xvortex backend and is
-       * left at its default (enabled): it is what lowers divergent
-       * SIMT control flow into correct masked execution, so we must
-       * never pass -mllvm -vortex-branch-divergence=0. */
+       * --sysroot / --gcc-toolchain pointing at the GNU toolchain
+       * matching the target XLEN, and -disable-loop-idiom-all. The
+       * Vortex branch-divergence pass is part of the +xvortex backend
+       * and is left at its default (enabled): it is what lowers
+       * divergent SIMT control flow into correct masked execution, so
+       * we must never pass -mllvm -vortex-branch-divergence=0. */
       if (asprintf(&cmd,
-            "%s/llvm-vortex/bin/clang --target=riscv32-unknown-elf "
-            "--sysroot=%s/riscv32-gnu-toolchain/riscv32-unknown-elf "
-            "--gcc-toolchain=%s/riscv32-gnu-toolchain "
-            "-march=rv32imaf -mabi=ilp32f "
+            "%s/llvm-vortex/bin/clang --target=%s "
+            "--sysroot=%s/%s/%s "
+            "--gcc-toolchain=%s/%s "
+            "-march=%s -mabi=%s "
             "-Xclang -target-feature -Xclang +xvortex "
             "-Xclang -target-feature -Xclang +zicond "
             "-mllvm -disable-loop-idiom-all "
@@ -128,13 +154,22 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
             "-O3 -mcmodel=medany -nostartfiles -nostdlib "
             "-fdata-sections -ffunction-sections -fuse-ld=lld "
             "%s "
-            "-Wl,-Bstatic,--gc-sections,-T,%s/sw/kernel/scripts/link32.ld,"
+            "-Wl,-Bstatic,--gc-sections,-T,%s/sw/kernel/scripts/%s,"
             "--defsym=STARTUP_ADDR=0x80000000 "
             "%s/sw/kernel/libvortex2.a "
-            "-L%s/libc32/lib -lm -lc "
-            "%s/libcrt32/lib/baremetal/libclang_rt.builtins-riscv32.a "
+            "-L%s/%s/lib -lm -lc "
+            "%s/%s/lib/baremetal/%s "
             "-o %s 2>%s/clang.log",
-            td, td, td, p_ll, vh, bd, td, td, p_elf, dir) < 0) {
+            td, target,
+            td, gnu_dir, target,
+            td, gnu_dir,
+            march, mabi,
+            p_ll,
+            vh, linker,
+            bd,
+            td, libc,
+            td, libcrt, crt_a,
+            p_elf, dir) < 0) {
          cmd = NULL;
          ok = false;
       }
