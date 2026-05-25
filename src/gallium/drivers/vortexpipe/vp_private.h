@@ -36,6 +36,28 @@ struct vp_screen {
     * cached so the pointer Vulkan reads stays valid for the screen's life.
     * Sized to comfortably hold "vortexpipe (Vortex on <llvmpipe name>)". */
    char name_str[128];
+
+   /* Device caps cached at screen open. Used by the launch + draw paths
+    * to refuse workloads the hardware can't run as one CTA, and to gate
+    * the fixed-function graphics paths on the corresponding ISA bits.
+    *
+    * hw_max_block_size = hw_num_threads * hw_num_warps. KMU's block_size
+    * DCR is sized to address one CTA's threads (CTA_TID_WIDTH+1 bits);
+    * larger values truncate, producing empty-tmask warps that crash the
+    * RTL with a `invalid request mask` LSU assertion. SimX silently
+    * sub-dispatches and so isn't a useful oracle here.
+    *
+    * has_tex / has_raster / has_om gate vp_raster_draw and the texture
+    * upload path on the ISA extensions actually present. A device built
+    * without them must take the llvmpipe fallback rather than emitting
+    * vx_tex / vx_rast / vx_om instructions that will trap on decode. */
+   uint32_t hw_num_threads;
+   uint32_t hw_num_warps;
+   uint32_t hw_max_block_size;
+   uint64_t hw_isa_flags;
+   bool     has_tex;
+   bool     has_raster;
+   bool     has_om;
 };
 
 /* A compiled compute state: llvmpipe's cso plus the Vortex kernel

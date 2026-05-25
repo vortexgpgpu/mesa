@@ -184,6 +184,26 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    struct vp_cso     *cso = vp->cur_cso;
    bool ran_on_vortex = false;
 
+   /* Vortex's CTA dispatcher executes one workgroup as ONE CTA — the
+    * KMU's block_size DCR is sized to address one CTA's threads
+    * (CTA_TID_WIDTH+1 bits, max = num_threads × num_warps). A shader
+    * whose local_size exceeds that cap truncates in the DCR write and
+    * the CTA dispatcher fires warps with tmask=0, which the LSU then
+    * asserts on (`invalid request mask`). Reject up-front. */
+   struct vp_screen *vps = vp_reg_get(pipe->screen);
+   uint32_t block_size = info->block[0] * info->block[1] * info->block[2];
+   if (vps && vps->hw_max_block_size != 0 &&
+       block_size > vps->hw_max_block_size) {
+      mesa_logw("vortexpipe: launch_grid: workgroup size %u (%ux%ux%u) "
+                "exceeds device cap %u (%u threads × %u warps); "
+                "fallback to llvmpipe",
+                block_size,
+                info->block[0], info->block[1], info->block[2],
+                vps->hw_max_block_size,
+                vps->hw_num_threads, vps->hw_num_warps);
+      goto fallback;
+   }
+
    /* Run on Vortex when the kernel compiled and we have set 0's
     * descriptor buffer (constant-buffer index 1) plus the descriptor
     * table vp_create_compute_state scanned out of the NIR. */
@@ -215,7 +235,11 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 
    if (ran_on_vortex) {
       vp_dbg("vortexpipe: launch_grid ran on Vortex");
-   } else if (vp_strict_mode()) {
+      return;
+   }
+
+fallback:
+   if (vp_strict_mode()) {
       /* Refuse the silent llvmpipe fallback: the test harness catches
        * mesa_loge and fails the test, instead of green-lighting CPU
        * execution of a Vortex test. The launch becomes a no-op so the
@@ -934,10 +958,26 @@ vp_draw_vbo(struct pipe_context *pipe,
          if (sw_raster < 0)
             sw_raster = getenv("VORTEXPIPE_SW_RASTER") != NULL;
 
+         /* The hardware RASTER + OM + (optional) TEX path requires the
+          * matching ISA extensions to be present on the device — a
+          * compute-only build will trap on the first vx_rast/vx_om/
+          * vx_tex it executes. Gate the path on the cached caps so a
+          * stripped-down device falls back to llvmpipe rasterization
+          * (the Phase 3 path below) without crashing the kernel. */
+         struct vp_screen *vps = vp_reg_get(pipe->screen);
+         bool gfx_hw = vps && vps->has_raster && vps->has_om;
+         bool tex_needed = vp->cur_tex != NULL;
+         if (gfx_hw && tex_needed && !vps->has_tex) {
+            mesa_logw("vortexpipe: draw_vbo: device lacks TEX extension; "
+                      "fragment shader needs a sampler — skipping hardware "
+                      "RASTER+OM path");
+            gfx_hw = false;
+         }
+
          /* Vortex hardware raster + OM path: round-trip the colour
           * attachment through the RASTER unit + fragment kernel; the
           * OM unit depth-tests and blends. */
-         if (!sw_raster && fs && fs->vxbin &&
+         if (!sw_raster && gfx_hw && fs && fs->vxbin &&
              vp->fb_color && vp->fb_width && vp->fb_height) {
             uint32_t w = vp->fb_width, h = vp->fb_height;
 
