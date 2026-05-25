@@ -123,10 +123,15 @@ vp_create_compute_state(struct pipe_context *pipe,
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
                       cso->vxbin_size);
          else
-            mesa_logw("vortexpipe: .vxbin compile failed; "
+            /* The toolchain ran but failed — hard error (broken install,
+             * clang/link error, vxbin.py error). Programs run on llvmpipe
+             * but the test harness needs to see this; logw masked it. */
+            mesa_loge("vortexpipe: .vxbin compile failed; "
                       "shader runs on llvmpipe");
          vp_free_ir(ir);
       } else {
+         /* NIR->LLVM returned "not translatable yet" — this is a
+          * feature-coverage gap, not a runtime failure. Stay as logw. */
          mesa_logw("vortexpipe: NIR->LLVM unavailable; "
                    "shader runs on llvmpipe");
       }
@@ -153,6 +158,23 @@ vp_delete_compute_state(struct pipe_context *pipe, void *p)
    vp->lp_delete_compute_state(pipe, cso->lp_cso);
    vp_free_blob(cso->vxbin);
    FREE(cso);
+}
+
+/* True when MESA_VORTEX_STRICT=1: any fallback from Vortex to llvmpipe
+ * is an error and the fallback is refused. The test harness sets this
+ * so silent CPU execution of a Vortex test fails the test instead of
+ * green-lighting it. Cached because getenv is process-stable. */
+static bool
+vp_strict_mode(void)
+{
+   static bool init   = false;
+   static bool strict = false;
+   if (!init) {
+      const char *s = getenv("MESA_VORTEX_STRICT");
+      strict = (s && s[0] != '0' && s[0] != '\0');
+      init   = true;
+   }
+   return strict;
 }
 
 static void
@@ -191,10 +213,20 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
       }
    }
 
-   if (ran_on_vortex)
+   if (ran_on_vortex) {
       vp_dbg("vortexpipe: launch_grid ran on Vortex");
-   else
-      vp->lp_launch_grid(pipe, info);   /* inherit-and-accelerate fallback */
+   } else if (vp_strict_mode()) {
+      /* Refuse the silent llvmpipe fallback: the test harness catches
+       * mesa_loge and fails the test, instead of green-lighting CPU
+       * execution of a Vortex test. The launch becomes a no-op so the
+       * application's validation step sees missing data and fails. */
+      mesa_loge("vortexpipe: launch_grid: Vortex path unavailable, "
+                "STRICT mode refuses llvmpipe fallback");
+   } else {
+      mesa_logw("vortexpipe: launch_grid: falling back to llvmpipe "
+                "(set MESA_VORTEX_STRICT=1 to fail instead)");
+      vp->lp_launch_grid(pipe, info);
+   }
 }
 
 /* Buffer-binding interception -- launch_grid needs lavapipe's
@@ -247,7 +279,9 @@ vp_create_vs_state(struct pipe_context *pipe,
             vp_dbg("vortexpipe: compiled vertex shader -> %zu-byte .vxbin",
                    cso->vxbin_size);
          else
-            mesa_logw("vortexpipe: VS .vxbin compile failed; "
+            /* Toolchain ran but failed — hard error, same rationale as
+             * the compute path above. */
+            mesa_loge("vortexpipe: VS .vxbin compile failed; "
                       "vertex stage runs on llvmpipe");
          vp_free_ir(ir);
       } else {
@@ -302,7 +336,7 @@ vp_create_fs_state(struct pipe_context *pipe,
             vp_dbg("vortexpipe: compiled fragment shader -> %zu-byte .vxbin",
                    cso->vxbin_size);
          else
-            mesa_logw("vortexpipe: FS .vxbin compile failed");
+            mesa_loge("vortexpipe: FS .vxbin compile failed");
          vp_free_ir(ir);
       } else {
          mesa_logw("vortexpipe: FS NIR->LLVM unavailable; "
@@ -993,6 +1027,11 @@ vp_draw_vbo(struct pipe_context *pipe,
    }
 
    /* inherit-and-accelerate fallback */
+   if (vp_strict_mode()) {
+      mesa_loge("vortexpipe: draw_vbo: Vortex path unavailable, "
+                "STRICT mode refuses llvmpipe fallback");
+      return;
+   }
    vp->lp_draw_vbo(pipe, info, drawid_offset, indirect, draws, num_draws);
 }
 

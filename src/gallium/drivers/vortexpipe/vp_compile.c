@@ -95,7 +95,7 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
    const char *td = getenv("VORTEX_TOOLDIR");
    if (!td || !*td) td = VP_TOOLDIR;
    if (!*vh || !*td) {
-      mesa_logw("vortexpipe: VORTEX_HOME / TOOLDIR not configured");
+      mesa_loge("vortexpipe: VORTEX_HOME / TOOLDIR not configured");
       return false;
    }
    const bool is64 = vp_xlen_is_64();
@@ -119,7 +119,7 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
 
    char dir[] = "/tmp/vortexpipe.XXXXXX";
    if (!mkdtemp(dir)) {
-      mesa_logw("vortexpipe: mkdtemp failed");
+      mesa_loge("vortexpipe: mkdtemp failed");
       return false;
    }
 
@@ -174,7 +174,7 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
          ok = false;
       }
       if (ok && system(cmd) != 0) {
-         mesa_logw("vortexpipe: device clang/link failed (kept %s/clang.log)",
+         mesa_loge("vortexpipe: device clang/link failed (kept %s/clang.log)",
                    dir);
          ok = false;
       }
@@ -192,7 +192,7 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
          ok = false;
       }
       if (ok && system(cmd) != 0) {
-         mesa_logw("vortexpipe: vxbin.py failed (kept %s/vxbin.log)", dir);
+         mesa_loge("vortexpipe: vxbin.py failed (kept %s/vxbin.log)", dir);
          ok = false;
       }
       free(cmd);
@@ -204,12 +204,16 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
       ok = (*out_blob != NULL);
    }
 
-   /* clean up on success; keep the temp dir for debugging on failure */
-   if (ok) {
+   /* clean up on success; keep the temp dir for debugging on failure or
+    * when VORTEXPIPE_KEEP_TMP is set (lets a developer inspect kernel
+    * ELF / .vxbin contents, symbol tables, etc.). */
+   if (ok && !getenv("VORTEXPIPE_KEEP_TMP")) {
       if (asprintf(&cmd, "rm -rf %s", dir) >= 0) {
          system(cmd);
          free(cmd);
       }
+   } else if (ok) {
+      fprintf(stderr, "vortexpipe: VORTEXPIPE_KEEP_TMP set; kept %s\n", dir);
    }
    return ok;
 }

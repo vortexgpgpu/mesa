@@ -28,11 +28,17 @@
  * add1 uses slot 1 (descriptor set 0). */
 #define VP_ARG_SLOTS 8
 
+/* VP_CHECK wraps a Vortex runtime call: any vx_result_t != VX_SUCCESS is a
+ * HARD ERROR — the operation we asked the runtime to perform on the device
+ * failed. Log as mesa_loge so the host runtime / test harness can detect
+ * the failure (vp_launch returns false on goto done; the test harness can
+ * grep "MESA: error" or check stderr). DO NOT downgrade to mesa_logw: the
+ * silent-fallback bug that ran tests on llvmpipe started here. */
 #define VP_CHECK(call, what)                                            \
    do {                                                                 \
       vx_result_t _r = (call);                                          \
       if (_r != VX_SUCCESS) {                                           \
-         mesa_logw("vortexpipe: launch: %s failed (%s)", (what),        \
+         mesa_loge("vortexpipe: launch: %s failed (%s)", (what),        \
                    vx_result_string(_r));                               \
          goto done;                                                     \
       }                                                                 \
@@ -95,14 +101,14 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
    memcpy(&leaf_off, h + VP_BVH_LEAF_NODES_OFFSET,  sizeof leaf_off);
 
    if (ser <= VP_ACCEL_SERIALIZATION_HDR + 8u * inst) {
-      mesa_logw("vortexpipe: launch: implausible BVH header");
+      mesa_loge("vortexpipe: launch: implausible BVH header");
       c->ok = false;
       return 0;
    }
    uint32_t size = ser - VP_ACCEL_SERIALIZATION_HDR - 8u * inst;
    if (size == 0 || size > VP_BVH_MAX_BYTES ||
        c->n_stages >= VP_MAX_BVH || c->n_bufs >= VP_MAX_BVH) {
-      mesa_logw("vortexpipe: launch: BVH too large / too many BVHs");
+      mesa_loge("vortexpipe: launch: BVH too large / too many BVHs");
       c->ok = false;
       return 0;
    }
@@ -167,11 +173,11 @@ vp_launch(vx_device_h dev,
    /* materialize the .vxbin in a temp file for vx_module_load_file */
    vxfd = mkstemp(vxpath);
    if (vxfd < 0) {
-      mesa_logw("vortexpipe: launch: mkstemp failed");
+      mesa_loge("vortexpipe: launch: mkstemp failed");
       return false;
    }
    if (write(vxfd, vxbin, vxbin_size) != (ssize_t)vxbin_size) {
-      mesa_logw("vortexpipe: launch: writing .vxbin failed");
+      mesa_loge("vortexpipe: launch: writing .vxbin failed");
       close(vxfd);
       unlink(vxpath);
       return false;
@@ -183,7 +189,7 @@ vp_launch(vx_device_h dev,
     * vx_queue_finish (vx_enqueue_write reads it asynchronously). */
    stage = malloc(desc_bytes);
    if (!stage) {
-      mesa_logw("vortexpipe: launch: descriptor staging OOM");
+      mesa_loge("vortexpipe: launch: descriptor staging OOM");
       unlink(vxpath);
       return false;
    }
@@ -218,7 +224,7 @@ vp_launch(vx_device_h dev,
             continue;
          uint64_t tlas_dev = vp_copy_as(&asc, (const void *)(uintptr_t)tlas_host);
          if (!asc.ok) {
-            mesa_logw("vortexpipe: launch: acceleration-structure copy failed");
+            mesa_loge("vortexpipe: launch: acceleration-structure copy failed");
             goto done;
          }
          memcpy(slot, &tlas_dev, sizeof tlas_dev);
@@ -322,11 +328,11 @@ vp_launch_vs(vx_device_h dev,
 
    vxfd = mkstemp(vxpath);
    if (vxfd < 0) {
-      mesa_logw("vortexpipe: vs launch: mkstemp failed");
+      mesa_loge("vortexpipe: vs launch: mkstemp failed");
       return false;
    }
    if (write(vxfd, vxbin, vxbin_size) != (ssize_t)vxbin_size) {
-      mesa_logw("vortexpipe: vs launch: writing .vxbin failed");
+      mesa_loge("vortexpipe: vs launch: writing .vxbin failed");
       close(vxfd);
       unlink(vxpath);
       return false;

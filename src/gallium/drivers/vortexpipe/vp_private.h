@@ -31,6 +31,11 @@ struct vp_screen {
    struct pipe_context *(*lp_context_create)(struct pipe_screen *,
                                              void *priv, unsigned flags);
    void (*lp_screen_destroy)(struct pipe_screen *);
+   const char *(*lp_screen_get_name)(struct pipe_screen *);
+   /* Lazy-formatted device-name override returned by vp_screen_get_name;
+    * cached so the pointer Vulkan reads stays valid for the screen's life.
+    * Sized to comfortably hold "vortexpipe (Vortex on <llvmpipe name>)". */
+   char name_str[128];
 };
 
 /* A compiled compute state: llvmpipe's cso plus the Vortex kernel

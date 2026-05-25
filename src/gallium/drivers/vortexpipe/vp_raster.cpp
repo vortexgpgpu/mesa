@@ -32,11 +32,14 @@
 /* sizeof(graphics::rast_prim_t): vec3e_t edges[3] + rast_attribs_t. */
 #define VP_RAST_PRIM_STRIDE 120
 
+/* Hard error from the Vortex runtime — log as mesa_loge so the host /
+ * test harness can detect it. Soft "feature not implemented" notices
+ * remain mesa_logw; runtime API failures must not. */
 #define VP_CHECK(call, what)                                            \
    do {                                                                 \
       vx_result_t _r = (call);                                          \
       if (_r != VX_SUCCESS) {                                           \
-         mesa_logw("vortexpipe: raster: %s failed (%s)", (what),        \
+         mesa_loge("vortexpipe: raster: %s failed (%s)", (what),        \
                    vx_result_string(_r));                               \
          goto done;                                                     \
       }                                                                 \
@@ -119,11 +122,11 @@ vp_raster_draw(vx_device_h dev,
 
    vxfd = mkstemp(vxpath);
    if (vxfd < 0) {
-      mesa_logw("vortexpipe: raster: mkstemp failed");
+      mesa_loge("vortexpipe: raster: mkstemp failed");
       return false;
    }
    if (write(vxfd, fs_vxbin, fs_vxbin_size) != (ssize_t)fs_vxbin_size) {
-      mesa_logw("vortexpipe: raster: writing .vxbin failed");
+      mesa_loge("vortexpipe: raster: writing .vxbin failed");
       close(vxfd);
       unlink(vxpath);
       return false;
