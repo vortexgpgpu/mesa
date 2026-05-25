@@ -29,8 +29,13 @@ vp_screen_destroy(struct pipe_screen *screen)
    struct vp_screen *vps = vp_reg_get(screen);
    void (*lp_destroy)(struct pipe_screen *) = vps->lp_screen_destroy;
 
-   if (vps->dev)
+   if (vps->dev) {
+      /* Dump GPU perf counters at device teardown, matching pocl_vortex's
+       * pocl-vortex.c:373 pattern. Output is gated by $VORTEX_PROFILING
+       * inside the runtime; a no-op when unset. */
+      vx_device_dump_perf(vps->dev, stdout);
       vx_device_release(vps->dev);
+   }
    vp_reg_del(screen);
    FREE(vps);
    lp_destroy(screen);
