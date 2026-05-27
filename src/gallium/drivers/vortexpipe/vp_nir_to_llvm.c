@@ -58,7 +58,8 @@
 #define VX_CSR_RASTER_PID       0x7CD
 #define VX_RASTER_DIM_BITS      15     /* pos_mask x/y field width + 1 */
 
-/* graphics::rast_prim_t layout (sw/common/graphics.h, FIXEDPOINT):
+/* vortex::graphics::rast_prim_t layout (sw/kernel/include/vx_graphics.h,
+ * FIXEDPOINT):
  * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v}, each a
  * rast_attrib_t {x,y,z} of fixed24. r/g/b/a are the colour planes,
  * u/v the texcoord planes. */
@@ -1262,6 +1263,27 @@ emit_vx_rast(struct vp_tr *t)
    return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, "rast");
 }
 
+/* vx_rast_begin(): per-frame raster trigger (custom-1, funct3=4).
+ * The kernel-side commit that tells the cluster raster_core to fetch
+ * tile/prim data from the currently-programmed DCRs. Idempotent in
+ * hardware (the raster dedupes concurrent pulses from multiple warps
+ * via its fetch_triggered state), so every thread of every
+ * participating warp can call it without a barrier. Must be issued
+ * once per frame before the first vx_rast() poll. */
+static void
+emit_vx_rast_begin(struct vp_tr *t)
+{
+   const char *s = ".insn r 43, 4, 0, x0, x0, x0";
+   LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                       NULL, 0, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "", 0,
+                                      /*HasSideEffects*/ true,
+                                      /*IsAlignStack*/ false,
+                                      LLVMInlineAsmDialectATT,
+                                      /*CanThrow*/ false);
+   LLVMBuildCall2(t->b, fnty, ia, NULL, 0, "");
+}
+
 /* vx_om: submit a fragment to the output-merger unit (custom-1,
  * funct3=2, R4-type). pos_face = (y<<16)|(x<<1)|face; the OM does
  * depth/stencil/blend and writes the colour + depth buffers. */
@@ -1393,6 +1415,11 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
                                           "fs_out");
    LLVMValueRef in_addr  = LLVMBuildPtrToInt(t->b, in_scr,  t->iptr, "");
    LLVMValueRef out_addr = LLVMBuildPtrToInt(t->b, out_scr, t->iptr, "");
+   /* Per-frame raster trigger. Every participating warp/thread
+    * issues this; HW dedupes into one fetch. Required before any
+    * vx_rast() poll — without it, the raster sits in IDLE and the
+    * loop below immediately exits on the boot-state done sentinel. */
+   emit_vx_rast_begin(t);
    LLVMBuildBr(t->b, loop);
 
    /* loop: pop a quad; stop when the raster queue drains. */

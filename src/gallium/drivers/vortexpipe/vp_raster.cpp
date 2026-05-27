@@ -20,9 +20,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#include "gfxutil.h"             /* graphics::Binning, cocogfx::CGLTrace */
+#include "graphics.h"            /* graphics::Binning + on-wire types */
 #include "VX_types.h"            /* VX_DCR_RASTER_*, VX_DCR_OM_*, VX_OM_* */
 #include "util/log.h"
+
+namespace graphics = vortex::graphics;
 
 /* Tile size must match the hardware (VX_config.h RASTER_TILE_LOGSIZE). */
 #ifndef RASTER_TILE_LOGSIZE
@@ -70,30 +72,34 @@ vp_raster_draw(vx_device_h dev,
                const struct vp_tex_params *tex)
 {
    /* ---- triangle setup + binning ---------------------------------- *
-    * Convert the VS output records to CGLTrace vertices: record slot 0
-    * is the clip-space position, slots 1.. the generic varyings. The
+    * Convert the VS output records to graphics::vertex_t: record slot
+    * 0 is the clip-space position, slots 1.. the generic varyings. The
     * RASTER unit interpolates a fixed colour + texcoord; each varying
     * is routed by its component count (2 -> texcoord, 3/4 -> colour),
     * the same gfx-v1 mapping the FS translator uses. */
-   std::unordered_map<uint32_t, cocogfx::CGLTrace::vertex_t> verts;
-   std::vector<cocogfx::CGLTrace::primitive_t> prims;
+   std::unordered_map<uint32_t, graphics::vertex_t> verts;
+   std::vector<graphics::primitive_t> prims;
    const uint8_t *xv = static_cast<const uint8_t *>(xverts);
 
    for (uint32_t i = 0; i < vertex_count; i++) {
       const uint8_t *rec = xv + (size_t)i * layout->stride;
       const float *pos = reinterpret_cast<const float *>(rec);
-      cocogfx::CGLTrace::vertex_t v;
-      v.pos      = { pos[0], pos[1], pos[2], pos[3] };
-      v.color    = { 1.0f, 1.0f, 1.0f, 1.0f };
-      v.texcoord = { 0.0f, 0.0f };
+      graphics::vertex_t v;
+      v.pos[0] = pos[0]; v.pos[1] = pos[1];
+      v.pos[2] = pos[2]; v.pos[3] = pos[3];
+      v.color[0] = 1.0f; v.color[1] = 1.0f;
+      v.color[2] = 1.0f; v.color[3] = 1.0f;
+      v.texcoord[0] = 0.0f; v.texcoord[1] = 0.0f;
       for (uint32_t vi = 0; vi < layout->num_varyings; vi++) {
          const float *a = reinterpret_cast<const float *>(
             rec + 16u * (1u + vi));            /* slot 0 is gl_Position */
          uint32_t nc = layout->varying_comps[vi];
-         if (nc == 2)
-            v.texcoord = { a[0], a[1] };
-         else if (nc >= 3)
-            v.color    = { a[0], a[1], a[2], nc >= 4 ? a[3] : 1.0f };
+         if (nc == 2) {
+            v.texcoord[0] = a[0]; v.texcoord[1] = a[1];
+         } else if (nc >= 3) {
+            v.color[0] = a[0]; v.color[1] = a[1];
+            v.color[2] = a[2]; v.color[3] = nc >= 4 ? a[3] : 1.0f;
+         }
       }
       verts[i] = v;
    }
@@ -257,10 +263,24 @@ vp_raster_draw(vx_device_h dev,
       }
 
       /* dispatch the fragment-shader kernel; threads poll vx_rast().
-       * Args passed inline via args_host (see vp_launch). */
+       * Args passed inline via args_host (see vp_launch).
+       *
+       * Fill every HW lane the device exposes so every warp on every
+       * core races for vx_rast() pops. block_dim = num_threads ×
+       * num_warps fills one CTA per core; grid_dim = num_cores
+       * spreads CTAs across cores. (Previous shape grid=1/block=4
+       * used 1 warp of 1 core — under 6% of a 4×4 device, less on
+       * larger configs.) */
+      uint64_t nt = 1, nw = 1, nc = 1;
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt),
+               "vx_device_query(NUM_THREADS)");
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,   &nw),
+               "vx_device_query(NUM_WARPS)");
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES,   &nc),
+               "vx_device_query(NUM_CORES)");
       vx_launch_info_t li = {
          sizeof(li), NULL, kbuf, argblk, sizeof(argblk), 1,
-         { 1, 1, 1 }, { 4, 1, 1 }, 0,
+         { (uint32_t)nc, 1, 1 }, { (uint32_t)(nt * nw), 1, 1 }, 0,
       };
       VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
 
