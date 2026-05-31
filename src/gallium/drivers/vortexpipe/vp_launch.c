@@ -349,8 +349,49 @@ vp_launch_vs(vx_device_h dev,
    VP_CHECK(vx_module_get_kernel(kmod, "kernel_main", &kbuf),
             "vx_module_get_kernel");
 
-   /* output vertex-record buffer + its device address */
-   VP_CHECK(vx_buffer_create(dev, out_bytes, 0, &obuf),
+   /* Query device geometry so the VS launch maximises warp utilization:
+    *   block_dim = round_up(vertex_count, num_threads), capped at the
+    *               max CTA size (num_threads × num_warps). This keeps
+    *               every active warp's tmask full (no partial trailing
+    *               warp) and lets a CTA saturate one whole core.
+    *   grid_dim  = ceil(vertex_count / block_dim) so the work spreads
+    *               across cores (KMU hands one CTA to each free core).
+    *
+    * Pre-fix shape was grid=(1,1,1) block=(vertex_count,1,1) which:
+    *   - silently truncated vertex_count > max_block_size at the DCR
+    *     write (KMU's CTA_TID_WIDTH+1 cap),
+    *   - left the trailing warp partially-masked when vertex_count
+    *     wasn't a multiple of num_threads (degraded warp util),
+    *   - sat all work on one core (the other num_cores-1 idle).
+    *
+    * Padding policy: the device output buffer is sized to grid × block
+    * × stride. Out-of-bounds threads (vid in [vertex_count,
+    * grid*block)) write to the pad region; the host read-back copies
+    * only `out_bytes` so the caller's buffer never sees the slack.
+    * This avoids needing a bounds-check intrinsic in the VS NIR
+    * lowering. */
+   uint64_t nt = 0, nw = 0;
+   VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt),
+            "vx_device_query(NUM_THREADS)");
+   VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,   &nw),
+            "vx_device_query(NUM_WARPS)");
+   const uint32_t num_threads  = (uint32_t)nt;
+   const uint32_t num_warps    = (uint32_t)nw;
+   const uint32_t cta_size_max = num_threads * num_warps;
+
+   uint32_t block_x = (vertex_count + num_threads - 1u) / num_threads
+                     * num_threads;          /* round up to nt multiple */
+   if (block_x > cta_size_max) block_x = cta_size_max;
+   if (block_x == 0)           block_x = num_threads;
+   uint32_t grid_x  = (vertex_count + block_x - 1u) / block_x;
+   uint32_t launched_threads = grid_x * block_x;
+   uint32_t stride           = (vertex_count > 0) ? out_bytes / vertex_count : 0;
+   uint32_t obuf_bytes       = launched_threads * stride;
+   if (obuf_bytes < out_bytes) obuf_bytes = out_bytes;
+
+   /* output vertex-record buffer + its device address (padded for the
+    * trailing CTA's out-of-bounds threads). */
+   VP_CHECK(vx_buffer_create(dev, obuf_bytes, 0, &obuf),
             "vx_buffer_create(out)");
    uint64_t out_dev = 0;
    VP_CHECK(vx_buffer_address(obuf, &out_dev), "vx_buffer_address");
@@ -395,15 +436,15 @@ vp_launch_vs(vx_device_h dev,
       argblk[1] = tbuf_dev;
    }
 
-   /* one thread per vertex: a single block of `vertex_count`.
-    * Args passed inline via args_host (see comment in vp_launch). */
+   /* One thread per vertex, sized to fill warps and saturate cores
+    * (see geometry-query comment above). */
    vx_launch_info_t li = {
       .struct_size = sizeof(li), .next = NULL,
       .kernel = kbuf,
       .args_host = argblk, .args_size = sizeof(argblk),
       .ndim = 1,
-      .grid_dim  = { 1, 1, 1 },
-      .block_dim = { vertex_count, 1, 1 },
+      .grid_dim  = { grid_x,  1, 1 },
+      .block_dim = { block_x, 1, 1 },
       .lmem_size = 0,
    };
    VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");

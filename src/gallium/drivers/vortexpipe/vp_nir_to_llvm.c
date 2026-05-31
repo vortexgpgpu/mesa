@@ -43,6 +43,7 @@
 /* KMU CTA CSRs (VX_types.h): per-thread / per-block index registers. */
 #define VX_CSR_CTA_THREAD_ID_X 0xCD3   /* local invocation id, +c for y/z */
 #define VX_CSR_CTA_BLOCK_ID_X  0xCD6   /* workgroup id,        +c for y/z */
+#define VX_CSR_CTA_BLOCK_DIM_X 0xCD9   /* workgroup size,      +c for y/z */
 #define VX_CSR_CTA_ID          0xCD0   /* workgroup id (barrier id)        */
 #define VX_CSR_CTA_SIZE        0xCD2   /* warps per workgroup              */
 #define VX_CSR_CTA_GRID_DIM_X  0xCDC   /* workgroup count, +c for y/z      */
@@ -1591,7 +1592,22 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       vs_scan_outputs(&t, nir, out_vs);
       if (out_vs)
          out_vs->needs_vertex_input = (nir->info.inputs_read != 0);
-      t.vid = emit_csr_read(&t, VX_CSR_CTA_THREAD_ID_X, "vid");
+      /* Global vertex id = blockIdx.x × blockDim.x + threadIdx.x.
+       * Pre-fix this read only THREAD_ID_X, which made sense when
+       * vp_launch_vs ran a single CTA whose block_dim covered every
+       * vertex. The driver now uses grid_x × block_x to fill warps
+       * AND spread CTAs across cores; the kernel must compute the
+       * global id to match. Out-of-bounds vids (trailing CTA's
+       * unused threads, when vertex_count isn't a multiple of
+       * block_dim) write into the padded device output buffer; the
+       * host read-back stops at the real vertex_count so the slack
+       * never leaves the device. */
+      LLVMValueRef vid_block_id  = emit_csr_read(&t, VX_CSR_CTA_BLOCK_ID_X, "bid");
+      LLVMValueRef vid_block_dim = emit_csr_read(&t, VX_CSR_CTA_BLOCK_DIM_X, "bdim");
+      LLVMValueRef vid_thread_id = emit_csr_read(&t, VX_CSR_CTA_THREAD_ID_X, "tid");
+      t.vid = LLVMBuildAdd(t.b,
+                LLVMBuildMul(t.b, vid_block_id, vid_block_dim, "blkofs"),
+                vid_thread_id, "vid");
       /* %arg[0] / %arg[1] are i64 device addresses from the host runtime.
        * On rv64 the device stack base is 0x1FFFF0000 (33-bit), so we keep
        * iptr width: cast the i64 down only on rv32. */
