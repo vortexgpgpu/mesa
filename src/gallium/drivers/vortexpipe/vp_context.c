@@ -228,7 +228,8 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
          ran_on_vortex = vp_launch(vp->dev, cso->vxbin, cso->vxbin_size,
                                    (uint8_t *)desc_host + vp->cbuf_off[1],
                                    desc_bytes, cso->descs, cso->num_descs,
-                                   info->grid, info->block, cso->lmem_size);
+                                   info->grid, info->block, cso->lmem_size,
+                                   vps && vps->has_rtu);
          pipe_buffer_unmap(pipe, xfer);
       }
    }

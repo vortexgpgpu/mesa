@@ -27,6 +27,7 @@ files_vortexpipe = files(
   'vp_context.c',
   'vp_nir_to_llvm.h',
   'vp_nir_to_llvm.c',
+  'vp_nir_lower_ray_tracing_to_rtu.c',
   'vp_compile.h',
   'vp_compile.c',
   'vp_launch.h',

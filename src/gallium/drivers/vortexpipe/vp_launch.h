@@ -42,7 +42,7 @@ bool vp_launch(vx_device_h dev,
                const void *desc_host, uint32_t desc_bytes,
                const struct vp_desc *descs, uint32_t num_descs,
                const uint32_t grid[3], const uint32_t block[3],
-               uint32_t lmem_size);
+               uint32_t lmem_size, bool has_rtu);
 
 /* The vertex-buffer geometry feeding a VS kernel: a single interleaved
  * host vertex buffer plus the per-attribute layout. The VS kernel

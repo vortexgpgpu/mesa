@@ -62,6 +62,19 @@ vp_screen_get_name(struct pipe_screen *screen)
    return vps->name_str;
 }
 
+/* NIR finalize hook. lavapipe leaves Vulkan ray queries intact when we
+ * advertise driver_ray_queries (RTU present); lower them here, before
+ * llvmpipe's own finalize_nir runs, so both the vortexpipe .vxbin path
+ * and the llvmpipe base see the lowered (vortex_rt_*) form. */
+static char *
+vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (vps && vps->has_rtu)
+      vp_nir_lower_ray_tracing_to_rtu(nir);
+   return vps->lp_finalize_nir(screen, nir);
+}
+
 struct pipe_screen *
 vortexpipe_create_screen(struct sw_winsys *winsys)
 {
@@ -95,10 +108,11 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
          vps->has_tex    = (isa & VX_ISA_EXT_TEX)    != 0;
          vps->has_raster = (isa & VX_ISA_EXT_RASTER) != 0;
          vps->has_om     = (isa & VX_ISA_EXT_OM)     != 0;
+         vps->has_rtu    = (isa & VX_ISA_EXT_RTU)    != 0;
          vp_dbg("vortexpipe: caps: threads=%u, warps=%u, max_block=%u, "
-                "tex=%d, raster=%d, om=%d",
+                "tex=%d, raster=%d, om=%d, rtu=%d",
                 vps->hw_num_threads, vps->hw_num_warps, vps->hw_max_block_size,
-                vps->has_tex, vps->has_raster, vps->has_om);
+                vps->has_tex, vps->has_raster, vps->has_om, vps->has_rtu);
       } else {
          mesa_logw("vortexpipe: failed to query device caps; treating as bare");
          /* Leave caps fields zero — every cap-gated path then refuses. */
@@ -112,11 +126,13 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    vps->lp_context_create  = screen->context_create;
    vps->lp_screen_destroy  = screen->destroy;
    vps->lp_screen_get_name = screen->get_name;
+   vps->lp_finalize_nir    = screen->finalize_nir;
    vp_reg_put(screen, vps);
 
    screen->context_create = vp_context_create;
    screen->destroy        = vp_screen_destroy;
    screen->get_name       = vp_screen_get_name;
+   screen->finalize_nir   = vp_finalize_nir;
 
    /* Clamp llvmpipe's compute caps to the Vortex hardware cap so well-
     * behaved Vulkan apps that read maxComputeWorkGroupSize /
@@ -135,6 +151,11 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
       if (caps->max_threads_per_block > hw_max)
          caps->max_threads_per_block = hw_max;
    }
+
+   /* Tell the lavapipe frontend to leave Vulkan ray queries intact for
+    * vortexpipe to lower (vp_nir_lower_ray_tracing_to_rtu) instead of
+    * expanding them to a software BVH walk. */
+   ((struct pipe_caps *)&screen->caps)->driver_ray_queries = vps->has_rtu;
 
    vp_dbg("vortexpipe: screen ready (llvmpipe base, Vortex hooks armed)");
    return screen;

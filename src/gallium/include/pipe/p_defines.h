@@ -814,6 +814,12 @@ struct pipe_compute_caps {
 
 struct pipe_caps {
    bool graphics;
+   /* The driver lowers Vulkan ray queries itself (e.g. vortexpipe to the
+    * Vortex RTU). When set, the lavapipe frontend skips its software
+    * BVH-walk lowering (lvp_nir_lower_ray_queries) and leaves the ray-query
+    * intrinsics intact for the driver's finalize_nir to lower. Defaults
+    * false. */
+   bool driver_ray_queries;
    bool npot_textures;
    bool anisotropic_filter;
    bool occlusion_query;

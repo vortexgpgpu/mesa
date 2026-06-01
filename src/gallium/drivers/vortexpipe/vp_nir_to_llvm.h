@@ -62,6 +62,14 @@ struct vp_desc {
 void vp_scan_descriptors(struct nir_shader *nir,
                          struct vp_desc *out, unsigned *num_out);
 
+/* Lower Vulkan ray-query / ray-tracing NIR (rq_* and trace_ray, left
+ * intact by lavapipe when the driver advertises driver_ray_queries) into
+ * the Vortex RTU vendor intrinsics (vortex_rt_set/get/trace/wait/cb_ret),
+ * which vp_nir_to_llvm emits as CUSTOM1 .insn ops. Returns true if it
+ * changed the shader. No-op (returns false) when the shader has no ray
+ * queries. See vp_nir_lower_ray_tracing_to_rtu.c. */
+bool vp_nir_lower_ray_tracing_to_rtu(struct nir_shader *nir);
+
 #ifdef __cplusplus
 }
 #endif

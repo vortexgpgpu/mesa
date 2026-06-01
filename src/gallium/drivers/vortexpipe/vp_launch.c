@@ -83,6 +83,7 @@ struct vp_as_ctx {
    unsigned    n_bufs;
    void       *stages[VP_MAX_BVH];
    unsigned    n_stages;
+   bool        has_rtu;   /* transcode AS to RTU scene instead of verbatim copy */
    bool        ok;
 };
 
@@ -149,13 +150,178 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
    return dev_addr;
 }
 
+/* ── BVH transcode: lavapipe lvp_bvh → Vortex RTU scene ──────────────
+ * The RTU walks its own scene format (sim/simx/rtu/rtu_types.h), not the
+ * lvp_bvh layout. For the opaque-triangle ray-query path we flatten the
+ * acceleration structure into the RTU TriList format (scene_kind=0): a
+ * 16-byte header { triangle_count, 0, 0, 0 } followed by 40-byte
+ * triangles { v0,v1,v2 (9 floats), flags }. Triangles are emitted in
+ * world space (instance transforms applied). CW-BVH4 / instancing-aware
+ * Tlas transcode is a follow-up. */
+
+/* lvp_bvh node layout (lvp_acceleration_structure.h). */
+#define LVP_BVH_HEADER_SIZE   40   /* sizeof(struct lvp_bvh_header) */
+#define LVP_NODE_TRIANGLE     0
+#define LVP_NODE_INTERNAL     1
+#define LVP_NODE_INSTANCE     2
+#define LVP_NODE_AABB         3
+#define LVP_NODE_INVALID      0xFFFFFFFFu
+#define LVP_BOX_CHILDREN_OFF  48   /* vk_aabb bounds[2] precede children[2] */
+#define LVP_TRI_GEOMFLAGS_OFF 44   /* coords[3][3]+padding+primitive_id      */
+#define LVP_INST_OTW_OFF      72   /* otw_matrix (object→world, mat3x4)       */
+
+/* RTU TriList constants (rtu_types.h). */
+#define RTU_SCENE_HDR_BYTES   16
+#define RTU_TRI_STRIDE        40
+#define RTU_TRI_FLAG_OPAQUE   0x1u
+#define RTU_SCENE_KIND_TRILIST 0u
+
+struct vp_tri_list {
+   float    (*tris)[10];   /* 9 coords + flags(as float bits) per triangle */
+   uint32_t  count;
+   uint32_t  cap;
+   bool      ok;
+};
+
+/* world = M(3x4 row-major) * [obj; 1]. */
+static void
+vp_xform_point(const float M[12], const float p[3], float out[3])
+{
+   for (int i = 0; i < 3; i++)
+      out[i] = M[i*4+0]*p[0] + M[i*4+1]*p[1] + M[i*4+2]*p[2] + M[i*4+3];
+}
+
+/* C = A ∘ B (both object→world 3x4; apply B then A). */
+static void
+vp_xform_compose(const float A[12], const float B[12], float C[12])
+{
+   for (int i = 0; i < 3; i++) {
+      for (int j = 0; j < 3; j++)
+         C[i*4+j] = A[i*4+0]*B[0*4+j] + A[i*4+1]*B[1*4+j] + A[i*4+2]*B[2*4+j];
+      C[i*4+3] = A[i*4+0]*B[0*4+3] + A[i*4+1]*B[1*4+3] + A[i*4+2]*B[2*4+3] + A[i*4+3];
+   }
+}
+
+static void
+vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
+            const float v2[3])
+{
+   if (tl->count == tl->cap) {
+      uint32_t ncap = tl->cap ? tl->cap * 2 : 64;
+      float (*nt)[10] = realloc(tl->tris, (size_t)ncap * sizeof(*nt));
+      if (!nt) { tl->ok = false; return; }
+      tl->tris = nt;
+      tl->cap = ncap;
+   }
+   float *t = tl->tris[tl->count++];
+   t[0]=v0[0]; t[1]=v0[1]; t[2]=v0[2];
+   t[3]=v1[0]; t[4]=v1[1]; t[5]=v1[2];
+   t[6]=v2[0]; t[7]=v2[1]; t[8]=v2[2];
+   uint32_t flags = RTU_TRI_FLAG_OPAQUE;
+   memcpy(&t[9], &flags, 4);
+}
+
+/* Walk one node (ptr = offset|type) of the lvp_bvh at base `bvh`, applying
+ * transform M, appending world-space triangles to tl. */
+static void
+vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
+             struct vp_tri_list *tl, int depth)
+{
+   if (node_ptr == LVP_NODE_INVALID || depth > 64 || !tl->ok)
+      return;
+   uint32_t type = node_ptr & 7u;
+   const uint8_t *node = bvh + (node_ptr & ~7u);
+   switch (type) {
+   case LVP_NODE_INTERNAL: {
+      uint32_t c0, c1;
+      memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
+      memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
+      vp_walk_node(bvh, c0, M, tl, depth + 1);
+      vp_walk_node(bvh, c1, M, tl, depth + 1);
+      break;
+   }
+   case LVP_NODE_TRIANGLE: {
+      float coords[9];
+      memcpy(coords, node, 36);           /* coords[3][3] */
+      float w0[3], w1[3], w2[3];
+      vp_xform_point(M, &coords[0], w0);
+      vp_xform_point(M, &coords[3], w1);
+      vp_xform_point(M, &coords[6], w2);
+      vp_tri_push(tl, w0, w1, w2);
+      break;
+   }
+   case LVP_NODE_INSTANCE: {
+      uint64_t blas_host = 0;
+      float otw[12];
+      memcpy(&blas_host, node, 8);
+      memcpy(otw, node + LVP_INST_OTW_OFF, 48);
+      if (blas_host) {
+         float Mc[12];
+         vp_xform_compose(M, otw, Mc);     /* world = M ∘ otw */
+         const uint8_t *blas = (const uint8_t *)(uintptr_t)blas_host;
+         uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
+         vp_walk_node(blas, root, Mc, tl, depth + 1);
+      }
+      break;
+   }
+   case LVP_NODE_AABB:
+   default:
+      /* Procedural primitive — not handled on the opaque-triangle path. */
+      break;
+   }
+}
+
+/* Transcode the lavapipe AS at `tlas_host` into an RTU TriList scene in
+ * device memory; returns its device address (0 on failure). */
+static uint64_t
+vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
+{
+   struct vp_tri_list tl = { .ok = true };
+   static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
+   uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
+   vp_walk_node((const uint8_t *)tlas_host, root, kIdentity, &tl, 0);
+   if (!tl.ok) {
+      free(tl.tris);
+      c->ok = false;
+      return 0;
+   }
+
+   uint32_t size = RTU_SCENE_HDR_BYTES + tl.count * RTU_TRI_STRIDE;
+   uint8_t *scene = malloc(size ? size : RTU_SCENE_HDR_BYTES);
+   if (!scene) { free(tl.tris); c->ok = false; return 0; }
+   uint32_t hdr[4] = { tl.count, RTU_SCENE_KIND_TRILIST, 0, 0 };
+   memcpy(scene, hdr, RTU_SCENE_HDR_BYTES);
+   for (uint32_t i = 0; i < tl.count; i++)
+      memcpy(scene + RTU_SCENE_HDR_BYTES + (size_t)i * RTU_TRI_STRIDE,
+             tl.tris[i], RTU_TRI_STRIDE);
+   free(tl.tris);
+
+   if (c->n_bufs >= VP_MAX_BVH || c->n_stages >= VP_MAX_BVH) {
+      free(scene); c->ok = false; return 0;
+   }
+   /* The upload is asynchronous; keep `scene` alive until the queue
+    * finishes (freed by the launch cleanup, like vp_copy_as's stages). */
+   c->stages[c->n_stages++] = scene;
+   vx_buffer_h b = NULL;
+   uint64_t dev_addr = 0;
+   if (vx_buffer_create(c->dev, size, VX_MEM_READ, &b) != VX_SUCCESS) {
+      c->ok = false; return 0;
+   }
+   c->bufs[c->n_bufs++] = b;
+   if (vx_buffer_address(b, &dev_addr) != VX_SUCCESS ||
+       vx_enqueue_write(c->q, b, 0, scene, size, 0, NULL, NULL) != VX_SUCCESS) {
+      c->ok = false; return 0;
+   }
+   return dev_addr;
+}
+
 bool
 vp_launch(vx_device_h dev,
           const void *vxbin, size_t vxbin_size,
           const void *desc_host, uint32_t desc_bytes,
           const struct vp_desc *descs, uint32_t num_descs,
           const uint32_t grid[3], const uint32_t block[3],
-          uint32_t lmem_size)
+          uint32_t lmem_size, bool has_rtu)
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
@@ -202,6 +368,7 @@ vp_launch(vx_device_h dev,
    VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
    asc.dev = dev;
    asc.q   = q;
+   asc.has_rtu = has_rtu;
 
    VP_CHECK(vx_module_load_file(dev, vxpath, &kmod),
             "vx_module_load_file");
@@ -222,7 +389,11 @@ vp_launch(vx_device_h dev,
          memcpy(&tlas_host, slot, sizeof tlas_host);   /* lp_descriptor.accel_struct */
          if (!tlas_host)
             continue;
-         uint64_t tlas_dev = vp_copy_as(&asc, (const void *)(uintptr_t)tlas_host);
+         /* With the RTU, transcode the AS into the RTU scene format; the
+          * kernel's vx_rt_trace consumes that. Otherwise copy verbatim. */
+         uint64_t tlas_dev = asc.has_rtu
+            ? vp_transcode_as(&asc, (const void *)(uintptr_t)tlas_host)
+            : vp_copy_as(&asc, (const void *)(uintptr_t)tlas_host);
          if (!asc.ok) {
             mesa_loge("vortexpipe: launch: acceleration-structure copy failed");
             goto done;

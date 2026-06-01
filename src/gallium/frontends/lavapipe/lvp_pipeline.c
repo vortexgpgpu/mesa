@@ -404,7 +404,11 @@ lvp_shader_lower(struct lvp_device *pdevice, nir_shader *nir, struct lvp_pipelin
 
    lvp_lower_pipeline_layout(pdevice, layout, nir);
 
-   NIR_PASS(_, nir, lvp_nir_lower_ray_queries);
+   /* When the underlying driver lowers ray queries itself (vortexpipe →
+    * Vortex RTU), skip the software BVH-walk lowering and leave rq_* /
+    * trace_ray intact for the driver's finalize_nir hook. */
+   if (!pdevice->pscreen->caps.driver_ray_queries)
+      NIR_PASS(_, nir, lvp_nir_lower_ray_queries);
 
    if (nir->info.stage == MESA_SHADER_COMPUTE ||
        nir->info.stage == MESA_SHADER_TASK ||

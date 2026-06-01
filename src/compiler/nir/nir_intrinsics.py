@@ -681,6 +681,18 @@ intrinsic("rq_confirm_intersection", src_comp=[-1])
 # src[] = { query }
 intrinsic("rq_load", src_comp=[-1], dest_comp=0, indices=[RAY_QUERY_VALUE,COMMITTED,COLUMN])
 
+# Vortex RTU (ray-tracing unit) vendor intrinsics. The vortexpipe Gallium
+# driver lowers rq_*/trace_ray to these (vp_nir_lower_ray_tracing_to_rtu.c)
+# and emits them as Vortex CUSTOM1 .insn ops (vp_nir_to_llvm.c). BASE is the
+# RTU register-file slot id (see sw/kernel/include/vx_raytrace.h).
+intrinsic("vortex_rt_set",   src_comp=[1], indices=[BASE])   # write slot BASE = src[0]
+# src[0] = ordering token (the vx_rt_wait status) so the slot read is
+# scoreboarded after the wait writeback (vx_rt_get_after); dest = slot BASE.
+intrinsic("vortex_rt_get",   src_comp=[1], dest_comp=1, indices=[BASE])
+intrinsic("vortex_rt_trace", src_comp=[1], dest_comp=1)      # dest = trace(src[0]=tlas addr)
+intrinsic("vortex_rt_wait",  src_comp=[1], dest_comp=1)      # dest = wait(src[0]=handle)
+intrinsic("vortex_rt_cb_ret", src_comp=[1])                  # cb_ret(src[0]=action)
+
 # Driver independent raytracing helpers
 
 # rt_resume is a helper that that be the first instruction accesing the

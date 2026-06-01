@@ -32,6 +32,7 @@ struct vp_screen {
                                              void *priv, unsigned flags);
    void (*lp_screen_destroy)(struct pipe_screen *);
    const char *(*lp_screen_get_name)(struct pipe_screen *);
+   char *(*lp_finalize_nir)(struct pipe_screen *, struct nir_shader *nir);
    /* Lazy-formatted device-name override returned by vp_screen_get_name;
     * cached so the pointer Vulkan reads stays valid for the screen's life.
     * Sized to comfortably hold "vortexpipe (Vortex on <llvmpipe name>)". */
@@ -58,6 +59,10 @@ struct vp_screen {
    bool     has_tex;
    bool     has_raster;
    bool     has_om;
+   bool     has_rtu;       /* VX_ISA_EXT_RTU: HW ray-tracing unit present.
+                            * Gates the HW RT path (ray-query / trace-ray
+                            * lowered to vx_rt_ ops) vs lavapipe's SW BVH
+                            * walk. */
 };
 
 /* A compiled compute state: llvmpipe's cso plus the Vortex kernel
