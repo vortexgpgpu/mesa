@@ -1182,7 +1182,10 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
 
 /* Mark `fn` as a Vortex kernel entry: emit the @llvm.global.annotations
  * record carrying "vortex.kernel" (what __attribute__((annotate(...)))
- * lowers to -- the llvm_vortex backend keys on it). */
+ * lowers to -- the llvm_vortex backend keys on it, emitting the
+ * __vx_kentry_<name> alias the VXSYMTAB footer records). Also place `fn`
+ * in @llvm.used so it survives --gc-sections: the device dispatches by
+ * address, so nothing references the kernel statically. */
 static void
 emit_kernel_annotation(struct vp_tr *t, LLVMValueRef fn)
 {
@@ -1216,57 +1219,15 @@ emit_kernel_annotation(struct vp_tr *t, LLVMValueRef fn)
    LLVMSetInitializer(g, arr);
    LLVMSetLinkage(g, LLVMAppendingLinkage);
    LLVMSetSection(g, "llvm.metadata");
-}
 
-/* Emit a per-kernel KMU dispatch stub following the multi-entry convention
- * documented in sw/kernel/src/vx_start.S:
- *
- *   .section .vx_entry, "ax", @progbits
- *   .global __vx_kentry_<entry_name>
- *   __vx_kentry_<entry_name>:
- *       lla s11, <entry_name>      ; load the kernel's address into s11
- *       j   __vx_cta_entry         ; jump to the shared CTA prologue
- *
- * `__vx_cta_entry` is the C-environment bringup in libvortex2.a:
- * SATP / gp / sp / tp+TLS / global ctors, then `jalr ra, s11` into the
- * kernel, then wsync + tmc to retire the warp.
- *
- * It is CRITICAL that the stub does NOT directly call the kernel — the
- * kernel needs the C-environment bringup that only __vx_cta_entry sets
- * up. Bypassing it (e.g. a plain tail-call wrapper) means the kernel
- * runs with garbage sp/tp/satp and the first `ret` returns to ra=0,
- * causing "Illegal 16-bit RVC: word=0x0" on the instruction fetch.
- *
- * vxbin.py's get_kernel_entries() scans the ELF for __vx_kentry_<name>
- * symbols and builds the VXSYMTAB footer; the runtime's load_bytes
- * registers <name> at the stub's PC; vp_launch's vx_module_get_kernel
- * then resolves successfully and the host programs that PC into KMU.
- * Matches the POCL convention vxbin.py was designed around — same shape
- * as POCL's __pocl_kernel_<name>_workgroup stubs. */
-static void
-emit_kentry_wrapper(struct vp_tr *t, LLVMValueRef kernel_fn,
-                    const char *entry_name)
-{
-   (void)kernel_fn;   /* the stub references kernel_fn by name, via the .lla */
-
-   /* Compose the stub source. Three lines + .size; module asm is appended
-    * verbatim to the module's text-section output by the LLVM backend. */
-   char buf[512];
-   int n = snprintf(buf, sizeof buf,
-      "\n"
-      ".section .vx_entry,\"ax\",@progbits\n"
-      ".global __vx_kentry_%s\n"
-      ".type   __vx_kentry_%s, @function\n"
-      "__vx_kentry_%s:\n"
-      "    lla s11, %s\n"
-      "    j   __vx_cta_entry\n"
-      ".size __vx_kentry_%s, . - __vx_kentry_%s\n",
-      entry_name, entry_name, entry_name,
-      entry_name,                                /* lla target = kernel sym */
-      entry_name, entry_name);
-   if (n <= 0 || n >= (int)sizeof buf)
-      return;   /* truncation: skip; vxbin.py will fall back to "main" */
-   LLVMAppendModuleInlineAsm(t->mod, buf, (size_t)n);
+   /* @llvm.used = appending global [1 x ptr] [ptr @fn] -> SHF_GNU_RETAIN. */
+   LLVMValueRef used_elem = fn;
+   LLVMValueRef used_arr = LLVMConstArray2(t->ptr, &used_elem, 1);
+   LLVMValueRef used_g = LLVMAddGlobal(t->mod, LLVMArrayType(t->ptr, 1),
+                                       "llvm.used");
+   LLVMSetInitializer(used_g, used_arr);
+   LLVMSetLinkage(used_g, LLVMAppendingLinkage);
+   LLVMSetSection(used_g, "llvm.metadata");
 }
 
 /* Scan the shader's outputs and assign each a 16-byte slot in the
@@ -1774,15 +1735,13 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       kfn = emit_fs_wrapper(&t, fn, fs_main_ty);
 
    if (t.ok) {
+      /* Annotate the kernel "vortex.kernel" + retain it. The llvm-vortex
+       * backend emits the __vx_kentry_<name> alias of the kernel body;
+       * vxbin.py records it in the VXSYMTAB footer and the runtime resolves
+       * it by name (kernel_main -> "main"). The KMU launches __vx_cta_entry,
+       * which brings up the C environment and dispatches to the kernel
+       * address it reads from VX_CSR_CTA_ENTRY. */
       emit_kernel_annotation(&t, kfn);
-      /* Emit the POCL-convention __vx_kentry_<name> wrapper around the
-       * kernel entry so vxbin.py's symbol scanner picks it up and the
-       * runtime's vx_module_get_kernel() can resolve the entry by name.
-       * The wrapped function is always named "kernel_main" today (see
-       * the LLVMAddFunction call above + emit_fs_wrapper); when multi-
-       * entry SPIR-V is supported, derive entry_name from the NIR
-       * shader's OpEntryPoint instead. */
-      emit_kentry_wrapper(&t, kfn, "kernel_main");
    }
 
    char *err = NULL;

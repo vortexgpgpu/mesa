@@ -372,7 +372,9 @@ vp_launch(vx_device_h dev,
 
    VP_CHECK(vx_module_load_file(dev, vxpath, &kmod),
             "vx_module_load_file");
-   VP_CHECK(vx_module_get_kernel(kmod, "kernel_main", &kbuf),
+   /* "main" is the public name vxbin.py assigns the single conventional
+    * kernel (the C entry is "kernel_main"); match the native runtime. */
+   VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf),
             "vx_module_get_kernel");
 
    /* Relocate each descriptor into the staged descriptor blob:
@@ -517,7 +519,9 @@ vp_launch_vs(vx_device_h dev,
    VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
    VP_CHECK(vx_module_load_file(dev, vxpath, &kmod),
             "vx_module_load_file");
-   VP_CHECK(vx_module_get_kernel(kmod, "kernel_main", &kbuf),
+   /* "main" is the public name vxbin.py assigns the single conventional
+    * kernel (the C entry is "kernel_main"); match the native runtime. */
+   VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf),
             "vx_module_get_kernel");
 
    /* Query device geometry so the VS launch maximises warp utilization:
