@@ -655,10 +655,11 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
 }
 
 /* RTU emit helpers (defined after emit_vx_tex, below). */
-static void         emit_vx_rt_set(struct vp_tr *t, unsigned slot, LLVMValueRef val);
 static LLVMValueRef emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status);
-static LLVMValueRef emit_vx_rt_trace(struct vp_tr *t, LLVMValueRef tlas);
-static LLVMValueRef emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle);
+static LLVMValueRef emit_vx_rt_trace2(struct vp_tr *t, LLVMValueRef scene,
+                                      LLVMValueRef flags_cull,
+                                      LLVMValueRef ray[8]);
+static LLVMValueRef emit_vx_rt_wait2(struct vp_tr *t, LLVMValueRef handle);
 static void         emit_vx_rt_cb_ret(struct vp_tr *t, LLVMValueRef action);
 
 static void
@@ -882,25 +883,32 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       }
       break;
    }
-   case nir_intrinsic_vortex_rt_set: {
-      unsigned slot = nir_intrinsic_base(in);
-      emit_vx_rt_set(t, slot, ssa_get(t, in->src[0].ssa->index, 0));
-      break;
-   }
    case nir_intrinsic_vortex_rt_get: {
       unsigned slot = nir_intrinsic_base(in);
       LLVMValueRef status = ssa_get(t, in->src[0].ssa->index, 0);
       ssa_set(t, in->def.index, 0, emit_vx_rt_get(t, slot, status));
       break;
    }
-   case nir_intrinsic_vortex_rt_trace: {
-      LLVMValueRef tlas = ssa_get(t, in->src[0].ssa->index, 0);
-      ssa_set(t, in->def.index, 0, emit_vx_rt_trace(t, tlas));
+   case nir_intrinsic_vortex_rt_trace2: {
+      /* src = { scene, flags|cull, origin(3), dir(3), tmin, tmax } */
+      LLVMValueRef scene = ssa_get(t, in->src[0].ssa->index, 0);
+      LLVMValueRef fc    = ssa_get(t, in->src[1].ssa->index, 0);
+      LLVMValueRef ray[8] = {
+         ssa_get(t, in->src[2].ssa->index, 0),   /* origin.x */
+         ssa_get(t, in->src[2].ssa->index, 1),   /* origin.y */
+         ssa_get(t, in->src[2].ssa->index, 2),   /* origin.z */
+         ssa_get(t, in->src[3].ssa->index, 0),   /* dir.x    */
+         ssa_get(t, in->src[3].ssa->index, 1),   /* dir.y    */
+         ssa_get(t, in->src[3].ssa->index, 2),   /* dir.z    */
+         ssa_get(t, in->src[4].ssa->index, 0),   /* tmin     */
+         ssa_get(t, in->src[5].ssa->index, 0),   /* tmax     */
+      };
+      ssa_set(t, in->def.index, 0, emit_vx_rt_trace2(t, scene, fc, ray));
       break;
    }
-   case nir_intrinsic_vortex_rt_wait: {
+   case nir_intrinsic_vortex_rt_wait2: {
       LLVMValueRef h = ssa_get(t, in->src[0].ssa->index, 0);
-      ssa_set(t, in->def.index, 0, emit_vx_rt_wait(t, h));
+      ssa_set(t, in->def.index, 0, emit_vx_rt_wait2(t, h));
       break;
    }
    case nir_intrinsic_vortex_rt_cb_ret:
@@ -931,36 +939,45 @@ emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
    return LLVMBuildCall2(t->b, fnty, ia, a, 3, "tex");
 }
 
-/* ── RTU (ray-tracing unit) ops ──────────────────────────────────────
- * CUSTOM1 (opcode 43). funct3=5 for set/get/trace/wait — the funct7
- * low 2 bits select the sub-op (0=set,1=get,2=trace,3=wait) and, for
- * set/get, the upper 5 bits carry the RTU register-file slot. funct3=6
- * is cb_ret. Mirrors sw/kernel/include/vx_raytrace.h. */
+/* ── RTU (ray-tracing unit) ops — ISA v2 window ABI ──────────────────
+ * CUSTOM1 (opcode 43). vortex_rt_trace2 (funct3=7, funct2=0) issues one ray:
+ * the per-trace config lane-packs into rs1 via wgather, the per-thread ray
+ * geometry rides the f0..f7 FP register window. vortex_rt_wait2 (funct3=7,
+ * funct2=1) is a single-op block. vortex_rt_get reads one hit slot post-
+ * terminal (GETW, funct3=6 funct2=3, count=1). funct3=6 funct2=0 is cb_ret.
+ * Mirrors sw/kernel/include/vx_raytrace.h. */
 
-/* vx_rt_set1: slot <- val. No result. */
-static void
-emit_vx_rt_set(struct vp_tr *t, unsigned slot, LLVMValueRef val)
+/* vx_wgather: lane-scatter {self,v1,v2,v3} across 4 lanes of one register
+ * (lane0<-self, lane1<-v1, lane2<-v2, lane3<-v3). R4-type, funct3=0, funct2=0;
+ * rd is tied in/out (holds self on input, the gathered result on output). */
+static LLVMValueRef
+emit_vx_wgather(struct vp_tr *t, LLVMValueRef self, LLVMValueRef v1,
+                LLVMValueRef v2, LLVMValueRef v3)
 {
-   char s[48];
-   int n = snprintf(s, sizeof s, ".insn r 43, 5, %u, x0, $0, x0",
-                    (slot & 0x1f) << 2);
-   LLVMTypeRef args[1] = { t->i32 };
-   LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), args, 1, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, (size_t)n, "r", 1,
+   /* rd=$0 (tied to the self input, "0" below). The matching/tied input
+    * consumes operand index $1, so the three scatter sources v1/v2/v3 are
+    * $2/$3/$4 — referencing $1/$2/$3 here would alias the self register and
+    * drop v3 (lane3). rs1<-v1(lane1), rs2<-v2(lane2), rs3<-v3(lane3). */
+   const char *s = ".insn r4 43, 0, 0, $0, $2, $3, $4";
+   const char *c = "=r,0,r,r,r";
+   LLVMTypeRef args[4] = { t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 4, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
                                       /*HasSideEffects*/ true, false,
                                       LLVMInlineAsmDialectATT, false);
-   LLVMValueRef a[1] = { val };
-   LLVMBuildCall2(t->b, fnty, ia, a, 1, "");
+   LLVMValueRef a[4] = { self, v1, v2, v3 };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 4, "wgather");
 }
 
-/* vx_rt_get_after: rd <- slot; rs1 = status (scoreboard ordering token so
- * the read stalls until the matching vx_rt_wait writes back). */
+/* vx_rt_get: rd <- hit slot (GETW, funct3=6 funct2=3, count=1; rs2=x1); rs1 =
+ * status (scoreboard ordering token so the read stalls until wait2's terminal
+ * staged the hit). Reads the f32-bit slot into a GP register. */
 static LLVMValueRef
 emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
 {
    char s[48];
-   int n = snprintf(s, sizeof s, ".insn r 43, 5, %u, $0, $1, x0",
-                    ((slot & 0x1f) << 2) | 1u);
+   int n = snprintf(s, sizeof s, ".insn r 43, 6, %u, $0, $1, x1",
+                    ((slot & 0x1f) << 2) | 3u);
    LLVMTypeRef args[1] = { t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, (size_t)n, "=r,r", 4,
@@ -970,32 +987,50 @@ emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
    return LLVMBuildCall2(t->b, fnty, ia, a, 1, "rtget");
 }
 
-/* vx_rt_trace: rd = handle <- trace(rs1 = TLAS device address). */
+/* vx_rt_trace2: rd = handle <- trace(rs1 = lane-packed config; f0..f7 = ray).
+ * config = wgather(0, scene, 0, flags|cull): lane1=scene, lane2=payload(0),
+ * lane3=flags|cull (the RtuUnit reads rs1 lanes 1/2/3). The eight ray floats
+ * are bound to f0..f7 — read by HW convention, like the tensor unit's fragment
+ * window; the encoding itself only names rd/rs1, so the window operands ride
+ * the operand list unreferenced. SSA values are i32 bit-patterns, so the ray
+ * geometry is bitcast to float to land in the FP registers. */
 static LLVMValueRef
-emit_vx_rt_trace(struct vp_tr *t, LLVMValueRef tlas)
+emit_vx_rt_trace2(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
+                  LLVMValueRef ray[8])
 {
-   const char *s = ".insn r 43, 5, 2, $0, $1, x0";
-   LLVMTypeRef args[1] = { t->i32 };
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r", 4,
+   LLVMValueRef z = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef cfg = emit_vx_wgather(t, z, scene, z, flags_cull);
+
+   const char *s = ".insn r 43, 7, 0, $0, $1, x0";
+   const char *c = "=r,r,{f0},{f1},{f2},{f3},{f4},{f5},{f6},{f7}";
+   LLVMTypeRef args[9];
+   args[0] = t->i32;                              /* cfg (rs1) */
+   for (int i = 0; i < 8; i++) args[1 + i] = t->f32;  /* f0..f7 */
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 9, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
                                       /*HasSideEffects*/ true, false,
                                       LLVMInlineAsmDialectATT, false);
-   LLVMValueRef a[1] = { tlas };
-   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "rttrace");
+   LLVMValueRef a[9];
+   a[0] = cfg;
+   for (int i = 0; i < 8; i++)
+      a[1 + i] = LLVMBuildBitCast(t->b, ray[i], t->f32, "");
+   return LLVMBuildCall2(t->b, fnty, ia, a, 9, "rttrace2");
 }
 
-/* vx_rt_wait: rd = status <- wait(rs1 = handle). Blocks the lane. */
+/* vx_rt_wait2: rd = status <- wait(rs1 = handle). Single-op block (funct3=7,
+ * funct2=1); it parks/revives like the regfile WAIT so it survives a callback
+ * trap. The hit-window reads (vortex_rt_get/GETW) chain on the returned status. */
 static LLVMValueRef
-emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle)
+emit_vx_rt_wait2(struct vp_tr *t, LLVMValueRef handle)
 {
-   const char *s = ".insn r 43, 5, 3, $0, $1, x0";
+   const char *s = ".insn r 43, 7, 1, $0, $1, x0";
    LLVMTypeRef args[1] = { t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r", 4,
                                       /*HasSideEffects*/ true, false,
                                       LLVMInlineAsmDialectATT, false);
    LLVMValueRef a[1] = { handle };
-   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "rtwait");
+   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "rtwait2");
 }
 
 /* vx_rt_cb_ret: release the parked context with rs1 = action. No result. */

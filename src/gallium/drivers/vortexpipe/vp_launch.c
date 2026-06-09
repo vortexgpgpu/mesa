@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 
 #include "util/log.h"
 
@@ -152,12 +153,16 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
 
 /* ── BVH transcode: lavapipe lvp_bvh → Vortex RTU scene ──────────────
  * The RTU walks its own scene format (sim/simx/rtu/rtu_types.h), not the
- * lvp_bvh layout. For the opaque-triangle ray-query path we flatten the
- * acceleration structure into the RTU TriList format (scene_kind=0): a
- * 16-byte header { triangle_count, 0, 0, 0 } followed by 40-byte
- * triangles { v0,v1,v2 (9 floats), flags }. Triangles are emitted in
- * world space (instance transforms applied). CW-BVH4 / instancing-aware
- * Tlas transcode is a follow-up. */
+ * lvp_bvh layout. We collect the acceleration structure's opaque triangles
+ * in world space (instance transforms applied), then build a CW-BVH4 scene
+ * (scene_kind=2): a 16-byte header { root_offset, scene_kind, scene_bytes,
+ * node_count } followed by 64-byte 4-wide internal nodes (common origin +
+ * per-axis exponent, 8-bit quantized child AABBs) and 56-byte leaves
+ * { 16-byte header (kind|count, geometry_index, _, prim_base) + 40-byte
+ * triangle }. One triangle per leaf; the leaf's prim_base carries the
+ * source triangle's gl_PrimitiveID. An empty AS degenerates to an empty
+ * TriList (all-miss). Instancing-aware two-level TLAS transcode is a
+ * follow-up. */
 
 /* lvp_bvh node layout (lvp_acceleration_structure.h). */
 #define LVP_BVH_HEADER_SIZE   40   /* sizeof(struct lvp_bvh_header) */
@@ -170,11 +175,27 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
 #define LVP_TRI_GEOMFLAGS_OFF 44   /* coords[3][3]+padding+primitive_id      */
 #define LVP_INST_OTW_OFF      72   /* otw_matrix (object→world, mat3x4)       */
 
-/* RTU TriList constants (rtu_types.h). */
+/* RTU scene constants (rtu_types.h / rtu_bvh.h). */
 #define RTU_SCENE_HDR_BYTES   16
 #define RTU_TRI_STRIDE        40
+#define RTU_TRI_FLAGS_OFFSET  36
 #define RTU_TRI_FLAG_OPAQUE   0x1u
 #define RTU_SCENE_KIND_TRILIST 0u
+#define RTU_SCENE_KIND_BVH4    2u
+
+/* CW-BVH4 on-disk layout (rtu_bvh.h: VxBvhInternalNode / VxBvhLeafHeader). */
+#define RTU_BVH4_NODE_BYTES   64u
+#define RTU_BVH4_WIDTH        4u
+#define RTU_BVH4_OFF_ORIGIN   4u
+#define RTU_BVH4_OFF_EXP      16u
+#define RTU_BVH4_OFF_CHILD    20u
+#define RTU_BVH4_OFF_QMIN     36u
+#define RTU_BVH4_OFF_QMAX     48u
+#define RTU_BVH_LEAF_HDR_BYTES 16u
+#define RTU_BVH_KIND_INTERNAL  0u
+#define RTU_BVH_KIND_LEAF_TRI  1u
+#define RTU_BVH_COUNT_SHIFT    8u
+#define RTU_BVH_CHILD_LEAF_FLAG 0x80000000u
 
 struct vp_tri_list {
    float    (*tris)[10];   /* 9 coords + flags(as float bits) per triangle */
@@ -271,7 +292,240 @@ vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
    }
 }
 
-/* Transcode the lavapipe AS at `tlas_host` into an RTU TriList scene in
+/* ── CW-BVH4 builder (greedy median split, ≤6 children, 1 tri/leaf) ──
+ * Mirrors the host builder in tests/raytracing/rt_raycast, widened to 6.
+ * `order` is a permutation of triangle indices; a build node is a leaf
+ * (one triangle) or an internal node fanning out to up to 6 children. */
+struct vp_bnode {
+   float    mn[3], mx[3];
+   uint32_t tri;                    /* leaf: source triangle index (prim id) */
+   int      child[RTU_BVH4_WIDTH];  /* internal: build-node indices */
+   int      nchild;
+   bool     leaf;
+};
+
+struct vp_bvh {
+   const float (*tris)[10];         /* tl->tris: 9 coords + flags per tri */
+   float    (*cmin)[3];             /* per-tri AABB min */
+   float    (*cmax)[3];             /* per-tri AABB max */
+   float    (*cen)[3];              /* per-tri centroid */
+   uint32_t *order;                 /* tri index permutation */
+   struct vp_bnode *nodes;          /* pre-sized: no realloc during build */
+   uint32_t  n_nodes;
+};
+
+/* Sort order[start, start+count) by centroid on the longest axis; return
+ * the median split offset. Insertion sort — scenes the RTU handles are
+ * small, and it avoids qsort's non-portable context passing. */
+static uint32_t
+vp_bvh_split(struct vp_bvh *b, uint32_t start, uint32_t count)
+{
+   float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+   for (uint32_t i = 0; i < count; i++) {
+      const float *c = b->cen[b->order[start + i]];
+      for (int a = 0; a < 3; a++) {
+         if (c[a] < mn[a]) mn[a] = c[a];
+         if (c[a] > mx[a]) mx[a] = c[a];
+      }
+   }
+   int axis = 0;
+   float ext = mx[0] - mn[0];
+   if (mx[1] - mn[1] > ext) { axis = 1; ext = mx[1] - mn[1]; }
+   if (mx[2] - mn[2] > ext) { axis = 2; }
+   for (uint32_t i = start + 1; i < start + count; i++) {
+      uint32_t v = b->order[i];
+      float k = b->cen[v][axis];
+      uint32_t j = i;
+      while (j > start && b->cen[b->order[j - 1]][axis] > k) {
+         b->order[j] = b->order[j - 1];
+         j--;
+      }
+      b->order[j] = v;
+   }
+   return count / 2;
+}
+
+/* Build the subtree over order[start, start+count); returns its node id. */
+static int
+vp_bvh_build(struct vp_bvh *b, uint32_t start, uint32_t count)
+{
+   int id = (int)b->n_nodes++;
+   struct vp_bnode *n = &b->nodes[id];
+   memset(n, 0, sizeof(*n));
+   if (count == 1) {
+      n->leaf = true;
+      n->tri  = b->order[start];
+      memcpy(n->mn, b->cmin[n->tri], sizeof n->mn);
+      memcpy(n->mx, b->cmax[n->tri], sizeof n->mx);
+      return id;
+   }
+   /* Partition into up to 6 child ranges: repeatedly median-split the
+    * largest range that still holds more than one triangle. */
+   uint32_t rs[RTU_BVH4_WIDTH], rc[RTU_BVH4_WIDTH];
+   int nr = 1;
+   rs[0] = start; rc[0] = count;
+   while (nr < (int)RTU_BVH4_WIDTH) {
+      int best = -1;
+      uint32_t bestc = 1;
+      for (int i = 0; i < nr; i++)
+         if (rc[i] > bestc) { bestc = rc[i]; best = i; }
+      if (best < 0) break;
+      uint32_t s = rs[best], c = rc[best];
+      uint32_t m = vp_bvh_split(b, s, c);
+      rs[best] = s;     rc[best] = m;
+      rs[nr]   = s + m; rc[nr]   = c - m; nr++;
+   }
+   int kids[RTU_BVH4_WIDTH], nk = 0;
+   for (int i = 0; i < nr; i++)
+      if (rc[i] > 0) kids[nk++] = vp_bvh_build(b, rs[i], rc[i]);
+   n = &b->nodes[id];   /* nodes[] is pre-sized; the pointer is still valid */
+   n->leaf = false;
+   n->nchild = nk;
+   for (int a = 0; a < 3; a++) { n->mn[a] = 1e30f; n->mx[a] = -1e30f; }
+   for (int i = 0; i < nk; i++) {
+      n->child[i] = kids[i];
+      const struct vp_bnode *c = &b->nodes[kids[i]];
+      for (int a = 0; a < 3; a++) {
+         if (c->mn[a] < n->mn[a]) n->mn[a] = c->mn[a];
+         if (c->mx[a] > n->mx[a]) n->mx[a] = c->mx[a];
+      }
+   }
+   return id;
+}
+
+/* Per-axis exponent so the node extent maps into the [0,255] uint8 grid:
+ * step = 2^exp ≥ ext/255. */
+static void
+vp_bvh_choose_exp(const float mn[3], const float mx[3], int exp[3])
+{
+   for (int a = 0; a < 3; a++) {
+      float ext = mx[a] - mn[a];
+      if (ext <= 0.f) { exp[a] = -16; continue; }
+      int e = (int)ceilf(log2f(ext / 255.0f));
+      if (e < -16) e = -16;
+      if (e >  16) e =  16;
+      exp[a] = e;
+   }
+}
+
+static uint8_t
+vp_quant(float v, float origin, int exp, bool hi)
+{
+   float t = (v - origin) / ldexpf(1.0f, exp);
+   float q = hi ? ceilf(t) : floorf(t);
+   if (q < 0.f)   q = 0.f;
+   if (q > 255.f) q = 255.f;
+   return (uint8_t)q;
+}
+
+/* Serialize the build tree into a CW-BVH4 scene buffer (malloc'd; caller
+ * frees). Returns NULL on OOM. *out_size receives the byte size. */
+static uint8_t *
+vp_bvh_serialize(struct vp_bvh *b, int root, const float (*tris)[10],
+                 uint32_t *out_size)
+{
+   const uint32_t leaf_bytes = RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_STRIDE;
+   uint32_t *off = malloc((size_t)b->n_nodes * sizeof(uint32_t));
+   if (!off) return NULL;
+   uint32_t cur = RTU_SCENE_HDR_BYTES;
+   for (uint32_t i = 0; i < b->n_nodes; i++) {
+      off[i] = cur;
+      cur += b->nodes[i].leaf ? leaf_bytes : RTU_BVH4_NODE_BYTES;
+   }
+   uint8_t *buf = calloc(1, cur);
+   if (!buf) { free(off); return NULL; }
+
+   uint32_t *sh = (uint32_t *)buf;
+   sh[0] = off[root];                 /* root node offset */
+   sh[1] = RTU_SCENE_KIND_BVH4;
+   sh[2] = cur;                       /* total scene bytes (prefetch sizing) */
+   sh[3] = b->n_nodes;                /* node count */
+
+   for (uint32_t i = 0; i < b->n_nodes; i++) {
+      const struct vp_bnode *n = &b->nodes[i];
+      uint8_t *p = buf + off[i];
+      if (n->leaf) {
+         uint32_t *lh = (uint32_t *)p;
+         lh[0] = RTU_BVH_KIND_LEAF_TRI | (1u << RTU_BVH_COUNT_SHIFT);
+         lh[1] = 0;                    /* geometry_index (single geometry) */
+         lh[2] = 0;
+         lh[3] = n->tri;               /* prim_base = source gl_PrimitiveID */
+         const float *t = tris[n->tri];
+         memcpy(p + RTU_BVH_LEAF_HDR_BYTES, t, 36);   /* 9 coords */
+         uint32_t flags = RTU_TRI_FLAG_OPAQUE;
+         memcpy(p + RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_FLAGS_OFFSET, &flags, 4);
+      } else {
+         uint32_t *kind = (uint32_t *)p;
+         *kind = RTU_BVH_KIND_INTERNAL |
+                 ((uint32_t)n->nchild << RTU_BVH_COUNT_SHIFT);
+         float *origin = (float *)(p + RTU_BVH4_OFF_ORIGIN);
+         origin[0] = n->mn[0]; origin[1] = n->mn[1]; origin[2] = n->mn[2];
+         int exp[3];
+         vp_bvh_choose_exp(n->mn, n->mx, exp);
+         int8_t *pe = (int8_t *)(p + RTU_BVH4_OFF_EXP);
+         pe[0] = (int8_t)exp[0]; pe[1] = (int8_t)exp[1]; pe[2] = (int8_t)exp[2];
+         uint32_t *child = (uint32_t *)(p + RTU_BVH4_OFF_CHILD);
+         uint8_t  *qmin  = p + RTU_BVH4_OFF_QMIN;
+         uint8_t  *qmax  = p + RTU_BVH4_OFF_QMAX;
+         for (int k = 0; k < n->nchild; k++) {
+            const struct vp_bnode *c = &b->nodes[n->child[k]];
+            uint32_t coff = off[n->child[k]];
+            child[k] = coff | (c->leaf ? RTU_BVH_CHILD_LEAF_FLAG : 0u);
+            for (int a = 0; a < 3; a++) {
+               qmin[k * 3 + a] = vp_quant(c->mn[a], n->mn[a], exp[a], false);
+               qmax[k * 3 + a] = vp_quant(c->mx[a], n->mn[a], exp[a], true);
+            }
+         }
+      }
+   }
+   free(off);
+   *out_size = cur;
+   return buf;
+}
+
+/* Build a CW-BVH4 scene buffer from the collected world-space triangles.
+ * Empty input degenerates to an empty TriList (all-miss). */
+static uint8_t *
+vp_build_bvh4_scene(const struct vp_tri_list *tl, uint32_t *out_size)
+{
+   if (tl->count == 0) {
+      uint8_t *scene = calloc(1, RTU_SCENE_HDR_BYTES);
+      if (!scene) return NULL;
+      *out_size = RTU_SCENE_HDR_BYTES;   /* {count=0, kind=TriList, 0, 0} */
+      return scene;
+   }
+
+   const uint32_t n = tl->count;
+   struct vp_bvh b = { .tris = tl->tris };
+   b.cmin  = malloc((size_t)n * sizeof(*b.cmin));
+   b.cmax  = malloc((size_t)n * sizeof(*b.cmax));
+   b.cen   = malloc((size_t)n * sizeof(*b.cen));
+   b.order = malloc((size_t)n * sizeof(*b.order));
+   b.nodes = malloc((size_t)(2 * n) * sizeof(*b.nodes));   /* ≤ 2N-1 nodes */
+   if (!b.cmin || !b.cmax || !b.cen || !b.order || !b.nodes) {
+      free(b.cmin); free(b.cmax); free(b.cen); free(b.order); free(b.nodes);
+      return NULL;
+   }
+   for (uint32_t i = 0; i < n; i++) {
+      const float *t = tl->tris[i];
+      for (int a = 0; a < 3; a++) {
+         float v0 = t[a], v1 = t[3 + a], v2 = t[6 + a];
+         float lo = v0 < v1 ? v0 : v1; lo = lo < v2 ? lo : v2;
+         float hi = v0 > v1 ? v0 : v1; hi = hi > v2 ? hi : v2;
+         b.cmin[i][a] = lo;
+         b.cmax[i][a] = hi;
+         b.cen[i][a]  = 0.5f * (lo + hi);
+      }
+      b.order[i] = i;
+   }
+   int root = vp_bvh_build(&b, 0, n);
+   uint8_t *scene = vp_bvh_serialize(&b, root, tl->tris, out_size);
+
+   free(b.cmin); free(b.cmax); free(b.cen); free(b.order); free(b.nodes);
+   return scene;
+}
+
+/* Transcode the lavapipe AS at `tlas_host` into an RTU CW-BVH4 scene in
  * device memory; returns its device address (0 on failure). */
 static uint64_t
 vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
@@ -286,15 +540,10 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
       return 0;
    }
 
-   uint32_t size = RTU_SCENE_HDR_BYTES + tl.count * RTU_TRI_STRIDE;
-   uint8_t *scene = malloc(size ? size : RTU_SCENE_HDR_BYTES);
-   if (!scene) { free(tl.tris); c->ok = false; return 0; }
-   uint32_t hdr[4] = { tl.count, RTU_SCENE_KIND_TRILIST, 0, 0 };
-   memcpy(scene, hdr, RTU_SCENE_HDR_BYTES);
-   for (uint32_t i = 0; i < tl.count; i++)
-      memcpy(scene + RTU_SCENE_HDR_BYTES + (size_t)i * RTU_TRI_STRIDE,
-             tl.tris[i], RTU_TRI_STRIDE);
+   uint32_t size = 0;
+   uint8_t *scene = vp_build_bvh4_scene(&tl, &size);
    free(tl.tris);
+   if (!scene) { c->ok = false; return 0; }
 
    if (c->n_bufs >= VP_MAX_BVH || c->n_stages >= VP_MAX_BVH) {
       free(scene); c->ok = false; return 0;

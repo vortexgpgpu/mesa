@@ -9,8 +9,9 @@
  * (lvp_nir_lower_ray_queries). When the device has the RTU
  * (driver_ray_queries cap set by vortexpipe), lavapipe skips that and
  * leaves the rq_* intrinsics intact; this pass rewrites them into the
- * Vortex RTU vendor intrinsics (vortex_rt_set/get/trace/wait), which
- * vp_nir_to_llvm emits as CUSTOM1 .insn ops. The model mirrors Intel's
+ * Vortex RTU vendor intrinsics (vortex_rt_trace2/wait2/get — the ISA v2
+ * window ABI), which vp_nir_to_llvm emits as CUSTOM1 .insn ops. The model
+ * mirrors Intel's
  * brw_nir_lower_ray_queries.c: rq_initialize stages the ray inputs,
  * rq_proceed fires one synchronous trace+wait, rq_load reads the hit
  * attributes back.
@@ -54,20 +55,19 @@
 #define RQ_COMMITTED_TRIANGLE     1
 
 /* Per-ray-query lowering state. The RTU is one-ray-per-lane, so a single
- * shared state covers the common single-query shader. */
+ * shared state covers the common single-query shader. The v2 window ABI passes
+ * the ray geometry through the trace2 register window (not the slot file), so
+ * the ray inputs are staged here at rq_initialize and consumed at rq_proceed. */
 struct rq_state {
-   nir_variable *tlas;    /* uint: TLAS device address (low 32 bits) */
-   nir_variable *status;  /* uint: vx_rt_wait status                 */
+   nir_variable *scene;   /* uint: TLAS device address (low 32 bits) */
+   nir_variable *flags;   /* uint: ray flags                         */
+   nir_variable *cull;    /* uint: cull mask (low byte)              */
+   nir_variable *origin;  /* vec3: world ray origin                  */
+   nir_variable *dir;     /* vec3: world ray direction               */
+   nir_variable *tmin;    /* float                                   */
+   nir_variable *tmax;    /* float                                   */
+   nir_variable *status;  /* uint: vx_rt_wait2 status                */
 };
-
-static void
-rt_set(nir_builder *b, unsigned slot, nir_def *val)
-{
-   /* vortex_rt_set takes a 32-bit value; floats are bit-identical. */
-   if (val->bit_size != 32)
-      val = nir_u2u32(b, val);
-   nir_vortex_rt_set(b, val, .base = slot);
-}
 
 static nir_def *
 rt_get(nir_builder *b, unsigned slot, nir_def *status)
@@ -88,34 +88,42 @@ lower_initialize(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    nir_def *dir    = in->src[6].ssa;
    nir_def *tmax   = in->src[7].ssa;
 
-   rt_set(b, VX_RT_RAY_ORIGIN + 0, nir_channel(b, origin, 0));
-   rt_set(b, VX_RT_RAY_ORIGIN + 1, nir_channel(b, origin, 1));
-   rt_set(b, VX_RT_RAY_ORIGIN + 2, nir_channel(b, origin, 2));
-   rt_set(b, VX_RT_RAY_DIRECTION + 0, nir_channel(b, dir, 0));
-   rt_set(b, VX_RT_RAY_DIRECTION + 1, nir_channel(b, dir, 1));
-   rt_set(b, VX_RT_RAY_DIRECTION + 2, nir_channel(b, dir, 2));
-   rt_set(b, VX_RT_T_MIN, tmin);
-   rt_set(b, VX_RT_T_MAX, tmax);
-   rt_set(b, VX_RT_RAY_FLAGS, nir_u2u32(b, flags));
-   rt_set(b, VX_RT_CULL_MASK, nir_iand_imm(b, nir_u2u32(b, cull), 0xff));
-
-   /* TLAS device address: vx_rt_trace takes one XLEN register (32 on
-    * rv32) — the low 32 bits of the acceleration-structure address. */
-   nir_def *tlas32 = accel->bit_size == 32 ? accel : nir_u2u32(b, accel);
-   nir_store_var(b, st->tlas, tlas32, 0x1);
+   /* Stage the ray inputs; rq_proceed issues them as one trace2 macro-op.
+    * The TLAS pointer is the low 32 bits of the acceleration-structure
+    * address (the RV32 trace2 config carries one XLEN scene register). */
+   nir_def *scene = accel->bit_size == 32 ? accel : nir_u2u32(b, accel);
+   nir_store_var(b, st->scene, scene, 0x1);
+   nir_store_var(b, st->flags, nir_u2u32(b, flags), 0x1);
+   nir_store_var(b, st->cull, nir_iand_imm(b, nir_u2u32(b, cull), 0xff), 0x1);
+   nir_store_var(b, st->origin, origin, 0x7);
+   nir_store_var(b, st->dir, dir, 0x7);
+   nir_store_var(b, st->tmin, tmin, 0x1);
+   nir_store_var(b, st->tmax, tmax, 0x1);
    nir_store_var(b, st->status, nir_imm_int(b, VX_RT_STS_DONE_MISS), 0x1);
 }
 
 static nir_def *
 lower_proceed(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
 {
-   /* Fire one synchronous ray: the RTU walks the whole BVH in trace+wait.
-    * `while (rayQueryProceedEXT(rq)) {}` evaluates proceed once, so a
-    * single trace happens and the loop body (candidate handling) is
-    * skipped for the opaque path. Return false. */
-   nir_def *tlas   = nir_load_var(b, st->tlas);
-   nir_def *handle = nir_vortex_rt_trace(b, 32, tlas);
-   nir_def *status = nir_vortex_rt_wait(b, 32, handle);
+   /* Fire one synchronous ray: the RTU walks the whole BVH in trace2+wait2.
+    * `while (rayQueryProceedEXT(rq)) {}` evaluates proceed once, so a single
+    * trace happens and the loop body (candidate handling) is skipped for the
+    * opaque path. Return false. */
+   nir_def *scene  = nir_load_var(b, st->scene);
+   nir_def *flags  = nir_load_var(b, st->flags);
+   nir_def *cull   = nir_load_var(b, st->cull);
+   /* lane-3 config word: ray_flags (low 16) | cull_mask (high 16). */
+   nir_def *flags_cull =
+      nir_ior(b, nir_iand_imm(b, flags, 0xffff),
+                 nir_ishl_imm(b, nir_iand_imm(b, cull, 0xff), 16));
+   nir_def *origin = nir_load_var(b, st->origin);
+   nir_def *dir    = nir_load_var(b, st->dir);
+   nir_def *tmin   = nir_load_var(b, st->tmin);
+   nir_def *tmax   = nir_load_var(b, st->tmax);
+
+   nir_def *handle = nir_vortex_rt_trace2(b, 32, scene, flags_cull,
+                                          origin, dir, tmin, tmax);
+   nir_def *status = nir_vortex_rt_wait2(b, 32, handle);
    nir_store_var(b, st->status, status, 0x1);
    return nir_imm_false(b);
 }
@@ -152,13 +160,12 @@ lower_load(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    case nir_ray_query_value_intersection_instance_custom_index:
       return rt_get(b, VX_RT_HIT_INSTANCE_CUSTOM, status);
    case nir_ray_query_value_intersection_object_ray_origin:
-      return nir_vec3(b, rt_get(b, VX_RT_OBJECT_RAY_ORIGIN + 0, status),
-                         rt_get(b, VX_RT_OBJECT_RAY_ORIGIN + 1, status),
-                         rt_get(b, VX_RT_OBJECT_RAY_ORIGIN + 2, status));
+      /* Opaque single-level path: object ray == world ray (the RTU only
+       * stages a distinct object ray on a callback yield). Return the
+       * staged world ray rather than the unwritten object-ray slots. */
+      return nir_load_var(b, st->origin);
    case nir_ray_query_value_intersection_object_ray_direction:
-      return nir_vec3(b, rt_get(b, VX_RT_OBJECT_RAY_DIRECTION + 0, status),
-                         rt_get(b, VX_RT_OBJECT_RAY_DIRECTION + 1, status),
-                         rt_get(b, VX_RT_OBJECT_RAY_DIRECTION + 2, status));
+      return nir_load_var(b, st->dir);
    default:
       /* Unhandled query value (front-face, transforms, world ray, …):
        * return zeros of the requested shape for now. */
@@ -204,7 +211,13 @@ vp_nir_lower_ray_tracing_to_rtu(nir_shader *shader)
 
    /* One shared query state (RTU is one ray per lane). */
    struct rq_state st = {
-      .tlas   = nir_local_variable_create(impl, glsl_uint_type(), "rq_tlas"),
+      .scene  = nir_local_variable_create(impl, glsl_uint_type(), "rq_scene"),
+      .flags  = nir_local_variable_create(impl, glsl_uint_type(), "rq_flags"),
+      .cull   = nir_local_variable_create(impl, glsl_uint_type(), "rq_cull"),
+      .origin = nir_local_variable_create(impl, glsl_vec_type(3), "rq_origin"),
+      .dir    = nir_local_variable_create(impl, glsl_vec_type(3), "rq_dir"),
+      .tmin   = nir_local_variable_create(impl, glsl_float_type(), "rq_tmin"),
+      .tmax   = nir_local_variable_create(impl, glsl_float_type(), "rq_tmax"),
       .status = nir_local_variable_create(impl, glsl_uint_type(), "rq_status"),
    };
 
