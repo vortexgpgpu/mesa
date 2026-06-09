@@ -9,7 +9,7 @@
  * (lvp_nir_lower_ray_queries). When the device has the RTU
  * (driver_ray_queries cap set by vortexpipe), lavapipe skips that and
  * leaves the rq_* intrinsics intact; this pass rewrites them into the
- * Vortex RTU vendor intrinsics (vortex_rt_trace2/wait2/get — the ISA v2
+ * Vortex RTU vendor intrinsics (vortex_rt_wtrace/wait/get — the ISA v2
  * window ABI), which vp_nir_to_llvm emits as CUSTOM1 .insn ops. The model
  * mirrors Intel's
  * brw_nir_lower_ray_queries.c: rq_initialize stages the ray inputs,
@@ -56,7 +56,7 @@
 
 /* Per-ray-query lowering state. The RTU is one-ray-per-lane, so a single
  * shared state covers the common single-query shader. The v2 window ABI passes
- * the ray geometry through the trace2 register window (not the slot file), so
+ * the ray geometry through the trace register window (not the slot file), so
  * the ray inputs are staged here at rq_initialize and consumed at rq_proceed. */
 struct rq_state {
    nir_variable *scene;   /* uint: TLAS device address (low 32 bits) */
@@ -66,7 +66,7 @@ struct rq_state {
    nir_variable *dir;     /* vec3: world ray direction               */
    nir_variable *tmin;    /* float                                   */
    nir_variable *tmax;    /* float                                   */
-   nir_variable *status;  /* uint: vx_rt_wait2 status                */
+   nir_variable *status;  /* uint: vx_rt_wait status                */
 };
 
 static nir_def *
@@ -88,9 +88,9 @@ lower_initialize(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    nir_def *dir    = in->src[6].ssa;
    nir_def *tmax   = in->src[7].ssa;
 
-   /* Stage the ray inputs; rq_proceed issues them as one trace2 macro-op.
+   /* Stage the ray inputs; rq_proceed issues them as one trace macro-op.
     * The TLAS pointer is the low 32 bits of the acceleration-structure
-    * address (the RV32 trace2 config carries one XLEN scene register). */
+    * address (the RV32 trace config carries one XLEN scene register). */
    nir_def *scene = accel->bit_size == 32 ? accel : nir_u2u32(b, accel);
    nir_store_var(b, st->scene, scene, 0x1);
    nir_store_var(b, st->flags, nir_u2u32(b, flags), 0x1);
@@ -105,7 +105,7 @@ lower_initialize(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
 static nir_def *
 lower_proceed(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
 {
-   /* Fire one synchronous ray: the RTU walks the whole BVH in trace2+wait2.
+   /* Fire one synchronous ray: the RTU walks the whole BVH in trace+wait.
     * `while (rayQueryProceedEXT(rq)) {}` evaluates proceed once, so a single
     * trace happens and the loop body (candidate handling) is skipped for the
     * opaque path. Return false. */
@@ -121,9 +121,9 @@ lower_proceed(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    nir_def *tmin   = nir_load_var(b, st->tmin);
    nir_def *tmax   = nir_load_var(b, st->tmax);
 
-   nir_def *handle = nir_vortex_rt_trace2(b, 32, scene, flags_cull,
+   nir_def *handle = nir_vortex_rt_wtrace(b, 32, scene, flags_cull,
                                           origin, dir, tmin, tmax);
-   nir_def *status = nir_vortex_rt_wait2(b, 32, handle);
+   nir_def *status = nir_vortex_rt_wait(b, 32, handle);
    nir_store_var(b, st->status, status, 0x1);
    return nir_imm_false(b);
 }

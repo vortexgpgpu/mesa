@@ -685,14 +685,14 @@ intrinsic("rq_load", src_comp=[-1], dest_comp=0, indices=[RAY_QUERY_VALUE,COMMIT
 # driver lowers rq_*/trace_ray to these (vp_nir_lower_ray_tracing_to_rtu.c)
 # and emits them as Vortex CUSTOM1 .insn ops (vp_nir_to_llvm.c). BASE is the
 # RTU register-file slot id (see sw/kernel/include/vx_raytrace.h).
-# v2 window ABI (rtu_isa_v2_proposal.md): vortex_rt_trace2 issues one ray in a
+# v2 window ABI (rtu_isa_v2_proposal.md): vortex_rt_wtrace issues one ray in a
 # single macro-op — the per-trace config (scene, flags|cull<<16) lane-packs via
 # wgather and the per-thread geometry (origin, dir, tmin, tmax) rides the f0..f7
-# register window. vortex_rt_wait2 blocks on the handle. vortex_rt_get reads one
+# register window. vortex_rt_wait blocks on the handle. vortex_rt_get reads one
 # hit slot post-terminal (GETW, scoreboard-chained on the wait status, src[0]).
 #                                  scene flags|cull origin dir tmin tmax
-intrinsic("vortex_rt_trace2", src_comp=[1,1,3,3,1,1], dest_comp=1)  # -> handle
-intrinsic("vortex_rt_wait2",  src_comp=[1], dest_comp=1)            # handle -> status
+intrinsic("vortex_rt_wtrace", src_comp=[1,1,3,3,1,1], dest_comp=1)  # -> handle
+intrinsic("vortex_rt_wait",  src_comp=[1], dest_comp=1)            # handle -> status
 intrinsic("vortex_rt_get",    src_comp=[1], dest_comp=1, indices=[BASE])
 intrinsic("vortex_rt_cb_ret", src_comp=[1])                  # cb_ret(src[0]=action)
 

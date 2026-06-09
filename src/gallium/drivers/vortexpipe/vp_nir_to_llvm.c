@@ -656,10 +656,10 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
 
 /* RTU emit helpers (defined after emit_vx_tex, below). */
 static LLVMValueRef emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status);
-static LLVMValueRef emit_vx_rt_trace2(struct vp_tr *t, LLVMValueRef scene,
+static LLVMValueRef emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene,
                                       LLVMValueRef flags_cull,
                                       LLVMValueRef ray[8]);
-static LLVMValueRef emit_vx_rt_wait2(struct vp_tr *t, LLVMValueRef handle);
+static LLVMValueRef emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle);
 static void         emit_vx_rt_cb_ret(struct vp_tr *t, LLVMValueRef action);
 
 static void
@@ -889,7 +889,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       ssa_set(t, in->def.index, 0, emit_vx_rt_get(t, slot, status));
       break;
    }
-   case nir_intrinsic_vortex_rt_trace2: {
+   case nir_intrinsic_vortex_rt_wtrace: {
       /* src = { scene, flags|cull, origin(3), dir(3), tmin, tmax } */
       LLVMValueRef scene = ssa_get(t, in->src[0].ssa->index, 0);
       LLVMValueRef fc    = ssa_get(t, in->src[1].ssa->index, 0);
@@ -903,12 +903,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          ssa_get(t, in->src[4].ssa->index, 0),   /* tmin     */
          ssa_get(t, in->src[5].ssa->index, 0),   /* tmax     */
       };
-      ssa_set(t, in->def.index, 0, emit_vx_rt_trace2(t, scene, fc, ray));
+      ssa_set(t, in->def.index, 0, emit_vx_rt_wtrace(t, scene, fc, ray));
       break;
    }
-   case nir_intrinsic_vortex_rt_wait2: {
+   case nir_intrinsic_vortex_rt_wait: {
       LLVMValueRef h = ssa_get(t, in->src[0].ssa->index, 0);
-      ssa_set(t, in->def.index, 0, emit_vx_rt_wait2(t, h));
+      ssa_set(t, in->def.index, 0, emit_vx_rt_wait(t, h));
       break;
    }
    case nir_intrinsic_vortex_rt_cb_ret:
@@ -940,9 +940,9 @@ emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
 }
 
 /* ── RTU (ray-tracing unit) ops — ISA v2 window ABI ──────────────────
- * CUSTOM1 (opcode 43). vortex_rt_trace2 (funct3=7, funct2=0) issues one ray:
+ * CUSTOM1 (opcode 43). vortex_rt_wtrace (funct3=7, funct2=0) issues one ray:
  * the per-trace config lane-packs into rs1 via wgather, the per-thread ray
- * geometry rides the f0..f7 FP register window. vortex_rt_wait2 (funct3=7,
+ * geometry rides the f0..f7 FP register window. vortex_rt_wait (funct3=7,
  * funct2=1) is a single-op block. vortex_rt_get reads one hit slot post-
  * terminal (GETW, funct3=6 funct2=3, count=1). funct3=6 funct2=0 is cb_ret.
  * Mirrors sw/kernel/include/vx_raytrace.h. */
@@ -970,7 +970,7 @@ emit_vx_wgather(struct vp_tr *t, LLVMValueRef self, LLVMValueRef v1,
 }
 
 /* vx_rt_get: rd <- hit slot (GETW, funct3=6 funct2=3, count=1; rs2=x1); rs1 =
- * status (scoreboard ordering token so the read stalls until wait2's terminal
+ * status (scoreboard ordering token so the read stalls until wait's terminal
  * staged the hit). Reads the f32-bit slot into a GP register. */
 static LLVMValueRef
 emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
@@ -987,7 +987,7 @@ emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
    return LLVMBuildCall2(t->b, fnty, ia, a, 1, "rtget");
 }
 
-/* vx_rt_trace2: rd = handle <- trace(rs1 = lane-packed config; f0..f7 = ray).
+/* vx_rt_trace: rd = handle <- trace(rs1 = lane-packed config; f0..f7 = ray).
  * config = wgather(0, scene, 0, flags|cull): lane1=scene, lane2=payload(0),
  * lane3=flags|cull (the RtuUnit reads rs1 lanes 1/2/3). The eight ray floats
  * are bound to f0..f7 — read by HW convention, like the tensor unit's fragment
@@ -995,7 +995,7 @@ emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
  * the operand list unreferenced. SSA values are i32 bit-patterns, so the ray
  * geometry is bitcast to float to land in the FP registers. */
 static LLVMValueRef
-emit_vx_rt_trace2(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
+emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
                   LLVMValueRef ray[8])
 {
    LLVMValueRef z = LLVMConstInt(t->i32, 0, false);
@@ -1014,14 +1014,14 @@ emit_vx_rt_trace2(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
    a[0] = cfg;
    for (int i = 0; i < 8; i++)
       a[1 + i] = LLVMBuildBitCast(t->b, ray[i], t->f32, "");
-   return LLVMBuildCall2(t->b, fnty, ia, a, 9, "rttrace2");
+   return LLVMBuildCall2(t->b, fnty, ia, a, 9, "rttrace");
 }
 
-/* vx_rt_wait2: rd = status <- wait(rs1 = handle). Single-op block (funct3=7,
+/* vx_rt_wait: rd = status <- wait(rs1 = handle). Single-op block (funct3=7,
  * funct2=1); it parks/revives like the regfile WAIT so it survives a callback
  * trap. The hit-window reads (vortex_rt_get/GETW) chain on the returned status. */
 static LLVMValueRef
-emit_vx_rt_wait2(struct vp_tr *t, LLVMValueRef handle)
+emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle)
 {
    const char *s = ".insn r 43, 7, 1, $0, $1, x0";
    LLVMTypeRef args[1] = { t->i32 };
@@ -1030,7 +1030,7 @@ emit_vx_rt_wait2(struct vp_tr *t, LLVMValueRef handle)
                                       /*HasSideEffects*/ true, false,
                                       LLVMInlineAsmDialectATT, false);
    LLVMValueRef a[1] = { handle };
-   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "rtwait2");
+   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "rtwait");
 }
 
 /* vx_rt_cb_ret: release the parked context with rs1 = action. No result. */
