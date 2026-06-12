@@ -56,11 +56,6 @@ namespace graphics = vortex::graphics;
       }                                                                 \
    } while (0)
 
-/* enqueue one DCR write, bailing to `done` on failure */
-#define DCR(addr, val)                                                  \
-   VP_CHECK(vx_enqueue_dcr_write(q, (addr), (uint32_t)(val), 0, NULL, NULL), \
-            #addr)
-
 /* exact log2 of a power-of-two texture dimension */
 static inline uint32_t
 vp_log2u(uint32_t n)
@@ -149,14 +144,14 @@ vp_raster_draw(vx_device_h dev,
       vx_queue_info_t qi = { sizeof(qi), NULL, VX_QUEUE_PRIORITY_NORMAL, 0 };
       VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
 
-      /* The front-end and fragment-shader .vxbins both link at the fixed
-       * kernel STARTUP_ADDR, so only one can be resident at a time. Run the
-       * front end first, drain it, then swap in the per-draw FS module; the
-       * device buffers it produces (prim + tilebuf) are separate
-       * allocations and survive the code-module swap.
-       *
-       * front-end module: the setup_k + binning_k blob embedded in the
-       * driver, loaded straight from memory (no toolchain at runtime). */
+      /* Load BOTH code modules resident: the per-draw FS at the default
+       * STARTUP_ADDR (0x80000000) and the embedded front end at its distinct
+       * base (kernels/gfx_frontend linked at 0x80200000). Co-residence lets
+       * one CP command batch sequence expand -> setup -> binning -> raster ->
+       * FS with no host module swap between stages (§6.4). */
+      VP_CHECK(vx_module_load_file(dev, vxpath, &kmod), "vx_module_load_file(fs)");
+      VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf), "vx_module_get_kernel(fs)");
+
       size_t fe_size = 0;
       const void *fe_bytes = vp_gfx_frontend_vxbin(&fe_size);
       VP_CHECK(vx_module_load_bytes(dev, fe_bytes, fe_size, &femod),
@@ -210,9 +205,9 @@ vp_raster_draw(vx_device_h dev,
          VP_CHECK(vx_buffer_address(*s.h, s.addr), s.what);
       }
 
-      /* on-device vertex assembly: expand the resident VS records into the
-       * setup_vertex_t[] the front end consumes (verts_buf = arg.verts_addr),
-       * replacing the host readback + expansion + re-upload. */
+      /* expand_k arg: on-device vertex assembly expands the resident VS
+       * records into the setup_vertex_t[] the front end consumes
+       * (verts_buf = arg.verts_addr). */
       expand_arg_t earg{};
       earg.vsrec_addr   = vsrec_addr;
       earg.verts_addr   = arg.verts_addr;
@@ -224,56 +219,9 @@ vp_raster_draw(vx_device_h dev,
       for (uint32_t i = 0; i < nvary; i++)
          earg.varying_comps[i] = layout->varying_comps[i];
 
-      vx_launch_info_t eli = vx_launch_info_t{};
-      eli.struct_size = sizeof(eli);
-      eli.kernel      = k_expand;
-      eli.args_host   = &earg;
-      eli.args_size   = sizeof(earg);
-      eli.ndim        = 1;
-      eli.grid_dim[0]  = G;
-      eli.block_dim[0] = T;
-      vx_event_h ev_x = NULL;
-      VP_CHECK(vx_enqueue_launch(q, &eli, 0, NULL, &ev_x),
-               "vx_enqueue_launch(expand)");
-
-      /* CP-sequenced front end: nine chained launches over resident memory
-       * (setup_k stages 0-2, binning_k stages 3-8). multi-CTA (grid=G)
-       * except the three single-CTA scans. Each launch waits on the prior
-       * stage's event — the launch drain is the device barrier. */
-      const uint32_t NSTAGE = 9;
-      const uint32_t sgrid[NSTAGE] = { G, 1, G,  G, 1, G,  G, 1, G };
-      pipe_arg_t      kargs[NSTAGE];
-      vx_launch_info_t li[NSTAGE];
-      vx_event_h       ev[NSTAGE] = {};
-      for (uint32_t s = 0; s < NSTAGE; ++s) {
-         kargs[s] = arg; kargs[s].stage = s;
-         li[s] = vx_launch_info_t{};
-         li[s].struct_size = sizeof(li[s]);
-         li[s].kernel      = (s < PIPE_STAGE_BCOUNT) ? k_setup : k_binning;
-         li[s].args_host   = &kargs[s];
-         li[s].args_size   = sizeof(pipe_arg_t);
-         li[s].ndim        = 1;
-         li[s].grid_dim[0]  = sgrid[s];
-         li[s].block_dim[0] = T;
-         vx_event_h dep = s ? ev[s - 1] : ev_x;
-         VP_CHECK(vx_enqueue_launch(q, &li[s], 1, &dep, &ev[s]),
-                  "vx_enqueue_launch(frontend)");
-      }
-
-      /* drain the front end, then free its code module so the FS module can
-       * load at the shared STARTUP_ADDR. The resident prim + tilebuf the
-       * front end produced are separate allocations and survive the swap. */
-      VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish(frontend)");
-      vx_kernel_release(k_binning); k_binning = NULL;
-      vx_kernel_release(k_setup);   k_setup   = NULL;
-      vx_kernel_release(k_expand);  k_expand  = NULL;
-      vx_module_release(femod);     femod     = NULL;
-
-      /* fragment-shader module (per-draw .vxbin) */
-      VP_CHECK(vx_module_load_file(dev, vxpath, &kmod), "vx_module_load_file(fs)");
-      VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf), "vx_module_get_kernel(fs)");
-
-      /* ---- RASTER + FS + OM over the device-produced buffers ---------- */
+      /* ---- colour / depth / texture buffers + uploads ----------------- *
+       * The DMA uploads precede the command batch on the same queue (FIFO);
+       * the batch itself is launches + DCR writes only. */
       uint64_t prim_dev = arg.prim_addr;
       uint64_t tile_dev = arg.tilebuf_addr;
 
@@ -293,47 +241,12 @@ vp_raster_draw(vx_device_h dev,
                        om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL) ? 0x00 : 0xFF;
       std::vector<uint8_t> zclear(cbuf_bytes, zfill);
       std::vector<uint32_t> texbuf;   /* outlives vx_queue_finish (async write) */
+      uint64_t tex_dev = 0;
 
       VP_CHECK(vx_enqueue_write(q, cbuf, 0, color, cbuf_bytes, 0, NULL, NULL),
                "vx_enqueue_write(color)");
       VP_CHECK(vx_enqueue_write(q, zbuf, 0, zclear.data(), cbuf_bytes, 0, NULL, NULL),
                "vx_enqueue_write(depth)");
-
-      /* RASTER DCRs: device-produced tile + primitive buffers; TILE_COUNT
-       * is the dense grid count (host-known, no readback). */
-      DCR(VX_DCR_RASTER_TBUF_ADDR,   tile_dev / 64);
-      DCR(VX_DCR_RASTER_TILE_COUNT,  num_bins);
-      DCR(VX_DCR_RASTER_PBUF_ADDR,   prim_dev / 64);
-      DCR(VX_DCR_RASTER_PBUF_STRIDE, VP_RAST_PRIM_STRIDE);
-      DCR(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
-      DCR(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
-
-      /* OM DCRs: colour + depth buffers, depth test, blend. Stencil
-       * disabled for gfx-v1 (ALWAYS / KEEP). */
-      DCR(VX_DCR_OM_CBUF_ADDR,        color_dev / 64);
-      DCR(VX_DCR_OM_CBUF_PITCH,       width * 4);
-      DCR(VX_DCR_OM_CBUF_WRITEMASK,   om->colormask);
-      DCR(VX_DCR_OM_ZBUF_ADDR,        depth_dev / 64);
-      DCR(VX_DCR_OM_ZBUF_PITCH,       width * 4);
-      DCR(VX_DCR_OM_DEPTH_FUNC,
-          om->depth_test ? om->depth_func : VX_OM_DEPTH_FUNC_ALWAYS);
-      DCR(VX_DCR_OM_DEPTH_WRITEMASK,
-          (om->depth_test && om->depth_write) ? 1u : 0u);
-      DCR(VX_DCR_OM_STENCIL_FUNC,      VX_OM_DEPTH_FUNC_ALWAYS);
-      DCR(VX_DCR_OM_STENCIL_ZPASS,     VX_OM_STENCIL_OP_KEEP);
-      DCR(VX_DCR_OM_STENCIL_ZFAIL,     VX_OM_STENCIL_OP_KEEP);
-      DCR(VX_DCR_OM_STENCIL_FAIL,      VX_OM_STENCIL_OP_KEEP);
-      DCR(VX_DCR_OM_STENCIL_REF,       0);
-      DCR(VX_DCR_OM_STENCIL_MASK,      0xFF);
-      DCR(VX_DCR_OM_STENCIL_WRITEMASK, 0);
-      DCR(VX_DCR_OM_BLEND_MODE,        om->blend_mode);
-      DCR(VX_DCR_OM_BLEND_FUNC,        om->blend_func);
-      DCR(VX_DCR_OM_BLEND_CONST,       0);
-      DCR(VX_DCR_OM_LOGIC_OP,          0);
-
-      /* TEX unit (stage 0): convert the bound texture from R8G8B8A8 to the
-       * A8R8G8B8 word the TEX unit unpacks, upload, program the sampler.
-       * Untextured draws (tex == NULL) leave TEX state alone. */
       if (tex) {
          const uint32_t texel_count = tex->width * tex->height;
          texbuf.resize(texel_count);
@@ -345,38 +258,112 @@ vp_raster_draw(vx_device_h dev,
             uint32_t a = src[i * 4 + 3];
             texbuf[i] = (a << 24) | (r << 16) | (g << 8) | b;
          }
-         const size_t texbuf_bytes = (size_t)texel_count * 4;
-
-         VP_CHECK(vx_buffer_create(dev, texbuf_bytes, 0, &xbuf), "vx_buffer_create(tex)");
-         uint64_t tex_dev = 0;
+         VP_CHECK(vx_buffer_create(dev, (size_t)texel_count * 4, 0, &xbuf),
+                  "vx_buffer_create(tex)");
          VP_CHECK(vx_buffer_address(xbuf, &tex_dev), "vx_buffer_address(tex)");
-         VP_CHECK(vx_enqueue_write(q, xbuf, 0, texbuf.data(), texbuf_bytes,
+         VP_CHECK(vx_enqueue_write(q, xbuf, 0, texbuf.data(), (size_t)texel_count * 4,
                                    0, NULL, NULL), "vx_enqueue_write(tex)");
-
-         uint32_t logw = vp_log2u(tex->width);
-         uint32_t logh = vp_log2u(tex->height);
-         DCR(VX_DCR_TEX_STAGE,        0);
-         DCR(VX_DCR_TEX_LOGDIM,       (logh << 16) | logw);
-         DCR(VX_DCR_TEX_FORMAT,       VX_TEX_FORMAT_A8R8G8B8);
-         DCR(VX_DCR_TEX_FILTER,       tex->filter);
-         DCR(VX_DCR_TEX_WRAP,         (tex->wrap_v << 16) | tex->wrap_u);
-         DCR(VX_DCR_TEX_ADDR,         tex_dev / 64);
-         DCR(VX_DCR_TEX_MIPOFF_BASE,  0);
       }
 
-      /* dispatch the fragment-shader kernel; threads poll vx_rast(). The
-       * front end already drained (queue_finish above), so RASTER sees the
-       * resident tilebuf + primbuf. Fill every HW lane: block = threads ×
-       * warps (one CTA/core), grid = cores. */
+      /* FS launch fills every HW lane: block = threads × warps (one CTA/core),
+       * grid = cores. */
       uint64_t nt = 1, nw = 1, nc = 1;
       VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt), "vx_device_query(NUM_THREADS)");
       VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,   &nw), "vx_device_query(NUM_WARPS)");
       VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES,   &nc), "vx_device_query(NUM_CORES)");
-      vx_launch_info_t fli = {
-         sizeof(fli), NULL, kbuf, argblk, sizeof(argblk), 1,
-         { (uint32_t)nc, 1, 1 }, { (uint32_t)(nt * nw), 1, 1 }, 0,
+
+      /* Launch descriptors + per-stage args. These must outlive
+       * vx_enqueue_commands (the runtime copies them at submit). */
+      const uint32_t NSTAGE = 9;
+      const uint32_t sgrid[NSTAGE] = { G, 1, G,  G, 1, G,  G, 1, G };
+      pipe_arg_t       kargs[NSTAGE];
+      vx_launch_info_t eli{}, li[NSTAGE], fli{};
+
+      eli.struct_size = sizeof(eli); eli.kernel = k_expand;
+      eli.args_host = &earg; eli.args_size = sizeof(earg);
+      eli.ndim = 1; eli.grid_dim[0] = G; eli.block_dim[0] = T;
+
+      for (uint32_t s = 0; s < NSTAGE; ++s) {
+         kargs[s] = arg; kargs[s].stage = s;
+         li[s] = vx_launch_info_t{};
+         li[s].struct_size = sizeof(li[s]);
+         li[s].kernel      = (s < PIPE_STAGE_BCOUNT) ? k_setup : k_binning;
+         li[s].args_host   = &kargs[s];
+         li[s].args_size   = sizeof(pipe_arg_t);
+         li[s].ndim        = 1;
+         li[s].grid_dim[0]  = sgrid[s];
+         li[s].block_dim[0] = T;
+      }
+
+      fli.struct_size = sizeof(fli); fli.kernel = kbuf;
+      fli.args_host = argblk; fli.args_size = sizeof(argblk);
+      fli.ndim = 1; fli.grid_dim[0] = (uint32_t)nc;
+      fli.block_dim[0] = (uint32_t)(nt * nw);
+
+      /* The whole draw as ONE CP command batch (§6.4): expand -> setup ->
+       * binning, then RASTER/OM/TEX config, then FS. The CP retires the
+       * commands in order, draining each launch before the next (the
+       * inter-stage device barrier), so the host is untouched between stages
+       * — no per-launch round-trip, no module swap. RASTER's device-produced
+       * tile + prim buffers feed it; TILE_COUNT is the dense grid count
+       * (host-known, no readback). Stencil disabled for gfx-v1 (ALWAYS/KEEP). */
+      std::vector<vx_command_t> cmds;
+      auto LAUNCH = [&](const vx_launch_info_t *l) {
+         vx_command_t c{}; c.type = VX_COMMAND_LAUNCH; c.data.launch = l;
+         cmds.push_back(c);
       };
-      VP_CHECK(vx_enqueue_launch(q, &fli, 0, NULL, NULL), "vx_enqueue_launch(fs)");
+      auto DCRW = [&](uint32_t a, uint32_t v) {
+         vx_command_t c{}; c.type = VX_COMMAND_DCR_WRITE;
+         c.data.dcr.addr = a; c.data.dcr.value = v; cmds.push_back(c);
+      };
+
+      LAUNCH(&eli);
+      for (uint32_t s = 0; s < NSTAGE; ++s) LAUNCH(&li[s]);
+
+      DCRW(VX_DCR_RASTER_TBUF_ADDR,   (uint32_t)(tile_dev / 64));
+      DCRW(VX_DCR_RASTER_TILE_COUNT,  num_bins);
+      DCRW(VX_DCR_RASTER_PBUF_ADDR,   (uint32_t)(prim_dev / 64));
+      DCRW(VX_DCR_RASTER_PBUF_STRIDE, VP_RAST_PRIM_STRIDE);
+      DCRW(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
+      DCRW(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
+
+      DCRW(VX_DCR_OM_CBUF_ADDR,        (uint32_t)(color_dev / 64));
+      DCRW(VX_DCR_OM_CBUF_PITCH,       width * 4);
+      DCRW(VX_DCR_OM_CBUF_WRITEMASK,   om->colormask);
+      DCRW(VX_DCR_OM_ZBUF_ADDR,        (uint32_t)(depth_dev / 64));
+      DCRW(VX_DCR_OM_ZBUF_PITCH,       width * 4);
+      DCRW(VX_DCR_OM_DEPTH_FUNC,       om->depth_test ? om->depth_func : VX_OM_DEPTH_FUNC_ALWAYS);
+      DCRW(VX_DCR_OM_DEPTH_WRITEMASK,  (om->depth_test && om->depth_write) ? 1u : 0u);
+      DCRW(VX_DCR_OM_STENCIL_FUNC,      VX_OM_DEPTH_FUNC_ALWAYS);
+      DCRW(VX_DCR_OM_STENCIL_ZPASS,     VX_OM_STENCIL_OP_KEEP);
+      DCRW(VX_DCR_OM_STENCIL_ZFAIL,     VX_OM_STENCIL_OP_KEEP);
+      DCRW(VX_DCR_OM_STENCIL_FAIL,      VX_OM_STENCIL_OP_KEEP);
+      DCRW(VX_DCR_OM_STENCIL_REF,       0);
+      DCRW(VX_DCR_OM_STENCIL_MASK,      0xFF);
+      DCRW(VX_DCR_OM_STENCIL_WRITEMASK, 0);
+      DCRW(VX_DCR_OM_BLEND_MODE,        om->blend_mode);
+      DCRW(VX_DCR_OM_BLEND_FUNC,        om->blend_func);
+      DCRW(VX_DCR_OM_BLEND_CONST,       0);
+      DCRW(VX_DCR_OM_LOGIC_OP,          0);
+
+      /* TEX unit (stage 0): the texels are already uploaded above (A8R8G8B8);
+       * program the sampler. Untextured draws leave TEX state alone. */
+      if (tex) {
+         uint32_t logw = vp_log2u(tex->width);
+         uint32_t logh = vp_log2u(tex->height);
+         DCRW(VX_DCR_TEX_STAGE,        0);
+         DCRW(VX_DCR_TEX_LOGDIM,       (logh << 16) | logw);
+         DCRW(VX_DCR_TEX_FORMAT,       VX_TEX_FORMAT_A8R8G8B8);
+         DCRW(VX_DCR_TEX_FILTER,       tex->filter);
+         DCRW(VX_DCR_TEX_WRAP,         (tex->wrap_v << 16) | tex->wrap_u);
+         DCRW(VX_DCR_TEX_ADDR,         (uint32_t)(tex_dev / 64));
+         DCRW(VX_DCR_TEX_MIPOFF_BASE,  0);
+      }
+
+      LAUNCH(&fli);
+
+      VP_CHECK(vx_enqueue_commands(q, cmds.data(), (uint32_t)cmds.size(),
+                                   0, NULL, NULL), "vx_enqueue_commands");
 
       VP_CHECK(vx_enqueue_read(q, color, cbuf, 0, cbuf_bytes, 0, NULL, NULL),
                "vx_enqueue_read(color)");

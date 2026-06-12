@@ -49,7 +49,15 @@ VX_CFLAGS := --target=$(TARGET) \
   -I. -I$(VORTEX_HOME)/sw/gfx -I$(VORTEX_HOME)/sw/kernel/include \
   -I$(VORTEX_HOME)/sw/common -I$(VORTEX_BUILD)/sw -I$(VORTEX_BUILD)/hw
 
-VX_LDFLAGS := -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/sw/kernel/scripts/$(LINKER),--defsym=STARTUP_ADDR=0x80000000 \
+# gfx_v2 §6.4: link the front end at a distinct base (0x80200000) so it
+# co-resides with the per-draw fragment-shader module (linked at the default
+# 0x80000000 by vp_compile). Both stay loaded, letting one CP command batch
+# sequence setup/binning then the FS with no host module swap. The 2 MB gap
+# is well clear of the small FS image; device buffers allocate far below
+# (VX_MEM_USER_BASE_ADDR), so the two code images never overlap.
+STARTUP_ADDR  ?= 0x80200000
+
+VX_LDFLAGS := -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/sw/kernel/scripts/$(LINKER),--defsym=STARTUP_ADDR=$(STARTUP_ADDR) \
   $(VORTEX_BUILD)/sw/kernel/libvortex2.a \
   -L$(VORTEX_TOOLDIR)/$(LIBC)/lib -lm -lc \
   $(VORTEX_TOOLDIR)/$(LIBCRT)/lib/baremetal/$(CRT_A)
@@ -60,7 +68,7 @@ all: $(OUTDIR)/gfx_frontend.vxbin
 # here — this driver compiles them, the SDK is the single source of truth.
 GFX_HDRS := $(wildcard $(VORTEX_HOME)/sw/gfx/*.h) $(VORTEX_HOME)/sw/common/gfx_frontend_abi.h
 
-$(OUTDIR)/gfx_frontend.elf: gfx_frontend_kernel.cpp $(GFX_HDRS)
+$(OUTDIR)/gfx_frontend.elf: gfx_frontend_kernel.cpp $(GFX_HDRS) Makefile
 	$(CLANG) $(VX_CFLAGS) gfx_frontend_kernel.cpp $(VX_LDFLAGS) -o $@
 
 $(OUTDIR)/gfx_frontend.vxbin: $(OUTDIR)/gfx_frontend.elf
