@@ -61,6 +61,7 @@ gfx_frontend_vxbin = custom_target(
       vp_vortex_home / 'sw' / 'gfx' / 'setup_math.h',
       vp_vortex_home / 'sw' / 'gfx' / 'setup_types.h',
       vp_vortex_home / 'sw' / 'common' / 'gfx_frontend_abi.h',
+      vp_vortex_home / 'sw' / 'common' / 'vx_gfx_abi.h',
     ],
   console : true,
 )

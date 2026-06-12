@@ -32,11 +32,12 @@
 
 namespace graphics = vortex::graphics;
 
-/* Tile size must match the hardware (VX_config.h RASTER_TILE_LOGSIZE) and
- * the front-end kernel's PIPE_BIN_LOG (sw/gfx/pipe_abi.h, = RASTER tile log):
- * device bins are RASTER tiles. */
-#ifndef RASTER_TILE_LOGSIZE
-#define RASTER_TILE_LOGSIZE 5
+/* gfx_v2 §6.3: the on-device front end bins at the coarse 128 px bin log
+ * (VX_config.h VX_CFG_RASTER_BIN_LOGSIZE) and the RASTER unit descends
+ * bin -> block -> quad. Must match the front-end kernel's PIPE_BIN_LOG
+ * (sw/gfx/pipe_abi.h). */
+#ifndef RASTER_BIN_LOGSIZE
+#define RASTER_BIN_LOGSIZE 7
 #endif
 
 /* sizeof(graphics::rast_prim_t): vec3e_t edges[3] + rast_attribs_t. */
@@ -92,23 +93,23 @@ vp_raster_draw(vx_device_h dev,
     * Bins == RASTER tiles, so the grid count (bin_cols*bin_rows) is the
     * RASTER TILE_COUNT — host-known, no num_tiles readback. The front end
     * emits one header per tile (empty tiles get pids_count=0). */
-   const uint32_t TILE     = 1u << RASTER_TILE_LOGSIZE;
-   const uint32_t bin_cols = (width  + TILE - 1) / TILE;
-   const uint32_t bin_rows = (height + TILE - 1) / TILE;
+   const uint32_t BIN      = 1u << RASTER_BIN_LOGSIZE;
+   const uint32_t bin_cols = (width  + BIN - 1) / BIN;
+   const uint32_t bin_rows = (height + BIN - 1) / BIN;
    const uint32_t num_bins = bin_cols * bin_rows;
    const uint32_t MS       = SETUP_MAX_SUB;
    const uint32_t P_max    = num_tris * MS;          /* worst-case kept prims */
 
-   /* keys[] holds one (bin,prim) entry per bin a prim's bbox covers; the
-    * exact count is meta[1], known only on-device. Size worst-case (every
-    * kept prim covers every bin) so the launch chain needs no mid-frame
-    * readback. Tighter / segmented allocation is the §6.2 (Phase E) work;
-    * the uint16 pids_offset in rast_tile_header_t also caps the live key
-    * count, bounding scene size on this dense-tilebuf path. */
+   /* keys[] holds one (bin,prim) entry per coarse 128 px bin a prim's bbox
+    * covers; the exact count is meta[1], known only on-device. Size worst-case
+    * (every kept prim covers every bin) so the launch chain needs no mid-frame
+    * readback. The coarse bins make this far smaller than 32 px tiles, and
+    * rast_bin_header_t's 32-bit fields lift the old 16-bit cap; tighter /
+    * segmented allocation is the §6.2 follow-up. */
    const uint32_t keys_cap = P_max && num_bins ? P_max * num_bins : 1;
 
    const size_t PRIM_SZ = sizeof(graphics::rast_prim_t);
-   const size_t HDR_SZ  = sizeof(graphics::rast_tile_header_t);
+   const size_t HDR_SZ  = sizeof(graphics::rast_bin_header_t);
    const size_t BBOX_SZ = sizeof(setup_bbox_t);
    const size_t TILEBUF_SZ = (size_t)num_bins * HDR_SZ + (size_t)keys_cap * 4;
    const uint32_t cbuf_bytes = width * height * 4;
