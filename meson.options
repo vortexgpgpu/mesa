@@ -117,6 +117,17 @@ option(
 )
 
 option(
+  'vortex-home',
+  type : 'string',
+  value : '',
+  description : 'Path to the Vortex SDK source tree (VORTEX_HOME). Needed ' +
+                'only to build vortexpipe\'s gfx_v2 on-device front-end ' +
+                'kernel (setup_k + binning_k): its sources live in ' +
+                'sw/gfx + sw/common and are not shipped in the install ' +
+                'prefix the rest of the driver consumes.',
+)
+
+option(
   'gallium-vdpau',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},

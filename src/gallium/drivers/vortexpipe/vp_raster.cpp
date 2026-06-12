@@ -2,31 +2,39 @@
  * Copyright © 2026  Vortex GPGPU
  * SPDX-License-Identifier: MIT
  *
- * vp_raster -- Phase 4/5: hardware-rasterizer + output-merger draw
- * orchestration.
+ * vp_raster -- gfx_v2 on-device draw orchestration.
  *
- * graphics::Binning() does triangle setup + tile binning; vp_raster_draw
- * uploads the tile/primitive buffers, programs the RASTER and OM DCRs,
- * and dispatches the fragment-shader kernel. The kernel polls vx_rast()
- * for quads and submits shaded fragments to the OM unit via vx_om(),
- * which depth-tests, blends and writes the colour + depth buffers.
+ * The whole binning front end runs on the device: the embedded setup_k +
+ * binning_k kernels (sw/gfx, built into libvortexpipe) do triangle clip +
+ * setup and parallel bin-sort over device-resident memory, producing
+ * RASTER's primbuf + dense tilebuf with no host graphics::Binning(). The
+ * host only converts VS output to the front-end vertex record, sizes the
+ * dense tile grid from the framebuffer, and sequences the launches.
+ *
+ * vp_raster_draw then programs the RASTER and OM DCRs from the
+ * device-produced buffers and dispatches the fragment-shader kernel, which
+ * polls vx_rast() for quads and submits shaded fragments to the OM unit via
+ * vx_om() for depth-test, blend and colour + depth writeback.
  */
 
 #include "vp_raster.h"
 
 #include <vector>
-#include <unordered_map>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-#include "graphics.h"            /* graphics::Binning + on-wire types */
+#include "graphics.h"            /* vortex::graphics::rast_prim_t / rast_tile_header_t */
+#include "gfx_frontend_abi.h"    /* pipe_arg_t, setup_vertex_t, PIPE_STAGE_*, SETUP_* */
+#include "vp_gfx_frontend.h"     /* embedded setup_k + binning_k .vxbin */
 #include "VX_types.h"            /* VX_DCR_RASTER_*, VX_DCR_OM_*, VX_OM_* */
 #include "util/log.h"
 
 namespace graphics = vortex::graphics;
 
-/* Tile size must match the hardware (VX_config.h RASTER_TILE_LOGSIZE). */
+/* Tile size must match the hardware (VX_config.h RASTER_TILE_LOGSIZE) and
+ * the front-end kernel's PIPE_BIN_LOG (sw/gfx/pipe_abi.h, = RASTER tile log):
+ * device bins are RASTER tiles. */
 #ifndef RASTER_TILE_LOGSIZE
 #define RASTER_TILE_LOGSIZE 5
 #endif
@@ -71,20 +79,24 @@ vp_raster_draw(vx_device_h dev,
                const struct vp_om_params *om,
                const struct vp_tex_params *tex)
 {
-   /* ---- triangle setup + binning ---------------------------------- *
-    * Convert the VS output records to graphics::vertex_t: record slot
-    * 0 is the clip-space position, slots 1.. the generic varyings. The
-    * RASTER unit interpolates a fixed colour + texcoord; each varying
-    * is routed by its component count (2 -> texcoord, 3/4 -> colour),
-    * the same gfx-v1 mapping the FS translator uses. */
-   std::unordered_map<uint32_t, graphics::vertex_t> verts;
-   std::vector<graphics::primitive_t> prims;
-   const uint8_t *xv = static_cast<const uint8_t *>(xverts);
+   const uint32_t num_tris = vertex_count / 3;
+   if (num_tris == 0) {
+      mesa_logw("vortexpipe: raster: draw has no complete triangles");
+      return false;
+   }
 
+   /* ---- VS output -> front-end vertex record (setup_vertex_t) --------- *
+    * Record slot 0 is the clip-space position, slots 1.. the generic
+    * varyings; each varying is routed by component count (2 -> texcoord,
+    * 3/4 -> colour), the same gfx-v1 mapping the FS translator uses. The
+    * triangle list is non-indexed, so the flat array is the front end's
+    * direct input (verts[3*t + 0..2] is triangle t). */
+   std::vector<setup_vertex_t> verts(vertex_count);
+   const uint8_t *xv = static_cast<const uint8_t *>(xverts);
    for (uint32_t i = 0; i < vertex_count; i++) {
       const uint8_t *rec = xv + (size_t)i * layout->stride;
       const float *pos = reinterpret_cast<const float *>(rec);
-      graphics::vertex_t v;
+      setup_vertex_t &v = verts[i];
       v.pos[0] = pos[0]; v.pos[1] = pos[1];
       v.pos[2] = pos[2]; v.pos[3] = pos[3];
       v.color[0] = 1.0f; v.color[1] = 1.0f;
@@ -101,30 +113,50 @@ vp_raster_draw(vx_device_h dev,
             v.color[2] = a[2]; v.color[3] = nc >= 4 ? a[3] : 1.0f;
          }
       }
-      verts[i] = v;
-   }
-   for (uint32_t i = 0; i + 2 < vertex_count; i += 3)
-      prims.push_back({ i, i + 1, i + 2 });
-
-   std::vector<uint8_t> tilebuf, primbuf;
-   uint32_t num_tiles = graphics::Binning(tilebuf, primbuf, verts, prims,
-                                          width, height, 0.0f, 1.0f,
-                                          RASTER_TILE_LOGSIZE);
-   if (num_tiles == 0 || primbuf.empty()) {
-      mesa_logw("vortexpipe: raster: binning produced no tiles");
-      return false;
    }
 
-   /* ---- dispatch on the RASTER + OM units ------------------------- */
+   /* ---- dense tile grid, sized from the framebuffer ------------------- *
+    * Bins == RASTER tiles, so the grid count (bin_cols*bin_rows) is the
+    * RASTER TILE_COUNT — host-known, no num_tiles readback. The front end
+    * emits one header per tile (empty tiles get pids_count=0). */
+   const uint32_t TILE     = 1u << RASTER_TILE_LOGSIZE;
+   const uint32_t bin_cols = (width  + TILE - 1) / TILE;
+   const uint32_t bin_rows = (height + TILE - 1) / TILE;
+   const uint32_t num_bins = bin_cols * bin_rows;
+   const uint32_t MS       = SETUP_MAX_SUB;
+   const uint32_t P_max    = num_tris * MS;          /* worst-case kept prims */
+
+   /* keys[] holds one (bin,prim) entry per bin a prim's bbox covers; the
+    * exact count is meta[1], known only on-device. Size worst-case (every
+    * kept prim covers every bin) so the launch chain needs no mid-frame
+    * readback. Tighter / segmented allocation is the §6.2 (Phase E) work;
+    * the uint16 pids_offset in rast_tile_header_t also caps the live key
+    * count, bounding scene size on this dense-tilebuf path. */
+   const uint32_t keys_cap = P_max && num_bins ? P_max * num_bins : 1;
+
+   const size_t PRIM_SZ = sizeof(graphics::rast_prim_t);
+   const size_t HDR_SZ  = sizeof(graphics::rast_tile_header_t);
+   const size_t BBOX_SZ = sizeof(setup_bbox_t);
+   const size_t TILEBUF_SZ = (size_t)num_bins * HDR_SZ + (size_t)keys_cap * 4;
+   const uint32_t cbuf_bytes = width * height * 4;
+
    bool ok = false;
-   vx_queue_h  q    = NULL;
-   vx_module_h kmod = NULL;
-   vx_kernel_h kbuf = NULL;
-   vx_buffer_h tbuf = NULL, pbuf = NULL,
-               cbuf = NULL, zbuf = NULL, xbuf = NULL;
+   vx_queue_h  q     = NULL;
+   vx_module_h femod = NULL, kmod = NULL;
+   vx_kernel_h k_setup = NULL, k_binning = NULL, kbuf = NULL;
+
+   /* front-end resident buffer set (verts in; prim + tilebuf out; rest
+    * scratch) + the colour/depth/texture buffers the FF units write/read */
+   vx_buffer_h verts_buf = NULL, slot_prim_buf = NULL, slot_bbox_buf = NULL,
+               keep_buf = NULL, offset_buf = NULL, tsum_buf = NULL,
+               prim_buf = NULL, bbox_buf = NULL, bcount_buf = NULL,
+               boffset_buf = NULL, keys_buf = NULL, btsum_buf = NULL,
+               thist_buf = NULL, bincount_buf = NULL, binbase_buf = NULL,
+               tilebuf_buf = NULL, meta_buf = NULL;
+   vx_buffer_h cbuf = NULL, zbuf = NULL, xbuf = NULL;
+
    char vxpath[] = "/tmp/vortexpipe-fs.XXXXXX";
    int  vxfd = -1;
-   const uint32_t cbuf_bytes = width * height * 4;
 
    vxfd = mkstemp(vxpath);
    if (vxfd < 0) {
@@ -140,71 +172,146 @@ vp_raster_draw(vx_device_h dev,
    close(vxfd);
 
    {
-      vx_queue_info_t qi = {
-         sizeof(qi), NULL, VX_QUEUE_PRIORITY_NORMAL, 0,
-      };
+      vx_queue_info_t qi = { sizeof(qi), NULL, VX_QUEUE_PRIORITY_NORMAL, 0 };
       VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
-      VP_CHECK(vx_module_load_file(dev, vxpath, &kmod),
-               "vx_module_load_file");
-      /* "main" is the public name vxbin.py assigns the single conventional
-       * kernel (the C entry is "kernel_main"); match the native runtime. */
-      VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf),
-               "vx_module_get_kernel");
 
-      /* tile / primitive / colour / depth device buffers */
-      VP_CHECK(vx_buffer_create(dev, tilebuf.size(), 0, &tbuf),
-               "vx_buffer_create(tiles)");
-      VP_CHECK(vx_buffer_create(dev, primbuf.size(), 0, &pbuf),
-               "vx_buffer_create(prims)");
-      VP_CHECK(vx_buffer_create(dev, cbuf_bytes, 0, &cbuf),
-               "vx_buffer_create(color)");
-      VP_CHECK(vx_buffer_create(dev, cbuf_bytes, 0, &zbuf),
-               "vx_buffer_create(depth)");
+      /* The front-end and fragment-shader .vxbins both link at the fixed
+       * kernel STARTUP_ADDR, so only one can be resident at a time. Run the
+       * front end first, drain it, then swap in the per-draw FS module; the
+       * device buffers it produces (prim + tilebuf) are separate
+       * allocations and survive the code-module swap.
+       *
+       * front-end module: the setup_k + binning_k blob embedded in the
+       * driver, loaded straight from memory (no toolchain at runtime). */
+      size_t fe_size = 0;
+      const void *fe_bytes = vp_gfx_frontend_vxbin(&fe_size);
+      VP_CHECK(vx_module_load_bytes(dev, fe_bytes, fe_size, &femod),
+               "vx_module_load_bytes(frontend)");
+      VP_CHECK(vx_module_get_kernel(femod, "setup_k", &k_setup),
+               "vx_module_get_kernel(setup_k)");
+      VP_CHECK(vx_module_get_kernel(femod, "binning_k", &k_binning),
+               "vx_module_get_kernel(binning_k)");
 
-      uint64_t tile_dev = 0, prim_dev = 0, color_dev = 0, depth_dev = 0;
-      VP_CHECK(vx_buffer_address(tbuf, &tile_dev),  "vx_buffer_address(tiles)");
-      VP_CHECK(vx_buffer_address(pbuf, &prim_dev),  "vx_buffer_address(prims)");
+      /* device-filling launch geometry: T = per-CTA threads, G = grid. */
+      uint32_t one = 1, gdim[1] = { 1 }, bdim[1] = { 1 };
+      VP_CHECK(vx_device_max_occupancy_grid(dev, 1, &one, gdim, bdim),
+               "vx_device_max_occupancy_grid");
+      const uint32_t T = bdim[0];
+      const uint32_t G = gdim[0];
+
+      /* Allocate the front-end buffer set up front (per draw) and capture
+       * each device address into the shared pipe_arg_t. */
+      pipe_arg_t arg{};
+      arg.num_tris   = num_tris;
+      arg.width      = width;
+      arg.height     = height;
+      arg.bin_stripe = (num_bins + G - 1) / G;   /* bins per CTA (HIST/SCATTER) */
+      arg.bin_cols   = bin_cols;
+      arg.num_bins   = num_bins;
+      arg.cull_mode  = SETUP_CULL_NONE;          /* gfx-v1 two-sided default */
+
+      struct { uint64_t bytes; uint64_t *addr; vx_buffer_h *h; const char *what; } spec[] = {
+         { (uint64_t)vertex_count * sizeof(setup_vertex_t), &arg.verts_addr,     &verts_buf,     "verts"     },
+         { (uint64_t)P_max * PRIM_SZ,                       &arg.slot_prim_addr, &slot_prim_buf, "slot_prim" },
+         { (uint64_t)P_max * BBOX_SZ,                       &arg.slot_bbox_addr, &slot_bbox_buf, "slot_bbox" },
+         { (uint64_t)num_tris * 4,                          &arg.keep_addr,      &keep_buf,      "keep"      },
+         { (uint64_t)(num_tris + 1) * 4,                    &arg.offset_addr,    &offset_buf,    "offset"    },
+         { (uint64_t)T * 4,                                 &arg.tsum_addr,      &tsum_buf,      "tsum"      },
+         { (uint64_t)P_max * PRIM_SZ,                       &arg.prim_addr,      &prim_buf,      "prim"      },
+         { (uint64_t)P_max * BBOX_SZ,                       &arg.bbox_addr,      &bbox_buf,      "bbox"      },
+         { (uint64_t)P_max * 4,                             &arg.bcount_addr,    &bcount_buf,    "bcount"    },
+         { (uint64_t)(P_max + 1) * 4,                       &arg.boffset_addr,   &boffset_buf,   "boffset"   },
+         { (uint64_t)keys_cap * 4,                          &arg.keys_addr,      &keys_buf,      "keys"      },
+         { (uint64_t)T * 4,                                 &arg.btsum_addr,     &btsum_buf,     "btsum"     },
+         { (uint64_t)T * num_bins * 4,                      &arg.thist_addr,     &thist_buf,     "thist"     },
+         { (uint64_t)num_bins * 4,                          &arg.bincount_addr,  &bincount_buf,  "bincount"  },
+         { (uint64_t)num_bins * 4,                          &arg.binbase_addr,   &binbase_buf,   "binbase"   },
+         { (uint64_t)TILEBUF_SZ,                            &arg.tilebuf_addr,   &tilebuf_buf,   "tilebuf"   },
+         { (uint64_t)3 * 4,                                 &arg.meta_addr,      &meta_buf,      "meta"      },
+      };
+      for (auto &s : spec) {
+         VP_CHECK(vx_buffer_create(dev, s.bytes ? s.bytes : 1, 0, s.h), s.what);
+         VP_CHECK(vx_buffer_address(*s.h, s.addr), s.what);
+      }
+
+      /* upload the VS-output verts; the front end consumes them resident */
+      vx_event_h ev_v = NULL;
+      VP_CHECK(vx_enqueue_write(q, verts_buf, 0, verts.data(),
+                                (size_t)vertex_count * sizeof(setup_vertex_t),
+                                0, NULL, &ev_v), "vx_enqueue_write(verts)");
+
+      /* CP-sequenced front end: nine chained launches over resident memory
+       * (setup_k stages 0-2, binning_k stages 3-8). multi-CTA (grid=G)
+       * except the three single-CTA scans. Each launch waits on the prior
+       * stage's event — the launch drain is the device barrier. */
+      const uint32_t NSTAGE = 9;
+      const uint32_t sgrid[NSTAGE] = { G, 1, G,  G, 1, G,  G, 1, G };
+      pipe_arg_t      kargs[NSTAGE];
+      vx_launch_info_t li[NSTAGE];
+      vx_event_h       ev[NSTAGE] = {};
+      for (uint32_t s = 0; s < NSTAGE; ++s) {
+         kargs[s] = arg; kargs[s].stage = s;
+         li[s] = vx_launch_info_t{};
+         li[s].struct_size = sizeof(li[s]);
+         li[s].kernel      = (s < PIPE_STAGE_BCOUNT) ? k_setup : k_binning;
+         li[s].args_host   = &kargs[s];
+         li[s].args_size   = sizeof(pipe_arg_t);
+         li[s].ndim        = 1;
+         li[s].grid_dim[0]  = sgrid[s];
+         li[s].block_dim[0] = T;
+         vx_event_h dep = s ? ev[s - 1] : ev_v;
+         VP_CHECK(vx_enqueue_launch(q, &li[s], 1, &dep, &ev[s]),
+                  "vx_enqueue_launch(frontend)");
+      }
+
+      /* drain the front end, then free its code module so the FS module can
+       * load at the shared STARTUP_ADDR. The resident prim + tilebuf the
+       * front end produced are separate allocations and survive the swap. */
+      VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish(frontend)");
+      vx_kernel_release(k_binning); k_binning = NULL;
+      vx_kernel_release(k_setup);   k_setup   = NULL;
+      vx_module_release(femod);     femod     = NULL;
+
+      /* fragment-shader module (per-draw .vxbin) */
+      VP_CHECK(vx_module_load_file(dev, vxpath, &kmod), "vx_module_load_file(fs)");
+      VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf), "vx_module_get_kernel(fs)");
+
+      /* ---- RASTER + FS + OM over the device-produced buffers ---------- */
+      uint64_t prim_dev = arg.prim_addr;
+      uint64_t tile_dev = arg.tilebuf_addr;
+
+      VP_CHECK(vx_buffer_create(dev, cbuf_bytes, 0, &cbuf), "vx_buffer_create(color)");
+      VP_CHECK(vx_buffer_create(dev, cbuf_bytes, 0, &zbuf), "vx_buffer_create(depth)");
+      uint64_t color_dev = 0, depth_dev = 0;
       VP_CHECK(vx_buffer_address(cbuf, &color_dev), "vx_buffer_address(color)");
       VP_CHECK(vx_buffer_address(zbuf, &depth_dev), "vx_buffer_address(depth)");
 
-      /* the FS kernel only needs the primitive buffer; the OM reaches
-       * the colour/depth buffers through its DCRs. */
+      /* the FS kernel only needs the primitive buffer; the OM reaches the
+       * colour/depth buffers through its DCRs. */
       uint64_t argblk[8] = { 0 };
       argblk[0] = prim_dev;
 
-      /* clear the depth buffer to the far value (GREATER/GEQUAL clear
-       * to 0, every other compare to max). */
+      /* clear depth to the far value (GREATER/GEQUAL clear to 0, else max) */
       uint8_t zfill = (om->depth_func == VX_OM_DEPTH_FUNC_GREATER ||
-                       om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL)
-                         ? 0x00 : 0xFF;
+                       om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL) ? 0x00 : 0xFF;
       std::vector<uint8_t> zclear(cbuf_bytes, zfill);
+      std::vector<uint32_t> texbuf;   /* outlives vx_queue_finish (async write) */
 
-      /* The converted texture words. vx_enqueue_write is asynchronous --
-       * the source memory must stay live until vx_queue_finish -- so the
-       * texel buffer is declared at this scope, alongside zclear, rather
-       * than inside the `if (tex)` block below. */
-      std::vector<uint32_t> texbuf;
+      VP_CHECK(vx_enqueue_write(q, cbuf, 0, color, cbuf_bytes, 0, NULL, NULL),
+               "vx_enqueue_write(color)");
+      VP_CHECK(vx_enqueue_write(q, zbuf, 0, zclear.data(), cbuf_bytes, 0, NULL, NULL),
+               "vx_enqueue_write(depth)");
 
-      /* upload everything (the colour buffer carries the cleared image) */
-      VP_CHECK(vx_enqueue_write(q, tbuf, 0, tilebuf.data(), tilebuf.size(),
-                                0, NULL, NULL), "vx_enqueue_write(tiles)");
-      VP_CHECK(vx_enqueue_write(q, pbuf, 0, primbuf.data(), primbuf.size(),
-                                0, NULL, NULL), "vx_enqueue_write(prims)");
-      VP_CHECK(vx_enqueue_write(q, cbuf, 0, color, cbuf_bytes,
-                                0, NULL, NULL), "vx_enqueue_write(color)");
-      VP_CHECK(vx_enqueue_write(q, zbuf, 0, zclear.data(), cbuf_bytes,
-                                0, NULL, NULL), "vx_enqueue_write(depth)");
-      /* args passed inline via args_host below (no abuf needed) */
-
-      /* RASTER DCRs (addresses are 64-byte block indices) */
+      /* RASTER DCRs: device-produced tile + primitive buffers; TILE_COUNT
+       * is the dense grid count (host-known, no readback). */
       DCR(VX_DCR_RASTER_TBUF_ADDR,   tile_dev / 64);
-      DCR(VX_DCR_RASTER_TILE_COUNT,  num_tiles);
+      DCR(VX_DCR_RASTER_TILE_COUNT,  num_bins);
       DCR(VX_DCR_RASTER_PBUF_ADDR,   prim_dev / 64);
       DCR(VX_DCR_RASTER_PBUF_STRIDE, VP_RAST_PRIM_STRIDE);
       DCR(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
       DCR(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
 
-      /* OM DCRs: colour + depth buffers, depth test, blend. Stencil is
+      /* OM DCRs: colour + depth buffers, depth test, blend. Stencil
        * disabled for gfx-v1 (ALWAYS / KEEP). */
       DCR(VX_DCR_OM_CBUF_ADDR,        color_dev / 64);
       DCR(VX_DCR_OM_CBUF_PITCH,       width * 4);
@@ -227,12 +334,9 @@ vp_raster_draw(vx_device_h dev,
       DCR(VX_DCR_OM_BLEND_CONST,       0);
       DCR(VX_DCR_OM_LOGIC_OP,          0);
 
-      /* TEX unit (stage 0): convert the bound texture from the Vulkan
-       * R8G8B8A8 host layout to the A8R8G8B8 word the TEX unit unpacks,
-       * upload it, and program the sampler DCRs. Untextured draws (tex
-       * == NULL) leave the TEX state alone -- the FS kernel won't issue
-       * vx_tex(). Only mip 0 is supplied; gfx-v1 fragment shading
-       * samples at LOD 0. */
+      /* TEX unit (stage 0): convert the bound texture from R8G8B8A8 to the
+       * A8R8G8B8 word the TEX unit unpacks, upload, program the sampler.
+       * Untextured draws (tex == NULL) leave TEX state alone. */
       if (tex) {
          const uint32_t texel_count = tex->width * tex->height;
          texbuf.resize(texel_count);
@@ -244,10 +348,9 @@ vp_raster_draw(vx_device_h dev,
             uint32_t a = src[i * 4 + 3];
             texbuf[i] = (a << 24) | (r << 16) | (g << 8) | b;
          }
-         const size_t texbuf_bytes = texel_count * 4;
+         const size_t texbuf_bytes = (size_t)texel_count * 4;
 
-         VP_CHECK(vx_buffer_create(dev, texbuf_bytes, 0, &xbuf),
-                  "vx_buffer_create(tex)");
+         VP_CHECK(vx_buffer_create(dev, texbuf_bytes, 0, &xbuf), "vx_buffer_create(tex)");
          uint64_t tex_dev = 0;
          VP_CHECK(vx_buffer_address(xbuf, &tex_dev), "vx_buffer_address(tex)");
          VP_CHECK(vx_enqueue_write(q, xbuf, 0, texbuf.data(), texbuf_bytes,
@@ -261,30 +364,22 @@ vp_raster_draw(vx_device_h dev,
          DCR(VX_DCR_TEX_FILTER,       tex->filter);
          DCR(VX_DCR_TEX_WRAP,         (tex->wrap_v << 16) | tex->wrap_u);
          DCR(VX_DCR_TEX_ADDR,         tex_dev / 64);
-         DCR(VX_DCR_TEX_MIPOFF_BASE,  0);   /* mip 0 at the buffer base */
+         DCR(VX_DCR_TEX_MIPOFF_BASE,  0);
       }
 
-      /* dispatch the fragment-shader kernel; threads poll vx_rast().
-       * Args passed inline via args_host (see vp_launch).
-       *
-       * Fill every HW lane the device exposes so every warp on every
-       * core races for vx_rast() pops. block_dim = num_threads ×
-       * num_warps fills one CTA per core; grid_dim = num_cores
-       * spreads CTAs across cores. (Previous shape grid=1/block=4
-       * used 1 warp of 1 core — under 6% of a 4×4 device, less on
-       * larger configs.) */
+      /* dispatch the fragment-shader kernel; threads poll vx_rast(). The
+       * front end already drained (queue_finish above), so RASTER sees the
+       * resident tilebuf + primbuf. Fill every HW lane: block = threads ×
+       * warps (one CTA/core), grid = cores. */
       uint64_t nt = 1, nw = 1, nc = 1;
-      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt),
-               "vx_device_query(NUM_THREADS)");
-      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,   &nw),
-               "vx_device_query(NUM_WARPS)");
-      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES,   &nc),
-               "vx_device_query(NUM_CORES)");
-      vx_launch_info_t li = {
-         sizeof(li), NULL, kbuf, argblk, sizeof(argblk), 1,
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt), "vx_device_query(NUM_THREADS)");
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,   &nw), "vx_device_query(NUM_WARPS)");
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES,   &nc), "vx_device_query(NUM_CORES)");
+      vx_launch_info_t fli = {
+         sizeof(fli), NULL, kbuf, argblk, sizeof(argblk), 1,
          { (uint32_t)nc, 1, 1 }, { (uint32_t)(nt * nw), 1, 1 }, 0,
       };
-      VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
+      VP_CHECK(vx_enqueue_launch(q, &fli, 0, NULL, NULL), "vx_enqueue_launch(fs)");
 
       VP_CHECK(vx_enqueue_read(q, color, cbuf, 0, cbuf_bytes, 0, NULL, NULL),
                "vx_enqueue_read(color)");
@@ -293,14 +388,22 @@ vp_raster_draw(vx_device_h dev,
    }
 
 done:
-   if (xbuf) vx_buffer_release(xbuf);
-   if (zbuf) vx_buffer_release(zbuf);
-   if (cbuf) vx_buffer_release(cbuf);
-   if (pbuf) vx_buffer_release(pbuf);
-   if (tbuf) vx_buffer_release(tbuf);
-   if (kbuf) vx_kernel_release(kbuf);
-   if (kmod) vx_module_release(kmod);
-   if (q)    vx_queue_release(q);
+   {
+      vx_buffer_h all[] = {
+         verts_buf, slot_prim_buf, slot_bbox_buf, keep_buf, offset_buf,
+         tsum_buf, prim_buf, bbox_buf, bcount_buf, boffset_buf, keys_buf,
+         btsum_buf, thist_buf, bincount_buf, binbase_buf, tilebuf_buf,
+         meta_buf, cbuf, zbuf, xbuf,
+      };
+      for (vx_buffer_h b : all)
+         if (b) vx_buffer_release(b);
+   }
+   if (k_binning) vx_kernel_release(k_binning);
+   if (k_setup)   vx_kernel_release(k_setup);
+   if (kbuf)      vx_kernel_release(kbuf);
+   if (femod)     vx_module_release(femod);
+   if (kmod)      vx_module_release(kmod);
+   if (q)         vx_queue_release(q);
    unlink(vxpath);
    return ok;
 }

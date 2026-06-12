@@ -17,6 +17,10 @@ VORTEX_HOME   ?= $(HOME)/dev/vortex_v3/prism_v3
 VORTEX_BUILD  ?= $(VORTEX_HOME)/build
 VORTEX_TOOLDIR?= $(HOME)/vortex_rtu_tools
 
+# Artifact directory. Defaults to in-tree (standalone `make`); the meson
+# custom_target passes OUTDIR=<build dir> for an out-of-tree build.
+OUTDIR        ?= .
+
 TARGET   := riscv$(XLEN)-unknown-elf
 GNU_DIR  := riscv$(XLEN)-gnu-toolchain
 MARCH    := rv32imaf
@@ -50,19 +54,19 @@ VX_LDFLAGS := -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/sw/kernel/scripts/$(L
   -L$(VORTEX_TOOLDIR)/$(LIBC)/lib -lm -lc \
   $(VORTEX_TOOLDIR)/$(LIBCRT)/lib/baremetal/$(CRT_A)
 
-all: gfx_frontend.vxbin
+all: $(OUTDIR)/gfx_frontend.vxbin
 
 # Kernel sources are owned by the Vortex SDK (sw/gfx + sw/common), not copied
 # here — this driver compiles them, the SDK is the single source of truth.
 GFX_HDRS := $(wildcard $(VORTEX_HOME)/sw/gfx/*.h) $(VORTEX_HOME)/sw/common/gfx_frontend_abi.h
 
-gfx_frontend.elf: gfx_frontend_kernel.cpp $(GFX_HDRS)
+$(OUTDIR)/gfx_frontend.elf: gfx_frontend_kernel.cpp $(GFX_HDRS)
 	$(CLANG) $(VX_CFLAGS) gfx_frontend_kernel.cpp $(VX_LDFLAGS) -o $@
 
-gfx_frontend.vxbin: gfx_frontend.elf
+$(OUTDIR)/gfx_frontend.vxbin: $(OUTDIR)/gfx_frontend.elf
 	OBJCOPY=$(OBJCOPY) python3 $(VORTEX_HOME)/sw/kernel/scripts/vxbin.py $< $@
 
 clean:
-	rm -f gfx_frontend.elf gfx_frontend.vxbin
+	rm -f $(OUTDIR)/gfx_frontend.elf $(OUTDIR)/gfx_frontend.vxbin
 
 .PHONY: all clean
