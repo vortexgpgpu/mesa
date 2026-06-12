@@ -20,6 +20,7 @@
 #include "vp_raster.h"
 
 #include <vector>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -66,8 +67,101 @@ vp_log2u(uint32_t n)
    return l;
 }
 
+/* ---- persistent front-end working set (§6.6) -------------------------- *
+ * The 17 binning buffers laid out once and reused across the frame's draws
+ * instead of allocated per draw. prim + tilebuf (the RASTER AXI master's
+ * inputs) are pinned over VX_MEM_PHYS; the rest is device-resident scratch.
+ * The pool grows monotonically when a draw needs more capacity. addr caches
+ * the device addresses (its count fields are unused — set per draw). */
+struct vp_raster_pool {
+   vx_buffer_h bufs[17];
+   pipe_arg_t  addr;
+   uint32_t    cap_tris;
+   uint32_t    cap_bins;
+   uint32_t    cap_keys;
+   uint32_t    cap_T;
+};
+
+extern "C" struct vp_raster_pool *
+vp_raster_pool_create(void)
+{
+   return new (std::nothrow) vp_raster_pool{};
+}
+
+extern "C" void
+vp_raster_pool_destroy(struct vp_raster_pool *pool)
+{
+   if (!pool)
+      return;
+   for (vx_buffer_h b : pool->bufs)
+      if (b) vx_buffer_release(b);
+   delete pool;
+}
+
+/* Ensure the pool is sized for this draw (grow-only); (re)allocates and
+ * re-caches addresses only when the request exceeds the current capacity.
+ * Returns false on an allocation failure. */
+static bool
+vp_pool_ensure(vx_device_h dev, struct vp_raster_pool *pool,
+               uint32_t num_tris, uint32_t num_bins,
+               uint32_t keys_cap, uint32_t T)
+{
+   if (pool->bufs[0] &&
+       num_tris <= pool->cap_tris && num_bins <= pool->cap_bins &&
+       keys_cap <= pool->cap_keys && T == pool->cap_T)
+      return true;   /* fits — reuse the resident set */
+
+   for (vx_buffer_h &b : pool->bufs) { if (b) vx_buffer_release(b); b = NULL; }
+
+   const uint32_t NT = num_tris > pool->cap_tris ? num_tris : pool->cap_tris;
+   const uint32_t B  = num_bins > pool->cap_bins ? num_bins : pool->cap_bins;
+   const uint32_t K  = keys_cap > pool->cap_keys ? keys_cap : pool->cap_keys;
+   const uint32_t MS = SETUP_MAX_SUB;
+   const uint32_t P_max = NT * MS;
+   const size_t PRIM_SZ = sizeof(graphics::rast_prim_t);
+   const size_t HDR_SZ  = sizeof(graphics::rast_bin_header_t);
+   const size_t BBOX_SZ = sizeof(setup_bbox_t);
+   const size_t TILEBUF_SZ = (size_t)B * HDR_SZ + (size_t)K * 4;
+
+   const uint32_t W   = 0;                                          /* scratch */
+   const uint32_t RWP = VX_MEM_READ | VX_MEM_WRITE | VX_MEM_PHYS;   /* RASTER-read */
+   pipe_arg_t &a = pool->addr;
+   struct { uint64_t bytes; uint64_t *addr; uint32_t flags; } spec[] = {
+      { (uint64_t)3 * NT * sizeof(setup_vertex_t), &a.verts_addr,     W   },
+      { (uint64_t)P_max * PRIM_SZ,                 &a.slot_prim_addr, W   },
+      { (uint64_t)P_max * BBOX_SZ,                 &a.slot_bbox_addr, W   },
+      { (uint64_t)NT * 4,                          &a.keep_addr,      W   },
+      { (uint64_t)(NT + 1) * 4,                    &a.offset_addr,    W   },
+      { (uint64_t)T * 4,                           &a.tsum_addr,      W   },
+      { (uint64_t)P_max * PRIM_SZ,                 &a.prim_addr,      RWP },
+      { (uint64_t)P_max * BBOX_SZ,                 &a.bbox_addr,      W   },
+      { (uint64_t)P_max * 4,                       &a.bcount_addr,    W   },
+      { (uint64_t)(P_max + 1) * 4,                 &a.boffset_addr,   W   },
+      { (uint64_t)K * 4,                           &a.keys_addr,      W   },
+      { (uint64_t)T * 4,                           &a.btsum_addr,     W   },
+      { (uint64_t)T * B * 4,                       &a.thist_addr,     W   },
+      { (uint64_t)B * 4,                           &a.bincount_addr,  W   },
+      { (uint64_t)B * 4,                           &a.binbase_addr,   W   },
+      { (uint64_t)TILEBUF_SZ,                      &a.tilebuf_addr,   RWP },
+      { (uint64_t)3 * 4,                           &a.meta_addr,      W   },
+   };
+   for (uint32_t i = 0; i < 17; i++) {
+      if (vx_buffer_create(dev, spec[i].bytes ? spec[i].bytes : 1,
+                           spec[i].flags, &pool->bufs[i]) != VX_SUCCESS) {
+         mesa_loge("vortexpipe: raster: front-end pool alloc failed");
+         return false;
+      }
+      if (vx_buffer_address(pool->bufs[i], spec[i].addr) != VX_SUCCESS) {
+         mesa_loge("vortexpipe: raster: front-end pool address failed");
+         return false;
+      }
+   }
+   pool->cap_tris = NT; pool->cap_bins = B; pool->cap_keys = K; pool->cap_T = T;
+   return true;
+}
+
 extern "C" bool
-vp_raster_draw(vx_device_h dev,
+vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                const void *fs_vxbin, size_t fs_vxbin_size,
                uint64_t vsrec_addr, uint32_t vertex_count,
                const struct vp_vs_layout *layout,
@@ -78,6 +172,10 @@ vp_raster_draw(vx_device_h dev,
    const uint32_t num_tris = vertex_count / 3;
    if (num_tris == 0) {
       mesa_logw("vortexpipe: raster: draw has no complete triangles");
+      return false;
+   }
+   if (!pool) {
+      mesa_loge("vortexpipe: raster: no front-end pool");
       return false;
    }
 
@@ -114,14 +212,8 @@ vp_raster_draw(vx_device_h dev,
    vx_module_h femod = NULL, kmod = NULL;
    vx_kernel_h k_expand = NULL, k_setup = NULL, k_binning = NULL, kbuf = NULL;
 
-   /* front-end resident buffer set (verts in; prim + tilebuf out; rest
-    * scratch) + the colour/depth/texture buffers the FF units write/read */
-   vx_buffer_h verts_buf = NULL, slot_prim_buf = NULL, slot_bbox_buf = NULL,
-               keep_buf = NULL, offset_buf = NULL, tsum_buf = NULL,
-               prim_buf = NULL, bbox_buf = NULL, bcount_buf = NULL,
-               boffset_buf = NULL, keys_buf = NULL, btsum_buf = NULL,
-               thist_buf = NULL, bincount_buf = NULL, binbase_buf = NULL,
-               tilebuf_buf = NULL, meta_buf = NULL;
+   /* The front-end resident buffer set lives in the persistent pool; only the
+    * per-draw colour/depth/texture buffers are owned here. */
    vx_buffer_h cbuf = NULL, zbuf = NULL, xbuf = NULL;
 
    char vxpath[] = "/tmp/vortexpipe-fs.XXXXXX";
@@ -170,10 +262,16 @@ vp_raster_draw(vx_device_h dev,
       const uint32_t T = bdim[0];
       const uint32_t G = gdim[0];
 
-      /* Allocate the front-end buffer set up front (per draw) and capture
-       * each device address into the shared pipe_arg_t. */
-      pipe_arg_t arg{};
+      /* Lay out (or reuse) the persistent front-end working set, then build
+       * the shared pipe_arg_t from the pool's cached device addresses plus
+       * this draw's counts. */
+      if (!vp_pool_ensure(dev, pool, num_tris, num_bins, keys_cap, T)) {
+         mesa_loge("vortexpipe: raster: front-end pool sizing failed");
+         goto done;
+      }
+      pipe_arg_t arg = pool->addr;               /* device addresses */
       arg.num_tris   = num_tris;
+      arg.stage      = 0;
       arg.width      = width;
       arg.height     = height;
       arg.bin_stripe = (num_bins + G - 1) / G;   /* bins per CTA (HIST/SCATTER) */
@@ -181,33 +279,9 @@ vp_raster_draw(vx_device_h dev,
       arg.num_bins   = num_bins;
       arg.cull_mode  = SETUP_CULL_NONE;          /* gfx-v1 two-sided default */
 
-      struct { uint64_t bytes; uint64_t *addr; vx_buffer_h *h; const char *what; } spec[] = {
-         { (uint64_t)vertex_count * sizeof(setup_vertex_t), &arg.verts_addr,     &verts_buf,     "verts"     },
-         { (uint64_t)P_max * PRIM_SZ,                       &arg.slot_prim_addr, &slot_prim_buf, "slot_prim" },
-         { (uint64_t)P_max * BBOX_SZ,                       &arg.slot_bbox_addr, &slot_bbox_buf, "slot_bbox" },
-         { (uint64_t)num_tris * 4,                          &arg.keep_addr,      &keep_buf,      "keep"      },
-         { (uint64_t)(num_tris + 1) * 4,                    &arg.offset_addr,    &offset_buf,    "offset"    },
-         { (uint64_t)T * 4,                                 &arg.tsum_addr,      &tsum_buf,      "tsum"      },
-         { (uint64_t)P_max * PRIM_SZ,                       &arg.prim_addr,      &prim_buf,      "prim"      },
-         { (uint64_t)P_max * BBOX_SZ,                       &arg.bbox_addr,      &bbox_buf,      "bbox"      },
-         { (uint64_t)P_max * 4,                             &arg.bcount_addr,    &bcount_buf,    "bcount"    },
-         { (uint64_t)(P_max + 1) * 4,                       &arg.boffset_addr,   &boffset_buf,   "boffset"   },
-         { (uint64_t)keys_cap * 4,                          &arg.keys_addr,      &keys_buf,      "keys"      },
-         { (uint64_t)T * 4,                                 &arg.btsum_addr,     &btsum_buf,     "btsum"     },
-         { (uint64_t)T * num_bins * 4,                      &arg.thist_addr,     &thist_buf,     "thist"     },
-         { (uint64_t)num_bins * 4,                          &arg.bincount_addr,  &bincount_buf,  "bincount"  },
-         { (uint64_t)num_bins * 4,                          &arg.binbase_addr,   &binbase_buf,   "binbase"   },
-         { (uint64_t)TILEBUF_SZ,                            &arg.tilebuf_addr,   &tilebuf_buf,   "tilebuf"   },
-         { (uint64_t)3 * 4,                                 &arg.meta_addr,      &meta_buf,      "meta"      },
-      };
-      for (auto &s : spec) {
-         VP_CHECK(vx_buffer_create(dev, s.bytes ? s.bytes : 1, 0, s.h), s.what);
-         VP_CHECK(vx_buffer_address(*s.h, s.addr), s.what);
-      }
-
       /* expand_k arg: on-device vertex assembly expands the resident VS
        * records into the setup_vertex_t[] the front end consumes
-       * (verts_buf = arg.verts_addr). */
+       * (arg.verts_addr). */
       expand_arg_t earg{};
       earg.vsrec_addr   = vsrec_addr;
       earg.verts_addr   = arg.verts_addr;
@@ -372,16 +446,11 @@ vp_raster_draw(vx_device_h dev,
    }
 
 done:
-   {
-      vx_buffer_h all[] = {
-         verts_buf, slot_prim_buf, slot_bbox_buf, keep_buf, offset_buf,
-         tsum_buf, prim_buf, bbox_buf, bcount_buf, boffset_buf, keys_buf,
-         btsum_buf, thist_buf, bincount_buf, binbase_buf, tilebuf_buf,
-         meta_buf, cbuf, zbuf, xbuf,
-      };
-      for (vx_buffer_h b : all)
-         if (b) vx_buffer_release(b);
-   }
+   /* the front-end working set is pool-owned and persists; only the per-draw
+    * colour / depth / texture buffers are released here. */
+   if (xbuf) vx_buffer_release(xbuf);
+   if (zbuf) vx_buffer_release(zbuf);
+   if (cbuf) vx_buffer_release(cbuf);
    if (k_binning) vx_kernel_release(k_binning);
    if (k_setup)   vx_kernel_release(k_setup);
    if (k_expand)  vx_kernel_release(k_expand);

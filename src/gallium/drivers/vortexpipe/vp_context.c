@@ -1043,7 +1043,7 @@ vp_draw_vbo(struct pipe_context *pipe,
 
             void *cbuf = malloc((size_t)w * h * 4);
             if (cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
-                vp_raster_draw(vp->dev, fs->vxbin, fs->vxbin_size,
+                vp_raster_draw(vp->dev, vp->raster_pool, fs->vxbin, fs->vxbin_size,
                                vsaddr, count, &vs->vs_layout,
                                cbuf, w, h, &om, tex_px ? &tex : NULL) &&
                 vp_fb_color_write(pipe, vp, cbuf)) {
@@ -1101,6 +1101,10 @@ vp_context_destroy(struct pipe_context *pipe)
    if (vp->velems)
       pipe->delete_vertex_elements_state(pipe, vp->velems);
 
+   /* release the persistent front-end pool's device buffers (the screen
+    * still holds the device open until its own teardown). */
+   vp_raster_pool_destroy(vp->raster_pool);
+
    /* llvmpipe_destroy tears down util_blitter, which calls back into
     * our delete_*_state hooks -- and those need `vp`. So destroy the
     * llvmpipe context first, then drop vortexpipe's own state. */
@@ -1124,6 +1128,7 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       return pipe;          /* degrade to plain llvmpipe context */
 
    vp->dev                     = vps->dev;
+   vp->raster_pool             = vp_raster_pool_create();
    vp->lp_create_compute_state = pipe->create_compute_state;
    vp->lp_bind_compute_state   = pipe->bind_compute_state;
    vp->lp_delete_compute_state = pipe->delete_compute_state;

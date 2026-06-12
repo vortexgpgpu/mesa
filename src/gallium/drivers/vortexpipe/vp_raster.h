@@ -25,6 +25,14 @@
 extern "C" {
 #endif
 
+/* Persistent front-end working set (§6.6): the binning pipeline's resident
+ * buffer set, laid out once over VX_MEM_PHYS and reused across the frame's
+ * draws (grown on demand) instead of allocated per draw. Owned by the
+ * context; opaque to the rest of vortexpipe. */
+struct vp_raster_pool;
+struct vp_raster_pool *vp_raster_pool_create(void);
+void                   vp_raster_pool_destroy(struct vp_raster_pool *pool);
+
 /* Output-merger state for a draw -- the Gallium depth-stencil + blend
  * state, translated to the Vortex OM encoding (see vp_context.c). */
 struct vp_om_params {
@@ -65,7 +73,7 @@ struct vp_tex_params {
  *
  * Returns true on success; false leaves `color` untouched so the
  * caller can fall back. */
-bool vp_raster_draw(vx_device_h dev,
+bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                     const void *fs_vxbin, size_t fs_vxbin_size,
                     uint64_t vsrec_addr, uint32_t vertex_count,
                     const struct vp_vs_layout *layout,

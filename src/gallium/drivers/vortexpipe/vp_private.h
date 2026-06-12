@@ -171,6 +171,8 @@ struct vp_context {
    struct pipe_resource *fb_color;
    struct pipe_resource *fb_depth;       /* depth/stencil attachment, or NULL */
    unsigned              fb_width, fb_height;
+   /* §6.6: persistent front-end working set, reused across the frame's draws. */
+   struct vp_raster_pool *raster_pool;
    /* Phase 5: output-merger state (depth-stencil-alpha + blend). */
    struct vp_dsa_cso   *cur_dsa;
    struct vp_blend_cso *cur_blend;
