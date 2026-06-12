@@ -53,9 +53,10 @@ struct vp_tex_params {
  * kernel submits fragments to the OM unit, which depth-tests, blends
  * and writes the colour buffer.
  *
- *   xverts        vertex_count records of layout->stride bytes; slot 0
- *                 is the clip-space gl_Position, slot 1 the colour
- *                 varying (the VS output layout).
+ *   vsrec_addr    device address of the resident VS output: vertex_count
+ *                 records of layout->stride bytes, slot 0 the clip-space
+ *                 gl_Position, slots 1.. the varyings. expand_k turns these
+ *                 into setup_vertex_t on-device (no host round-trip).
  *   color         a width*height R8G8B8A8 host buffer -- on entry the
  *                 cleared framebuffer, on return the rendered image.
  *   om            depth/blend state for the OM unit.
@@ -66,7 +67,7 @@ struct vp_tex_params {
  * caller can fall back. */
 bool vp_raster_draw(vx_device_h dev,
                     const void *fs_vxbin, size_t fs_vxbin_size,
-                    const void *xverts, uint32_t vertex_count,
+                    uint64_t vsrec_addr, uint32_t vertex_count,
                     const struct vp_vs_layout *layout,
                     void *color, uint32_t width, uint32_t height,
                     const struct vp_om_params *om,

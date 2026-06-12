@@ -936,7 +936,6 @@ vp_draw_vbo(struct pipe_context *pipe,
    if (simple) {
       uint32_t count  = draws[0].count;
       uint32_t stride = vs->vs_layout.stride;
-      void    *xverts = malloc((size_t)count * stride);
 
       /* Gather the vertex-buffer geometry if the VS fetches inputs;
        * if it needs them and we can't supply them, fall back wholly. */
@@ -945,10 +944,15 @@ vp_draw_vbo(struct pipe_context *pipe,
       bool vin_ok = !vs->vs_layout.needs_vertex_input ||
                     vp_gather_vertex_input(pipe, vp, draws, &vin, &vxfer);
 
-      bool vs_ok = xverts && vin_ok &&
+      /* Run the VS on Vortex; keep its transformed output resident so the
+       * on-device front end consumes it with no host round-trip. */
+      vx_buffer_h vsbuf  = NULL;
+      uint64_t    vsaddr = 0;
+      bool vs_ok = vin_ok &&
          vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
-                      xverts, count * stride, count,
-                      vs->vs_layout.needs_vertex_input ? &vin : NULL);
+                      count, count * stride,
+                      vs->vs_layout.needs_vertex_input ? &vin : NULL,
+                      &vsbuf, &vsaddr);
       if (vxfer)
          pipe_buffer_unmap(pipe, vxfer);
 
@@ -1040,7 +1044,7 @@ vp_draw_vbo(struct pipe_context *pipe,
             void *cbuf = malloc((size_t)w * h * 4);
             if (cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
                 vp_raster_draw(vp->dev, fs->vxbin, fs->vxbin_size,
-                               xverts, count, &vs->vs_layout,
+                               vsaddr, count, &vs->vs_layout,
                                cbuf, w, h, &om, tex_px ? &tex : NULL) &&
                 vp_fb_color_write(pipe, vp, cbuf)) {
                vp_dbg("vortexpipe: draw_vbo -> Vortex RASTER+OM "
@@ -1048,23 +1052,31 @@ vp_draw_vbo(struct pipe_context *pipe,
                       count, w, h, om.depth_test, tex_px != NULL);
                free(tex_px);
                free(cbuf);
-               free(xverts);
+               vx_buffer_release(vsbuf);
                return;
             }
             free(tex_px);
             free(cbuf);
          }
 
-         /* fallback: VS on Vortex, rasterization on llvmpipe */
-         if (vp_draw_passthrough(vp, pipe, info, drawid_offset,
+         /* fallback: VS on Vortex, rasterization on llvmpipe — read the
+          * resident VS output back to a host vertex buffer for llvmpipe. */
+         void *xverts = malloc((size_t)count * stride);
+         if (xverts &&
+             vp_buffer_readback(vp->dev, vsbuf, xverts,
+                                (uint32_t)((size_t)count * stride)) &&
+             vp_draw_passthrough(vp, pipe, info, drawid_offset,
                                  xverts, count)) {
             vp_dbg("vortexpipe: draw_vbo ran the %u-vertex VS on Vortex "
                    "(llvmpipe raster)", count);
             free(xverts);
+            vx_buffer_release(vsbuf);
             return;
          }
+         free(xverts);
       }
-      free(xverts);
+      if (vsbuf)
+         vx_buffer_release(vsbuf);
    }
 
    /* inherit-and-accelerate fallback */

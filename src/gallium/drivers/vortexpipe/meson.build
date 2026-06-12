@@ -50,6 +50,18 @@ gfx_frontend_vxbin = custom_target(
     'VORTEX_TOOLDIR=' + get_option('vortex-tooldir'),
     'all',
   ],
+  # Rebuild the blob when the SDK kernel sources (sw/gfx, sw/common) or the
+  # build recipe change — meson does not see make's own prerequisites.
+  depend_files : files(
+      'kernels/gfx_frontend/gfx_frontend_kernel.cpp',
+      'kernels/gfx_frontend/Makefile',
+    ) + [
+      vp_vortex_home / 'sw' / 'gfx' / 'pipe_frontend.h',
+      vp_vortex_home / 'sw' / 'gfx' / 'pipe_abi.h',
+      vp_vortex_home / 'sw' / 'gfx' / 'setup_math.h',
+      vp_vortex_home / 'sw' / 'gfx' / 'setup_types.h',
+      vp_vortex_home / 'sw' / 'common' / 'gfx_frontend_abi.h',
+    ],
   console : true,
 )
 

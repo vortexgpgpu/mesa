@@ -60,17 +60,28 @@ struct vp_vertex_input {
    uint32_t    attr_stride[8];   /* bytes between consecutive vertices */
 };
 
-/* Run a compiled Vortex vertex-shader kernel (.vxbin) on `dev`
- * (Phase 3). One thread per vertex; the kernel writes one transformed
- * record per vertex into a device buffer (arg slot 0). When `vin` is
- * non-NULL its vertex buffer is uploaded and an attribute table
- * (arg slot 1) lets the kernel fetch per-vertex inputs. On success
- * the `out_bytes` of output are copied into out_host. */
+/* Run a compiled Vortex vertex-shader kernel (.vxbin) on `dev`. One
+ * thread per vertex; the kernel writes one transformed record per vertex
+ * into a device buffer (arg slot 0). When `vin` is non-NULL its vertex
+ * buffer is uploaded and an attribute table (arg slot 1) lets the kernel
+ * fetch per-vertex inputs.
+ *
+ * The transformed vertices are left RESIDENT: on success *out_buf / *out_addr
+ * receive the device buffer + its base address, which the caller owns and
+ * must vx_buffer_release. The on-device front end (vp_raster_draw's expand_k)
+ * consumes them directly; only the llvmpipe-raster fallback reads them back to
+ * host (vp_buffer_readback). `out_bytes` is the logical count*stride size. */
 bool vp_launch_vs(vx_device_h dev,
                   const void *vxbin, size_t vxbin_size,
-                  void *out_host, uint32_t out_bytes,
-                  uint32_t vertex_count,
-                  const struct vp_vertex_input *vin);
+                  uint32_t vertex_count, uint32_t out_bytes,
+                  const struct vp_vertex_input *vin,
+                  vx_buffer_h *out_buf, uint64_t *out_addr);
+
+/* Copy a resident device buffer back to host memory (one-shot, own queue).
+ * Used on the llvmpipe-raster fallback to hand the kept-resident VS output to
+ * llvmpipe as a host vertex buffer. */
+bool vp_buffer_readback(vx_device_h dev, vx_buffer_h buf,
+                        void *host, uint32_t bytes);
 
 #ifdef __cplusplus
 }

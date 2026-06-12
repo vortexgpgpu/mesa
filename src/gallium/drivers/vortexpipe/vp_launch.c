@@ -736,9 +736,9 @@ done:
 bool
 vp_launch_vs(vx_device_h dev,
              const void *vxbin, size_t vxbin_size,
-             void *out_host, uint32_t out_bytes,
-             uint32_t vertex_count,
-             const struct vp_vertex_input *vin)
+             uint32_t vertex_count, uint32_t out_bytes,
+             const struct vp_vertex_input *vin,
+             vx_buffer_h *out_buf, uint64_t *out_addr)
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
@@ -747,6 +747,9 @@ vp_launch_vs(vx_device_h dev,
    vx_buffer_h obuf = NULL, vbuf = NULL, tbuf = NULL;
    char vxpath[] = "/tmp/vortexpipe-vs.XXXXXX";
    int  vxfd = -1;
+
+   *out_buf  = NULL;
+   *out_addr = 0;
 
    vxfd = mkstemp(vxpath);
    if (vxfd < 0) {
@@ -790,10 +793,9 @@ vp_launch_vs(vx_device_h dev,
     *
     * Padding policy: the device output buffer is sized to grid × block
     * × stride. Out-of-bounds threads (vid in [vertex_count,
-    * grid*block)) write to the pad region; the host read-back copies
-    * only `out_bytes` so the caller's buffer never sees the slack.
-    * This avoids needing a bounds-check intrinsic in the VS NIR
-    * lowering. */
+    * grid*block)) write to the pad region; consumers read only the first
+    * `vertex_count` records, so the slack is never observed. This avoids
+    * needing a bounds-check intrinsic in the VS NIR lowering. */
    uint64_t nt = 0, nw = 0;
    VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt),
             "vx_device_query(NUM_THREADS)");
@@ -872,20 +874,41 @@ vp_launch_vs(vx_device_h dev,
       .lmem_size = 0,
    };
    VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
-
-   VP_CHECK(vx_enqueue_read(q, out_host, obuf, 0, out_bytes, 0, NULL, NULL),
-            "vx_enqueue_read");
    VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish");
 
+   /* leave the transformed vertices resident; the caller consumes them
+    * on-device (expand_k) or reads them back only on the fallback path. */
+   *out_buf  = obuf;
+   *out_addr = out_dev;
    ok = true;
 
 done:
    if (tbuf) vx_buffer_release(tbuf);
    if (vbuf) vx_buffer_release(vbuf);
-   if (obuf) vx_buffer_release(obuf);
+   if (!ok && obuf) vx_buffer_release(obuf);   /* on success the caller owns obuf */
    if (kbuf) vx_kernel_release(kbuf);
    if (kmod) vx_module_release(kmod);
    if (q)    vx_queue_release(q);
    unlink(vxpath);
+   return ok;
+}
+
+/* Copy a resident device buffer back to host memory (one-shot, own queue). */
+bool
+vp_buffer_readback(vx_device_h dev, vx_buffer_h buf, void *host, uint32_t bytes)
+{
+   bool ok = false;
+   vx_queue_h q = NULL;
+   vx_queue_info_t qi = {
+      .struct_size = sizeof(qi), .next = NULL,
+      .priority = VX_QUEUE_PRIORITY_NORMAL, .flags = 0,
+   };
+   VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
+   VP_CHECK(vx_enqueue_read(q, host, buf, 0, bytes, 0, NULL, NULL),
+            "vx_enqueue_read");
+   VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish");
+   ok = true;
+done:
+   if (q) vx_queue_release(q);
    return ok;
 }

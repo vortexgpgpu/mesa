@@ -73,7 +73,7 @@ vp_log2u(uint32_t n)
 extern "C" bool
 vp_raster_draw(vx_device_h dev,
                const void *fs_vxbin, size_t fs_vxbin_size,
-               const void *xverts, uint32_t vertex_count,
+               uint64_t vsrec_addr, uint32_t vertex_count,
                const struct vp_vs_layout *layout,
                void *color, uint32_t width, uint32_t height,
                const struct vp_om_params *om,
@@ -85,35 +85,8 @@ vp_raster_draw(vx_device_h dev,
       return false;
    }
 
-   /* ---- VS output -> front-end vertex record (setup_vertex_t) --------- *
-    * Record slot 0 is the clip-space position, slots 1.. the generic
-    * varyings; each varying is routed by component count (2 -> texcoord,
-    * 3/4 -> colour), the same gfx-v1 mapping the FS translator uses. The
-    * triangle list is non-indexed, so the flat array is the front end's
-    * direct input (verts[3*t + 0..2] is triangle t). */
-   std::vector<setup_vertex_t> verts(vertex_count);
-   const uint8_t *xv = static_cast<const uint8_t *>(xverts);
-   for (uint32_t i = 0; i < vertex_count; i++) {
-      const uint8_t *rec = xv + (size_t)i * layout->stride;
-      const float *pos = reinterpret_cast<const float *>(rec);
-      setup_vertex_t &v = verts[i];
-      v.pos[0] = pos[0]; v.pos[1] = pos[1];
-      v.pos[2] = pos[2]; v.pos[3] = pos[3];
-      v.color[0] = 1.0f; v.color[1] = 1.0f;
-      v.color[2] = 1.0f; v.color[3] = 1.0f;
-      v.texcoord[0] = 0.0f; v.texcoord[1] = 0.0f;
-      for (uint32_t vi = 0; vi < layout->num_varyings; vi++) {
-         const float *a = reinterpret_cast<const float *>(
-            rec + 16u * (1u + vi));            /* slot 0 is gl_Position */
-         uint32_t nc = layout->varying_comps[vi];
-         if (nc == 2) {
-            v.texcoord[0] = a[0]; v.texcoord[1] = a[1];
-         } else if (nc >= 3) {
-            v.color[0] = a[0]; v.color[1] = a[1];
-            v.color[2] = a[2]; v.color[3] = nc >= 4 ? a[3] : 1.0f;
-         }
-      }
-   }
+   /* The resident VS output (vsrec_addr) is expanded to setup_vertex_t
+    * on-device by expand_k below — no host readback or vertex expansion. */
 
    /* ---- dense tile grid, sized from the framebuffer ------------------- *
     * Bins == RASTER tiles, so the grid count (bin_cols*bin_rows) is the
@@ -143,7 +116,7 @@ vp_raster_draw(vx_device_h dev,
    bool ok = false;
    vx_queue_h  q     = NULL;
    vx_module_h femod = NULL, kmod = NULL;
-   vx_kernel_h k_setup = NULL, k_binning = NULL, kbuf = NULL;
+   vx_kernel_h k_expand = NULL, k_setup = NULL, k_binning = NULL, kbuf = NULL;
 
    /* front-end resident buffer set (verts in; prim + tilebuf out; rest
     * scratch) + the colour/depth/texture buffers the FF units write/read */
@@ -187,6 +160,8 @@ vp_raster_draw(vx_device_h dev,
       const void *fe_bytes = vp_gfx_frontend_vxbin(&fe_size);
       VP_CHECK(vx_module_load_bytes(dev, fe_bytes, fe_size, &femod),
                "vx_module_load_bytes(frontend)");
+      VP_CHECK(vx_module_get_kernel(femod, "expand_k", &k_expand),
+               "vx_module_get_kernel(expand_k)");
       VP_CHECK(vx_module_get_kernel(femod, "setup_k", &k_setup),
                "vx_module_get_kernel(setup_k)");
       VP_CHECK(vx_module_get_kernel(femod, "binning_k", &k_binning),
@@ -234,11 +209,31 @@ vp_raster_draw(vx_device_h dev,
          VP_CHECK(vx_buffer_address(*s.h, s.addr), s.what);
       }
 
-      /* upload the VS-output verts; the front end consumes them resident */
-      vx_event_h ev_v = NULL;
-      VP_CHECK(vx_enqueue_write(q, verts_buf, 0, verts.data(),
-                                (size_t)vertex_count * sizeof(setup_vertex_t),
-                                0, NULL, &ev_v), "vx_enqueue_write(verts)");
+      /* on-device vertex assembly: expand the resident VS records into the
+       * setup_vertex_t[] the front end consumes (verts_buf = arg.verts_addr),
+       * replacing the host readback + expansion + re-upload. */
+      expand_arg_t earg{};
+      earg.vsrec_addr   = vsrec_addr;
+      earg.verts_addr   = arg.verts_addr;
+      earg.num_verts    = vertex_count;
+      earg.vstride      = layout->stride;
+      uint32_t nvary = layout->num_varyings;
+      if (nvary > EXPAND_MAX_VARYINGS) nvary = EXPAND_MAX_VARYINGS;
+      earg.num_varyings = nvary;
+      for (uint32_t i = 0; i < nvary; i++)
+         earg.varying_comps[i] = layout->varying_comps[i];
+
+      vx_launch_info_t eli = vx_launch_info_t{};
+      eli.struct_size = sizeof(eli);
+      eli.kernel      = k_expand;
+      eli.args_host   = &earg;
+      eli.args_size   = sizeof(earg);
+      eli.ndim        = 1;
+      eli.grid_dim[0]  = G;
+      eli.block_dim[0] = T;
+      vx_event_h ev_x = NULL;
+      VP_CHECK(vx_enqueue_launch(q, &eli, 0, NULL, &ev_x),
+               "vx_enqueue_launch(expand)");
 
       /* CP-sequenced front end: nine chained launches over resident memory
        * (setup_k stages 0-2, binning_k stages 3-8). multi-CTA (grid=G)
@@ -259,7 +254,7 @@ vp_raster_draw(vx_device_h dev,
          li[s].ndim        = 1;
          li[s].grid_dim[0]  = sgrid[s];
          li[s].block_dim[0] = T;
-         vx_event_h dep = s ? ev[s - 1] : ev_v;
+         vx_event_h dep = s ? ev[s - 1] : ev_x;
          VP_CHECK(vx_enqueue_launch(q, &li[s], 1, &dep, &ev[s]),
                   "vx_enqueue_launch(frontend)");
       }
@@ -270,6 +265,7 @@ vp_raster_draw(vx_device_h dev,
       VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish(frontend)");
       vx_kernel_release(k_binning); k_binning = NULL;
       vx_kernel_release(k_setup);   k_setup   = NULL;
+      vx_kernel_release(k_expand);  k_expand  = NULL;
       vx_module_release(femod);     femod     = NULL;
 
       /* fragment-shader module (per-draw .vxbin) */
@@ -400,6 +396,7 @@ done:
    }
    if (k_binning) vx_kernel_release(k_binning);
    if (k_setup)   vx_kernel_release(k_setup);
+   if (k_expand)  vx_kernel_release(k_expand);
    if (kbuf)      vx_kernel_release(kbuf);
    if (femod)     vx_module_release(femod);
    if (kmod)      vx_module_release(kmod);
