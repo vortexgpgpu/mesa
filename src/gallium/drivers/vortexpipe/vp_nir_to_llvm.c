@@ -48,6 +48,9 @@
 #define VX_CSR_CTA_SIZE        0xCD2   /* warps per workgroup              */
 #define VX_CSR_CTA_GRID_DIM_X  0xCDC   /* workgroup count, +c for y/z      */
 #define VX_CSR_CTA_LMEM_ADDR   0xCDF   /* shared-memory base for this CTA  */
+#define VX_CSR_THREAD_ID       0xCC0   /* SIMD lane id (0..NUM_THREADS-1)  */
+#define VX_CSR_WARP_ID         0xCC1   /* warp id within the core          */
+#define VX_CSR_NUM_THREADS     0xFC0   /* threads per warp                 */
 
 /* RISC-V custom-0 opcode -- vx_barrier lives here (custom-1 is graphics). */
 #define VP_RISCV_CUSTOM0       11
@@ -58,6 +61,9 @@
 #define VX_CSR_RASTER_BCOORD_Z0 0x7C9
 #define VX_CSR_RASTER_PID       0x7CD
 #define VX_RASTER_DIM_BITS      15     /* pos_mask x/y field width + 1 */
+/* frag_payload_t (sw/common/vx_gfx_abi.h), padded to a 16-word LMEM-DMA line
+ * stride: [0]=pos_mask, [1]=pid, [2..13]=bcoord[axis][corner] (X,Y,Z planes). */
+#define VP_FRAG_PAYLOAD_BYTES   64
 
 /* vortex::graphics::rast_prim_t layout (sw/kernel/include/vx_graphics.h,
  * FIXEDPOINT):
@@ -1357,19 +1363,25 @@ emit_store_i32(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef val)
       LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
 }
 
-/* vx_rast(): pop a quad from the raster unit (custom-1, funct3=3).
- * Returns the pos_mask word; 0 means the queue is drained. */
+/* vx_frag_fetch(lmem_base): RASTER dispatch v2 self-pull (custom-1, funct3=3,
+ * funct7=1). Pops the next covered-quad wave from the single-owner raster
+ * producer and stages each lane's frag_payload_t into the worker's own LMEM at
+ * lmem_base (warp-uniform; lane t lands at lmem_base + t*sizeof(frag_payload_t)).
+ * Returns the drained flag in rd (1 = producer drained -> worker exits). */
 static LLVMValueRef
-emit_vx_rast(struct vp_tr *t)
+emit_vx_frag_fetch(struct vp_tr *t, LLVMValueRef lmem_base)
 {
-   const char *s = ".insn r 43, 3, 0, $0, x0, x0";
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, NULL, 0, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r", 3,
+   const char *s = ".insn r 43, 3, 1, $0, $1, x0";
+   const char *c = "=r,r";
+   LLVMTypeRef args[1] = { t->iptr };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
                                       /*HasSideEffects*/ true,
                                       /*IsAlignStack*/ false,
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
-   return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, "rast");
+   LLVMValueRef a[1] = { lmem_base };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "drained");
 }
 
 /* vx_rast_begin(): per-frame raster trigger (custom-1, funct3=4).
@@ -1529,21 +1541,36 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
     * vx_rast() poll — without it, the raster sits in IDLE and the
     * loop below immediately exits on the boot-state done sentinel. */
    emit_vx_rast_begin(t);
+   /* RASTER dispatch v2 (FWD): per-warp LMEM payload band base = CTA lmem base +
+    * warp_id * num_threads * sizeof(frag_payload_t). vx_frag_fetch stages each
+    * wave there; this lane reads its slot at base + lane * sizeof. */
+   LLVMValueRef lmem_base = vp_to_iptr(t, emit_csr_read(t, VX_CSR_CTA_LMEM_ADDR, "lmem"));
+   LLVMValueRef warp_id   = emit_csr_read(t, VX_CSR_WARP_ID, "wid");
+   LLVMValueRef nthreads  = emit_csr_read(t, VX_CSR_NUM_THREADS, "nt");
+   LLVMValueRef lane      = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+   LLVMValueRef payload_k = LLVMConstInt(t->i32, VP_FRAG_PAYLOAD_BYTES, false);
+   LLVMValueRef warp_off  = LLVMBuildMul(t->b,
+      LLVMBuildMul(t->b, warp_id, nthreads, ""), payload_k, "warp_off");
+   LLVMValueRef wbase     = LLVMBuildAdd(t->b, lmem_base,
+                                         vp_to_iptr(t, warp_off), "wbase");
+   LLVMValueRef lane_off  = LLVMBuildMul(t->b, lane, payload_k, "lane_off");
+   LLVMValueRef pl        = LLVMBuildAdd(t->b, wbase,
+                                         vp_to_iptr(t, lane_off), "pl");
    LLVMBuildBr(t->b, loop);
 
-   /* loop: pop a quad; stop when the raster queue drains. */
+   /* loop: pull a wave into LMEM; stop when the producer drains. */
    LLVMPositionBuilderAtEnd(t->b, loop);
-   LLVMValueRef pos_mask = emit_vx_rast(t);
+   LLVMValueRef drained = emit_vx_frag_fetch(t, wbase);
    LLVMBuildCondBr(t->b,
-      LLVMBuildICmp(t->b, LLVMIntEQ, pos_mask,
+      LLVMBuildICmp(t->b, LLVMIntNE, drained,
                     LLVMConstInt(t->i32, 0, false), ""),
       exit, body);
 
-   /* body: unpack the quad, shade its covered sub-pixels. */
+   /* body: unpack this lane's staged quad payload, shade its covered sub-pixels. */
    LLVMPositionBuilderAtEnd(t->b, body);
-   /* prim_base is iptr (i64 on rv64), pid * stride is i32; widen the
-    * product before adding so LLVM's Add has matching operand widths. */
-   LLVMValueRef pid  = emit_csr_read(t, VX_CSR_RASTER_PID, "pid");
+   LLVMValueRef pos_mask = emit_load_i32(t, pl);
+   /* prim_base is iptr, pid * stride is i32; widen the product before adding. */
+   LLVMValueRef pid  = emit_load_i32(t, addk(t, pl, 4));
    LLVMValueRef poff = LLVMBuildMul(t->b, pid,
       LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base,
@@ -1571,12 +1598,13 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
 
       LLVMPositionBuilderAtEnd(t->b, px);
       /* barycentric gradient: dx = F0/(F0+F1+F2), dy = F1/sum. */
+      /* bcoords from the LMEM payload: word 2 + axis*4 + corner (X,Y,Z planes). */
       LLVMValueRef f0 = emit_fixed_to_float(t,
-         emit_csr_read(t, VX_CSR_RASTER_BCOORD_X0 + i, "f0"), 16);
+         emit_load_i32(t, addk(t, pl, (2 + 0 * 4 + i) * 4)), 16);
       LLVMValueRef f1 = emit_fixed_to_float(t,
-         emit_csr_read(t, VX_CSR_RASTER_BCOORD_Y0 + i, "f1"), 16);
+         emit_load_i32(t, addk(t, pl, (2 + 1 * 4 + i) * 4)), 16);
       LLVMValueRef f2 = emit_fixed_to_float(t,
-         emit_csr_read(t, VX_CSR_RASTER_BCOORD_Z0 + i, "f2"), 16);
+         emit_load_i32(t, addk(t, pl, (2 + 2 * 4 + i) * 4)), 16);
       LLVMValueRef sum = LLVMBuildFAdd(t->b,
          LLVMBuildFAdd(t->b, f0, f1, ""), f2, "");
       LLVMValueRef recip = LLVMBuildFDiv(t->b,
