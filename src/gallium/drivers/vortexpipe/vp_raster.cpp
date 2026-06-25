@@ -373,9 +373,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       fli.args_host = argblk; fli.args_size = sizeof(argblk);
       fli.ndim = 1; fli.grid_dim[0] = (uint32_t)nc;
       fli.block_dim[0] = (uint32_t)(nt * nw);
-      /* RASTER dispatch v2 (FWD): per-warp frag_payload_t staging band in LMEM
-       * (vx_frag_fetch dest) = num_warps * num_threads * 64B (one DMA line). */
-      fli.lmem_size = (uint32_t)(nw * nt * 64);
+      /* FWD-5: vx_frag_fetch stages the payload into the gfx window, not LMEM. */
 
       /* The whole draw as ONE CP command batch (§6.4): expand -> setup ->
        * binning, then RASTER/OM/TEX config, then FS. The CP retires the
