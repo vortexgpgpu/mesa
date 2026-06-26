@@ -543,6 +543,10 @@ vp_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
 
 /* ---- graphics: framebuffer interception (Phase 4) ------------------ */
 
+/* §6.6 residency: defined below, used by set_framebuffer_state to flush the
+ * outgoing render pass's resident colour back before the framebuffer changes. */
+static void vp_fb_invalidate(struct pipe_context *pipe, struct vp_context *vp);
+
 /* Capture colour attachment 0 and the depth/stencil attachment so the
  * Vortex raster path can round-trip them; everything else stays with
  * llvmpipe. */
@@ -551,6 +555,9 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
                          const struct pipe_framebuffer_state *fb)
 {
    struct vp_context *vp = vp_reg_get(pipe);
+   /* end of the old render pass: flush its resident colour back + drop the
+    * resident buffers (the new framebuffer re-initialises on its first draw). */
+   vp_fb_invalidate(pipe, vp);
    vp->fb_color  = (fb && fb->nr_cbufs > 0 && fb->cbufs[0])
                       ? fb->cbufs[0]->texture : NULL;
    vp->fb_depth  = (fb && fb->zsbuf) ? fb->zsbuf->texture : NULL;
@@ -617,9 +624,9 @@ vp_fb_depth_write(struct pipe_context *pipe, struct vp_context *vp,
                          (void *)src, true);
 }
 
-/* ---- graphics: output-merger state (Phase 5) ----------------------- */
-
-/* VX OM encodings (VX_types.h) -- depth-compare function and blend. */
+/* VX OM encodings (VX_types.h) -- depth-compare function and blend.
+ * Used by the residency depth-clear heuristic below and the OM-state
+ * translation further down. */
 #define VX_OM_DEPTH_FUNC_ALWAYS              0
 #define VX_OM_DEPTH_FUNC_NEVER               1
 #define VX_OM_DEPTH_FUNC_LESS                2
@@ -645,6 +652,156 @@ vp_fb_depth_write(struct pipe_context *pipe, struct vp_context *vp,
 #define VX_OM_BLEND_FUNC_ONE_MINUS_DST_A     9
 #define VX_OM_BLEND_FUNC_CONST_RGB           10
 #define VX_OM_BLEND_FUNC_ONE_MINUS_CONST_RGB 11
+
+/* ---- §6.6 framebuffer + texture residency ------------------------------ *
+ * The colour + depth attachments are kept device-resident across the draws of
+ * a render pass: cleared/initialised ONCE (not per draw — so depth + colour
+ * accumulate correctly across draws), rendered into in place, and copied back
+ * to the colour resource only at present / framebuffer-change / llvmpipe
+ * fallback. Textures upload once and stay resident, keyed by the bound
+ * resource. This removes the per-draw framebuffer round-trip + texture upload. */
+
+/* Allocate a device buffer and (optionally) upload `bytes` from host `src`. */
+static bool
+vp_dev_upload(vx_device_h dev, const void *src, size_t bytes,
+              vx_buffer_h *out_buf, uint64_t *out_addr)
+{
+   vx_buffer_h b = NULL;
+   if (vx_buffer_create(dev, bytes ? bytes : 1, 0, &b) != VX_SUCCESS)
+      return false;
+   if (vx_buffer_address(b, out_addr) != VX_SUCCESS) {
+      vx_buffer_release(b);
+      return false;
+   }
+   bool ok = true;
+   if (src && bytes) {
+      vx_queue_h q = NULL;
+      vx_queue_info_t qi = { sizeof(qi), NULL, VX_QUEUE_PRIORITY_NORMAL, 0 };
+      if (vx_queue_create(dev, &qi, &q) != VX_SUCCESS) {
+         vx_buffer_release(b);
+         return false;
+      }
+      ok = vx_enqueue_write(q, b, 0, src, bytes, 0, NULL, NULL) == VX_SUCCESS
+        && vx_queue_finish(q, VX_TIMEOUT_INFINITE) == VX_SUCCESS;
+      vx_queue_release(q);
+   }
+   if (!ok) { vx_buffer_release(b); return false; }
+   *out_buf = b;
+   return true;
+}
+
+/* Copy the resident colour buffer back to the framebuffer's colour resource so
+ * the host / a present / an llvmpipe read observes the rendered result. */
+static void
+vp_fb_sync_out(struct pipe_context *pipe, struct vp_context *vp)
+{
+   if (!vp->rfb_dirty || !vp->rcb || !vp->rfb_res)
+      return;
+   const uint32_t bytes = vp->rfb_w * vp->rfb_h * 4;
+   void *host = malloc(bytes);
+   if (host &&
+       vp_buffer_readback(vp->dev, vp->rcb, host, bytes)) {
+      vp_resource_rw(pipe, vp->rfb_res, vp->rfb_w, vp->rfb_h, host, true);
+   }
+   free(host);
+   vp->rfb_dirty = false;
+}
+
+/* Flush + drop the resident colour/depth buffers (framebuffer change, fallback,
+ * teardown): the colour resource becomes authoritative again. */
+static void
+vp_fb_invalidate(struct pipe_context *pipe, struct vp_context *vp)
+{
+   vp_fb_sync_out(pipe, vp);
+   if (vp->rcb) { vx_buffer_release(vp->rcb); vp->rcb = NULL; }
+   if (vp->rzb) { vx_buffer_release(vp->rzb); vp->rzb = NULL; }
+   vp->rfb_res = NULL;
+   vp->rfb_w = vp->rfb_h = 0;
+}
+
+/* Ensure the resident colour + depth buffers exist for the bound framebuffer at
+ * (w,h); (re)allocate + initialise (colour from the resource's clear, depth to
+ * the far value) once per pass. Returns the device addresses, or false. */
+static bool
+vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
+             uint32_t w, uint32_t h, const struct vp_om_params *om,
+             uint64_t *color_dev, uint64_t *depth_dev)
+{
+   if (vp->rcb && vp->rfb_res == vp->fb_color &&
+       vp->rfb_w == w && vp->rfb_h == h) {
+      /* reuse the resident pass buffers (preserve colour + depth across draws) */
+      if (vx_buffer_address(vp->rcb, color_dev) != VX_SUCCESS) return false;
+      if (vx_buffer_address(vp->rzb, depth_dev) != VX_SUCCESS) return false;
+      return true;
+   }
+
+   vp_fb_invalidate(pipe, vp);
+
+   const uint32_t bytes = w * h * 4;
+   /* colour init: capture the attachment's current contents (the render pass's
+    * loadOp=CLEAR already cleared the resource via llvmpipe). */
+   void *cinit = malloc(bytes);
+   bool cok = cinit && vp_fb_color_read(pipe, vp, cinit);
+   if (cok)
+      cok = vp_dev_upload(vp->dev, cinit, bytes, &vp->rcb, color_dev);
+   free(cinit);
+   if (!cok) return false;
+
+   /* depth clear: far value (GREATER/GEQUAL clear to 0, else max), once. */
+   uint8_t zfill = (om->depth_func == VX_OM_DEPTH_FUNC_GREATER ||
+                    om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL) ? 0x00 : 0xFF;
+   void *zinit = malloc(bytes);
+   bool zok = zinit != NULL;
+   if (zok) {
+      memset(zinit, zfill, bytes);
+      zok = vp_dev_upload(vp->dev, zinit, bytes, &vp->rzb, depth_dev);
+   }
+   free(zinit);
+   if (!zok) { vx_buffer_release(vp->rcb); vp->rcb = NULL; return false; }
+
+   vp->rfb_res = vp->fb_color;
+   vp->rfb_w = w; vp->rfb_h = h;
+   vp->rfb_dirty = false;
+   return true;
+}
+
+/* Ensure the bound texture is uploaded + resident, keyed by its resource. The
+ * mip-0 image is read back to a tight A8R8G8B8 host buffer and uploaded once;
+ * a re-bind of the same resource reuses it. Returns the device address. */
+static bool
+vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
+              struct pipe_resource *res, uint32_t w, uint32_t h,
+              uint64_t *tex_dev)
+{
+   if (vp->rtex_buf && vp->rtex_res == res &&
+       vp->rtex_w == w && vp->rtex_h == h)
+      return vx_buffer_address(vp->rtex_buf, tex_dev) == VX_SUCCESS;
+
+   if (vp->rtex_buf) { vx_buffer_release(vp->rtex_buf); vp->rtex_buf = NULL; }
+   vp->rtex_res = NULL;
+
+   const uint32_t texel_count = w * h;
+   uint8_t *px = malloc((size_t)texel_count * 4);
+   uint32_t *texbuf = malloc((size_t)texel_count * 4);
+   bool ok = px && texbuf && vp_resource_rw(pipe, res, w, h, px, false);
+   if (ok) {
+      for (uint32_t i = 0; i < texel_count; i++) {
+         uint32_t r = px[i * 4 + 0], g = px[i * 4 + 1];
+         uint32_t b = px[i * 4 + 2], a = px[i * 4 + 3];
+         texbuf[i] = (a << 24) | (r << 16) | (g << 8) | b;
+      }
+      ok = vp_dev_upload(vp->dev, texbuf, (size_t)texel_count * 4,
+                         &vp->rtex_buf, tex_dev);
+   }
+   free(px);
+   free(texbuf);
+   if (!ok) return false;
+   vp->rtex_res = res;
+   vp->rtex_w = w; vp->rtex_h = h;
+   return true;
+}
+
+/* ---- graphics: output-merger state (Phase 5) ----------------------- */
 
 static uint32_t
 vp_vx_depth_func(unsigned pf)
@@ -1019,56 +1176,59 @@ vp_draw_vbo(struct pipe_context *pipe,
 
          /* gather the bound texture for TEX stage 0, if any (power-of-two 2D). */
          struct vp_tex_params tex = { 0 };
-         void *tex_px = NULL;
+         bool tex_used = false;
+         uint32_t tw = 0, th = 0;
          if (vp->cur_tex) {
-            uint32_t tw = vp->cur_tex->width0;
-            uint32_t th = vp->cur_tex->height0;
+            tw = vp->cur_tex->width0;
+            th = vp->cur_tex->height0;
             if (tw && th && !(tw & (tw - 1)) && !(th & (th - 1))) {
-               tex_px = malloc((size_t)tw * th * 4);
-               if (tex_px &&
-                   vp_resource_rw(pipe, vp->cur_tex, tw, th, tex_px, false)) {
-                  tex.pixels = tex_px;
-                  tex.width  = tw;
-                  tex.height = th;
-                  tex.filter = vp->cur_sampler ? vp->cur_sampler->filter
-                                               : VX_TEX_FILTER_POINT;
-                  tex.wrap_u = vp->cur_sampler ? vp->cur_sampler->wrap_u
-                                               : VX_TEX_WRAP_CLAMP;
-                  tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
-                                               : VX_TEX_WRAP_CLAMP;
-               } else {
-                  free(tex_px);
-                  tex_px = NULL;
-               }
+               tex.width  = tw;
+               tex.height = th;
+               tex.filter = vp->cur_sampler ? vp->cur_sampler->filter
+                                            : VX_TEX_FILTER_POINT;
+               tex.wrap_u = vp->cur_sampler ? vp->cur_sampler->wrap_u
+                                            : VX_TEX_WRAP_CLAMP;
+               tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
+                                            : VX_TEX_WRAP_CLAMP;
+               tex_used = true;
             } else {
                mesa_logw("vortexpipe: draw_vbo: non-power-of-two "
                          "texture %ux%u unsupported (gfx-v1)", tw, th);
             }
          }
 
-         void *cbuf = malloc((size_t)w * h * 4);
-         bool drew = cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
-             vp_raster_draw(vp->dev, vp->raster_pool,
-                            vs->vxbin, vs->vxbin_size,
-                            &vs->vx_module, &vs->vx_kernel,
-                            fs->vxbin, fs->vxbin_size,
-                            &fs->vx_module, &fs->vx_kernel,
-                            count, &vs->vs_layout,
-                            vs->vs_layout.needs_vertex_input ? &vin : NULL,
-                            cbuf, w, h, &om, tex_px ? &tex : NULL) &&
-             vp_fb_color_write(pipe, vp, cbuf);
+         /* Resident colour/depth (cleared/initialised once per pass) + resident
+          * texture: the OM renders straight into the device buffers, no per-draw
+          * framebuffer round-trip or texture re-upload. */
+         uint64_t color_dev = 0, depth_dev = 0, tex_dev = 0;
+         bool drew = vp_fb_ensure(pipe, vp, w, h, &om, &color_dev, &depth_dev);
+         if (drew && tex_used)
+            drew = vp_tex_ensure(pipe, vp, vp->cur_tex, tw, th, &tex_dev);
          if (drew)
+            drew = vp_raster_draw(vp->dev, vp->raster_pool,
+                                  vs->vxbin, vs->vxbin_size,
+                                  &vs->vx_module, &vs->vx_kernel,
+                                  fs->vxbin, fs->vxbin_size,
+                                  &fs->vx_module, &fs->vx_kernel,
+                                  count, &vs->vs_layout,
+                                  vs->vs_layout.needs_vertex_input ? &vin : NULL,
+                                  color_dev, depth_dev, w, h, &om,
+                                  tex_used ? tex_dev : 0, tex_used ? &tex : NULL);
+         if (drew) {
+            vp->rfb_dirty = true;   /* device colour ahead of the resource */
             vp_dbg("vortexpipe: draw_vbo -> Vortex VS+RASTER+OM (one OP_DRAW) "
                    "(%u verts, %ux%u, depth_test=%d, textured=%d)",
-                   count, w, h, om.depth_test, tex_px != NULL);
-         free(tex_px);
-         free(cbuf);
-         if (drew) {
+                   count, w, h, om.depth_test, tex_used);
             if (vxfer) pipe_buffer_unmap(pipe, vxfer);
             return;
          }
          /* hw path failed → fall through to VS-on-Vortex + llvmpipe raster */
       }
+
+      /* Taking an llvmpipe path: flush any resident hw renders back to the
+       * colour resource (so llvmpipe composites on top) and drop the resident
+       * buffers (the next hw draw re-initialises from the resource). */
+      vp_fb_invalidate(pipe, vp);
 
       /* fallback: run the VS on Vortex as a standalone launch, read its output
        * back to a host vertex buffer and rasterize on llvmpipe (unsupported
@@ -1107,7 +1267,20 @@ vp_draw_vbo(struct pipe_context *pipe,
                 "STRICT mode refuses llvmpipe fallback");
       return;
    }
+   /* sync + drop any resident hw renders before llvmpipe draws into the FB. */
+   vp_fb_invalidate(pipe, vp);
    vp->lp_draw_vbo(pipe, info, drawid_offset, indirect, draws, num_draws);
+}
+
+/* present / sync point: copy any resident hw renders back to the colour
+ * resource before llvmpipe flushes, so a present / readback observes them. */
+static void
+vp_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
+         unsigned flags)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp_fb_sync_out(pipe, vp);
+   vp->lp_flush(pipe, fence, flags);
 }
 
 static void
@@ -1122,6 +1295,10 @@ vp_context_destroy(struct pipe_context *pipe)
       vp->lp_delete_vs_state(pipe, vp->passthrough_vs);
    if (vp->velems)
       pipe->delete_vertex_elements_state(pipe, vp->velems);
+
+   /* §6.6 residency: flush + release the resident framebuffer + texture. */
+   vp_fb_invalidate(pipe, vp);
+   if (vp->rtex_buf) { vx_buffer_release(vp->rtex_buf); vp->rtex_buf = NULL; }
 
    /* release the persistent front-end pool's device buffers (the screen
     * still holds the device open until its own teardown). */
@@ -1176,6 +1353,7 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_bind_vertex_elements_state   = pipe->bind_vertex_elements_state;
    vp->lp_delete_vertex_elements_state = pipe->delete_vertex_elements_state;
    vp->lp_set_vertex_buffers   = pipe->set_vertex_buffers;
+   vp->lp_flush                = pipe->flush;
    vp->lp_context_destroy      = pipe->destroy;
    vp_reg_put(pipe, vp);
 
@@ -1193,6 +1371,7 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->bind_fs_state        = vp_bind_fs_state;
    pipe->delete_fs_state      = vp_delete_fs_state;
    pipe->set_framebuffer_state = vp_set_framebuffer_state;
+   pipe->flush                 = vp_flush;
    pipe->create_depth_stencil_alpha_state = vp_create_dsa_state;
    pipe->bind_depth_stencil_alpha_state   = vp_bind_dsa_state;
    pipe->delete_depth_stencil_alpha_state = vp_delete_dsa_state;

@@ -47,11 +47,12 @@ struct vp_om_params {
    uint32_t colormask;      /* VX_DCR_OM_CBUF_WRITEMASK */
 };
 
-/* The texture bound for a draw -- mip 0 of the sampler-view image,
- * plus the sampler's filter/wrap. width/height must be powers of two.
- * NULL passed to vp_raster_draw means an untextured draw. */
+/* The texture bound for a draw -- mip 0 dims + the sampler's filter/wrap.
+ * width/height must be powers of two. The texels themselves are uploaded +
+ * kept device-resident by the caller (vp_context texture residency) and passed
+ * to vp_raster_draw as a device address; a zero tex_dev means an untextured
+ * draw (the params are then ignored). */
 struct vp_tex_params {
-   const void *pixels;      /* width*height R8G8B8A8 host pixels */
    uint32_t    width;
    uint32_t    height;
    uint32_t    filter;      /* VX_TEX_FILTER_* */
@@ -86,6 +87,11 @@ struct vp_tex_params {
  * pointers (the caller's CSO-resident slots): NULL on first use → loaded from
  * the vxbin and stored back; reused thereafter (compile-once / upload-once, no
  * /tmp round-trip). The front-end module is cached on `pool`. */
+/* color_dev / depth_dev are the device addresses of the render-pass-resident
+ * colour + depth buffers (vp_context framebuffer residency): the OM renders
+ * straight into them — no per-draw colour upload / readback, no per-draw depth
+ * clear (the caller clears/initialises them once per pass). tex_dev is the
+ * resident texture buffer (0 = untextured). */
 bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                     const void *vs_vxbin, size_t vs_vxbin_size,
                     vx_module_h *vs_module_io, vx_kernel_h *vs_kernel_io,
@@ -94,9 +100,10 @@ bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                     uint32_t vertex_count,
                     const struct vp_vs_layout *layout,
                     const struct vp_vertex_input *vin,
-                    void *color, uint32_t width, uint32_t height,
+                    uint64_t color_dev, uint64_t depth_dev,
+                    uint32_t width, uint32_t height,
                     const struct vp_om_params *om,
-                    const struct vp_tex_params *tex);
+                    uint64_t tex_dev, const struct vp_tex_params *tex);
 
 #ifdef __cplusplus
 }

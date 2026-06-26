@@ -180,6 +180,22 @@ struct vp_context {
    unsigned              fb_width, fb_height;
    /* §6.6: persistent front-end working set, reused across the frame's draws. */
    struct vp_raster_pool *raster_pool;
+   /* §6.6 framebuffer residency: the colour + depth attachments kept
+    * device-resident across the draws of a render pass. rcb/rzb shadow
+    * fb_color (rfb_res) at rfb_w x rfb_h: cleared/initialised ONCE per pass
+    * (not per draw — preserving depth + colour across draws), then synced back
+    * to the colour resource at flush / framebuffer-change / llvmpipe fallback.
+    * rfb_dirty = the device buffers hold renders not yet in the resource. */
+   vx_buffer_h           rcb, rzb;
+   struct pipe_resource *rfb_res;
+   unsigned              rfb_w, rfb_h;
+   bool                  rfb_dirty;
+   void (*lp_flush)(struct pipe_context *, struct pipe_fence_handle **, unsigned);
+   /* §6.6 texture residency: the converted + uploaded TEX-stage-0 texels kept
+    * device-resident across draws, keyed by the bound sampler resource. */
+   vx_buffer_h           rtex_buf;
+   struct pipe_resource *rtex_res;
+   unsigned              rtex_w, rtex_h;
    /* Phase 5: output-merger state (depth-stencil-alpha + blend). */
    struct vp_dsa_cso   *cur_dsa;
    struct vp_blend_cso *cur_blend;

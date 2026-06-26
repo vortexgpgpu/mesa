@@ -186,9 +186,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                uint32_t vertex_count,
                const struct vp_vs_layout *layout,
                const struct vp_vertex_input *vin,
-               void *color, uint32_t width, uint32_t height,
+               uint64_t color_dev, uint64_t depth_dev,
+               uint32_t width, uint32_t height,
                const struct vp_om_params *om,
-               const struct vp_tex_params *tex)
+               uint64_t tex_dev, const struct vp_tex_params *tex)
 {
    const uint32_t num_tris = vertex_count / 3;
    if (num_tris == 0) {
@@ -227,15 +228,13 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
    const size_t HDR_SZ  = sizeof(graphics::rast_bin_header_t);
    const size_t BBOX_SZ = sizeof(setup_bbox_t);
    const size_t TILEBUF_SZ = (size_t)num_bins * HDR_SZ + (size_t)keys_cap * 4;
-   const uint32_t cbuf_bytes = width * height * 4;
 
    bool ok = false;
    vx_queue_h  q     = NULL;
 
-   /* The front-end resident buffer set lives in the persistent pool; only the
-    * per-draw VS-output / colour / depth / texture / vertex-input buffers are
-    * owned here. */
-   vx_buffer_h cbuf = NULL, zbuf = NULL, xbuf = NULL;
+   /* The front-end working set + colour/depth/texture buffers are resident
+    * (pool- / context-owned); only the per-draw VS-output + vertex-input
+    * buffers are owned here. */
    vx_buffer_h vsbuf = NULL, vbuf = NULL, tbuf = NULL;
 
    /* kernels resolved from the residency caches below (the modules persist
@@ -347,51 +346,18 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       for (uint32_t i = 0; i < nvary; i++)
          earg.varying_comps[i] = layout->varying_comps[i];
 
-      /* ---- colour / depth / texture buffers + uploads ----------------- *
-       * The DMA uploads precede the command batch on the same queue (FIFO);
-       * the batch itself is launches + DCR writes only. */
+      /* Colour + depth are render-pass-resident (color_dev / depth_dev) and the
+       * texture is residency-cached (tex_dev) — all owned + uploaded once by the
+       * caller. The OM/TEX units reach them through their DCRs; there is no
+       * per-draw colour upload/readback, depth clear, or texture upload here.
+       * Only the per-draw VS output + vertex inputs are staged below. */
       uint64_t prim_dev = arg.prim_addr;
       uint64_t tile_dev = arg.tilebuf_addr;
-
-      VP_CHECK(vx_buffer_create(dev, cbuf_bytes, 0, &cbuf), "vx_buffer_create(color)");
-      VP_CHECK(vx_buffer_create(dev, cbuf_bytes, 0, &zbuf), "vx_buffer_create(depth)");
-      uint64_t color_dev = 0, depth_dev = 0;
-      VP_CHECK(vx_buffer_address(cbuf, &color_dev), "vx_buffer_address(color)");
-      VP_CHECK(vx_buffer_address(zbuf, &depth_dev), "vx_buffer_address(depth)");
 
       /* the FS kernel only needs the primitive buffer; the OM reaches the
        * colour/depth buffers through its DCRs. */
       uint64_t argblk[8] = { 0 };
       argblk[0] = prim_dev;
-
-      /* clear depth to the far value (GREATER/GEQUAL clear to 0, else max) */
-      uint8_t zfill = (om->depth_func == VX_OM_DEPTH_FUNC_GREATER ||
-                       om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL) ? 0x00 : 0xFF;
-      std::vector<uint8_t> zclear(cbuf_bytes, zfill);
-      std::vector<uint32_t> texbuf;   /* outlives vx_queue_finish (async write) */
-      uint64_t tex_dev = 0;
-
-      VP_CHECK(vx_enqueue_write(q, cbuf, 0, color, cbuf_bytes, 0, NULL, NULL),
-               "vx_enqueue_write(color)");
-      VP_CHECK(vx_enqueue_write(q, zbuf, 0, zclear.data(), cbuf_bytes, 0, NULL, NULL),
-               "vx_enqueue_write(depth)");
-      if (tex) {
-         const uint32_t texel_count = tex->width * tex->height;
-         texbuf.resize(texel_count);
-         const uint8_t *src = static_cast<const uint8_t *>(tex->pixels);
-         for (uint32_t i = 0; i < texel_count; i++) {
-            uint32_t r = src[i * 4 + 0];
-            uint32_t g = src[i * 4 + 1];
-            uint32_t b = src[i * 4 + 2];
-            uint32_t a = src[i * 4 + 3];
-            texbuf[i] = (a << 24) | (r << 16) | (g << 8) | b;
-         }
-         VP_CHECK(vx_buffer_create(dev, (size_t)texel_count * 4, 0, &xbuf),
-                  "vx_buffer_create(tex)");
-         VP_CHECK(vx_buffer_address(xbuf, &tex_dev), "vx_buffer_address(tex)");
-         VP_CHECK(vx_enqueue_write(q, xbuf, 0, texbuf.data(), (size_t)texel_count * 4,
-                                   0, NULL, NULL), "vx_enqueue_write(tex)");
-      }
 
       /* VS vertex-input upload + attribute table (VS arg slot 1; slot 0 = VS
        * output). The table is indexed by VS input driver_location. Both the
@@ -505,9 +471,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_OM_BLEND_CONST,       0);
       DCRW(VX_DCR_OM_LOGIC_OP,          0);
 
-      /* TEX unit (stage 0): the texels are already uploaded above (A8R8G8B8);
-       * program the sampler. Untextured draws leave TEX state alone. */
-      if (tex) {
+      /* TEX unit (stage 0): the texels are residency-cached at tex_dev
+       * (A8R8G8B8); program the sampler. Untextured draws (tex_dev==0) leave
+       * TEX state alone. */
+      if (tex_dev && tex) {
          uint32_t logw = vp_log2u(tex->width);
          uint32_t logh = vp_log2u(tex->height);
          DCRW(VX_DCR_TEX_STAGE,        0);
@@ -527,21 +494,19 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       VP_CHECK(vx_enqueue_draw(q, cmds.data(), (uint32_t)cmds.size(),
                                0, NULL, NULL), "vx_enqueue_draw");
 
-      VP_CHECK(vx_enqueue_read(q, color, cbuf, 0, cbuf_bytes, 0, NULL, NULL),
-               "vx_enqueue_read(color)");
+      /* The render lands in the resident colour buffer (color_dev); the caller
+       * syncs it back to the framebuffer resource at present / pass end. No
+       * per-draw colour readback. */
       VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish");
       ok = true;
    }
 
 done:
-   /* the front-end working set + all code modules are resident (pool- or
-    * CSO-cached) and persist across draws; only the per-draw VS-output /
-    * colour / depth / texture / vertex-input buffers are released here. */
+   /* the front-end working set, code modules and colour/depth/texture buffers
+    * are resident (pool- / context-cached) and persist across draws; only the
+    * per-draw VS-output + vertex-input buffers are released here. */
    if (tbuf) vx_buffer_release(tbuf);
    if (vbuf) vx_buffer_release(vbuf);
-   if (xbuf) vx_buffer_release(xbuf);
-   if (zbuf) vx_buffer_release(zbuf);
-   if (cbuf) vx_buffer_release(cbuf);
    if (vsbuf) vx_buffer_release(vsbuf);
    if (q)         vx_queue_release(q);
    return ok;
