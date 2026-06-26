@@ -437,8 +437,11 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
       LAUNCH(&fli);
 
-      VP_CHECK(vx_enqueue_commands(q, cmds.data(), (uint32_t)cmds.size(),
-                                   0, NULL, NULL), "vx_enqueue_commands");
+      /* Submit the whole draw as ONE device-orchestrated command: the CP
+       * expands the resident descriptor and sequences expand→setup→bin→
+       * FF-config→FS on-device, draining each stage with no host round-trip. */
+      VP_CHECK(vx_enqueue_draw(q, cmds.data(), (uint32_t)cmds.size(),
+                               0, NULL, NULL), "vx_enqueue_draw");
 
       VP_CHECK(vx_enqueue_read(q, color, cbuf, 0, cbuf_bytes, 0, NULL, NULL),
                "vx_enqueue_read(color)");
