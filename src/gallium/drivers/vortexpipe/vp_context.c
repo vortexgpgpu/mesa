@@ -601,29 +601,6 @@ vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
                          dst, false);
 }
 
-static bool
-vp_fb_color_write(struct pipe_context *pipe, struct vp_context *vp,
-                  const void *src)
-{
-   return vp_resource_rw(pipe, vp->fb_color, vp->fb_width, vp->fb_height,
-                         (void *)src, true);
-}
-
-static bool
-vp_fb_depth_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
-{
-   return vp_resource_rw(pipe, vp->fb_depth, vp->fb_width, vp->fb_height,
-                         dst, false);
-}
-
-static bool
-vp_fb_depth_write(struct pipe_context *pipe, struct vp_context *vp,
-                  const void *src)
-{
-   return vp_resource_rw(pipe, vp->fb_depth, vp->fb_width, vp->fb_height,
-                         (void *)src, true);
-}
-
 /* VX OM encodings (VX_types.h) -- depth-compare function and blend.
  * Used by the residency depth-clear heuristic below and the OM-state
  * translation further down. */
