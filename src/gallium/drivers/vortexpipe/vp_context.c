@@ -369,8 +369,11 @@ vp_fs_routing(struct pipe_context *pipe)
    struct vp_screen *vps = vp_reg_get(pipe->screen);
    struct vp_sw_routing r = { false, false, false };
    const char *force = getenv("VORTEXPIPE_FORCE_SW");
-   bool force_tex = force && (strstr(force, "tex") || strstr(force, "all"));
+   bool force_all = force && strstr(force, "all");
+   bool force_tex = force && (strstr(force, "tex") || force_all);
+   bool force_om  = force && (strstr(force, "om")  || force_all);
    r.sw_tex = (vps && !vps->has_tex) || force_tex;
+   r.sw_om  = (vps && !vps->has_om)  || force_om;
    return r;
 }
 
@@ -1129,12 +1132,16 @@ vp_draw_vbo(struct pipe_context *pipe,
       if (sw_raster < 0)
          sw_raster = getenv("VORTEXPIPE_SW_RASTER") != NULL;
       struct vp_screen *vps = vp_reg_get(pipe->screen);
-      bool gfx_hw = vps && vps->has_raster && vps->has_om;
+      /* §5: a unit absent from the device runs in software (the FS was compiled
+       * for it) rather than dropping the whole draw to llvmpipe — RASTER must be
+       * HW here (its SW fork is a separate wrapper variant), but OM may be SW. */
+      bool fs_sw_om  = fs && fs->fs_routing.sw_om;
+      bool gfx_hw = vps && vps->has_raster && (vps->has_om || fs_sw_om);
       bool tex_needed = vp->cur_tex != NULL;
-      /* §5: a sampler on a TEX-less device no longer drops the whole draw to
-       * llvmpipe — the FS was compiled to sample in software (fs_routing.sw_tex),
-       * so the device path runs HW raster+OM + SW TEX. Only skip if the FS was
-       * NOT built for SW texturing (e.g. caps changed under a cached shader). */
+      /* A sampler on a TEX-less device no longer drops to llvmpipe — the FS was
+       * compiled to sample in software (fs_routing.sw_tex), so the device path
+       * runs HW raster + (HW/SW) OM + SW TEX. Only skip if the FS was NOT built
+       * for SW texturing (e.g. caps changed under a cached shader). */
       bool fs_sw_tex = fs && fs->fs_routing.sw_tex;
       if (gfx_hw && tex_needed && !vps->has_tex && !fs_sw_tex) {
          mesa_logw("vortexpipe: draw_vbo: device lacks TEX extension and FS not "
@@ -1213,7 +1220,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                                   vs->vs_layout.needs_vertex_input ? &vin : NULL,
                                   color_dev, depth_dev, w, h, &om,
                                   tex_used ? tex_dev : 0, tex_used ? &tex : NULL,
-                                  fs_sw_tex);
+                                  fs_sw_tex, fs_sw_om);
          if (drew) {
             vp->rfb_dirty = true;   /* device colour ahead of the resource */
             vp_dbg("vortexpipe: draw_vbo -> Vortex VS+RASTER+OM (one OP_DRAW) "

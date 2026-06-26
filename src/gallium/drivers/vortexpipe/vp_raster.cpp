@@ -94,10 +94,13 @@ struct vp_raster_pool {
     * of reloaded per draw. */
    vx_module_h fe_module;
    vx_kernel_h k_expand, k_setup, k_binning;
-   /* §5 SW sampler: a small resident gfx_sw_texstate_t the FS reads (arg[1])
-    * when texturing is routed to software; created once, rewritten per draw. */
+   /* §5 SW sampler / output-merger: small resident descriptors the FS reads
+    * (tex via arg[1], om via arg[2]) when the unit is routed to software;
+    * created once, rewritten per draw. */
    vx_buffer_h texstate_buf;
    uint64_t    texstate_dev;
+   vx_buffer_h omstate_buf;
+   uint64_t    omstate_dev;
 };
 
 extern "C" struct vp_raster_pool *
@@ -114,6 +117,7 @@ vp_raster_pool_destroy(struct vp_raster_pool *pool)
    for (vx_buffer_h b : pool->bufs)
       if (b) vx_buffer_release(b);
    if (pool->texstate_buf) vx_buffer_release(pool->texstate_buf);
+   if (pool->omstate_buf)  vx_buffer_release(pool->omstate_buf);
    if (pool->k_binning) vx_kernel_release(pool->k_binning);
    if (pool->k_setup)   vx_kernel_release(pool->k_setup);
    if (pool->k_expand)  vx_kernel_release(pool->k_expand);
@@ -196,7 +200,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                uint32_t width, uint32_t height,
                const struct vp_om_params *om,
                uint64_t tex_dev, const struct vp_tex_params *tex,
-               bool sw_tex)
+               bool sw_tex, bool sw_om)
 {
    const uint32_t num_tris = vertex_count / 3;
    if (num_tris == 0) {
@@ -391,6 +395,65 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          argblk[1] = pool->texstate_dev;
       }
 
+      /* §5 SW output-merger: build the resident om descriptor from the same OM
+       * state the FF path programs into the OM DCRs (depth/blend/colormask +
+       * the resident colour/depth buffers), with the enable flags derived as
+       * gfx_sw::resolve_om_state does. The FS (compiled with sw_om) merges each
+       * fragment via gfx_om_fragment_sw over the LSU using arg[2]. */
+      gfx_sw_omstate_t omstate{};
+      if (sw_om) {
+         omstate.depth_func      = om->depth_test ? om->depth_func
+                                                  : (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS;
+         omstate.depth_writemask = om->depth_write ? 1u : 0u;
+         for (int f = 0; f < 2; ++f) {
+            omstate.stencil_func[f]      = VX_OM_DEPTH_FUNC_ALWAYS;
+            omstate.stencil_zpass[f]     = VX_OM_STENCIL_OP_KEEP;
+            omstate.stencil_zfail[f]     = VX_OM_STENCIL_OP_KEEP;
+            omstate.stencil_fail[f]      = VX_OM_STENCIL_OP_KEEP;
+            omstate.stencil_ref[f]       = 0;
+            omstate.stencil_mask[f]      = VX_OM_STENCIL_MASK;
+            omstate.stencil_writemask[f] = 0;
+         }
+         omstate.blend_mode_rgb = om->blend_mode & 0xffff;
+         omstate.blend_mode_a   = om->blend_mode >> 16;
+         omstate.blend_src_rgb  =  om->blend_func        & 0xff;
+         omstate.blend_src_a    = (om->blend_func >> 8)  & 0xff;
+         omstate.blend_dst_rgb  = (om->blend_func >> 16) & 0xff;
+         omstate.blend_dst_a    = (om->blend_func >> 24) & 0xff;
+         omstate.blend_const    = 0;
+         omstate.logic_op       = 0;
+         omstate.zbuf_base      = depth_dev;
+         omstate.cbuf_base      = color_dev;
+         omstate.zbuf_pitch     = width * 4;
+         omstate.cbuf_pitch     = width * 4;
+         omstate.cbuf_writemask4 = om->colormask;
+         /* resolve_om_state (host-side derivation, mirrors gfx_sw.h) */
+         omstate.depth_enabled = !((omstate.depth_func == (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS)
+                                && !(omstate.depth_writemask & 1u));
+         omstate.stencil_enabled[0] = omstate.stencil_enabled[1] = 0;  /* ALWAYS/KEEP */
+         omstate.blend_enabled = !((omstate.blend_mode_rgb == (uint32_t)VX_OM_BLEND_MODE_ADD)
+                                && (omstate.blend_mode_a   == (uint32_t)VX_OM_BLEND_MODE_ADD)
+                                && (omstate.blend_src_rgb  == (uint32_t)VX_OM_BLEND_FUNC_ONE)
+                                && (omstate.blend_src_a    == (uint32_t)VX_OM_BLEND_FUNC_ONE)
+                                && (omstate.blend_dst_rgb  == (uint32_t)VX_OM_BLEND_FUNC_ZERO)
+                                && (omstate.blend_dst_a    == (uint32_t)VX_OM_BLEND_FUNC_ZERO));
+         uint32_t m4 = om->colormask & 0xf;
+         omstate.cbuf_writemask = (((m4 >> 0) & 1) * 0x000000ffu) | (((m4 >> 1) & 1) * 0x0000ff00u)
+                                | (((m4 >> 2) & 1) * 0x00ff0000u) | (((m4 >> 3) & 1) * 0xff000000u);
+         omstate.color_read  = (m4 != 0xf);
+         omstate.color_write = (m4 != 0x0);
+         if (!pool->omstate_buf) {
+            VP_CHECK(vx_buffer_create(dev, sizeof(gfx_sw_omstate_t), 0,
+                                      &pool->omstate_buf), "vx_buffer_create(omstate)");
+            VP_CHECK(vx_buffer_address(pool->omstate_buf, &pool->omstate_dev),
+                     "vx_buffer_address(omstate)");
+         }
+         VP_CHECK(vx_enqueue_write(q, pool->omstate_buf, 0, &omstate,
+                                   sizeof(omstate), 0, NULL, NULL),
+                  "vx_enqueue_write(omstate)");
+         argblk[2] = pool->omstate_dev;
+      }
+
       /* VS vertex-input upload + attribute table (VS arg slot 1; slot 0 = VS
        * output). The table is indexed by VS input driver_location. Both the
        * table and the VS arg block are declared here so they outlive
@@ -484,6 +547,9 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
       DCRW(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
 
+      /* FF OM config — skipped when OM is routed to software (the FS merges via
+       * gfx_om_fragment_sw from the resident om descriptor instead). */
+      if (!sw_om) {
       DCRW(VX_DCR_OM_CBUF_ADDR,        (uint32_t)(color_dev / 64));
       DCRW(VX_DCR_OM_CBUF_PITCH,       width * 4);
       DCRW(VX_DCR_OM_CBUF_WRITEMASK,   om->colormask);
@@ -502,6 +568,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_OM_BLEND_FUNC,        om->blend_func);
       DCRW(VX_DCR_OM_BLEND_CONST,       0);
       DCRW(VX_DCR_OM_LOGIC_OP,          0);
+      }
 
       /* TEX unit (stage 0): the texels are residency-cached at tex_dev
        * (A8R8G8B8); program the sampler. Untextured draws (tex_dev==0) leave

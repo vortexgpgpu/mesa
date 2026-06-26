@@ -1611,6 +1611,14 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
    } else {
       texstate_ptr = LLVMConstNull(t->ptr);
    }
+   /* §5 SW output-merger: arg[2] is the resident gfx_sw_omstate_t device address
+    * (host-filled when OM is routed to software). The wrapper merges each covered
+    * sub-pixel via gfx_om_fragment_sw over the LSU instead of staging + vx_om4. */
+   LLVMValueRef omstate_ptr = LLVMConstNull(t->ptr);
+   if (t->sw_om) {
+      LLVMValueRef os_addr = emit_arg_i32(t, arg, 2);
+      omstate_ptr = LLVMBuildIntToPtr(t->b, os_addr, t->ptr, "omstate");
+   }
    LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16),
                                           "fs_in");
    LLVMValueRef out_scr = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4),
@@ -1640,6 +1648,20 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
                                     vp_to_iptr(t, poff), "prim");
    LLVMValueRef mask = LLVMBuildAnd(t->b, pos_mask,
       LLVMConstInt(t->i32, 0xf, false), "mask");
+
+   /* §5 SW OM: decode the quad origin + face from pos_mask so the wrapper can
+    * address each covered sub-pixel directly (qx@[4+:DIM-1], qy@[4+DIM-1+:DIM-1],
+    * face@31). px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
+   const uint32_t dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
+   LLVMValueRef qx = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4, false), ""),
+      LLVMConstInt(t->i32, dim_mask, false), "qx");
+   LLVMValueRef qy = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4 + VX_RASTER_DIM_BITS - 1, false), ""),
+      LLVMConstInt(t->i32, dim_mask, false), "qy");
+   LLVMValueRef face = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 31, false), ""),
+      LLVMConstInt(t->i32, 1, false), "face");
 
    for (unsigned i = 0; i < 4; i++) {
       LLVMBasicBlockRef px  = LLVMAppendBasicBlockInContext(t->ctx, fn, "px");
@@ -1693,18 +1715,39 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
          LLVMBuildFMul(t->b, dz, LLVMConstReal(t->f32, 16777216.0), ""),
          t->i32, "");
 
-      /* stage this covered sub-pixel's colour + depth into the OM quad
-       * window (colour[i]@base+i, depth[i]@base+4+i). The single vx_om4
-       * after the loop submits the whole quad; cov_mask gates valid slots. */
-      emit_vx_gfx_set(t, VP_OM_SLOT_BASE + i, rgba);
-      emit_vx_gfx_set(t, VP_OM_SLOT_BASE + 4 + i, depth_i);
+      if (t->sw_om) {
+         /* §5 SW output-merger: merge this covered sub-pixel directly via
+          * gfx_om_fragment_sw(omstate, px, py, face, colour, depth) over the LSU
+          * (no window staging, no vx_om4). px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
+         LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+         LLVMValueRef px = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
+            LLVMConstInt(t->i32, i & 1, false), "px");
+         LLVMValueRef py = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
+            LLVMConstInt(t->i32, i >> 1, false), "py");
+         LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
+         LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                            params, 6, false);
+         LLVMValueRef ofn = LLVMGetNamedFunction(t->mod, "gfx_om_fragment_sw");
+         if (!ofn)
+            ofn = LLVMAddFunction(t->mod, "gfx_om_fragment_sw", fty);
+         LLVMValueRef a[6] = { omstate_ptr, px, py, face, rgba, depth_i };
+         LLVMBuildCall2(t->b, fty, ofn, a, 6, "");
+      } else {
+         /* stage this covered sub-pixel's colour + depth into the OM quad
+          * window (colour[i]@base+i, depth[i]@base+4+i). The single vx_om4
+          * after the loop submits the whole quad; cov_mask gates valid slots. */
+         emit_vx_gfx_set(t, VP_OM_SLOT_BASE + i, rgba);
+         emit_vx_gfx_set(t, VP_OM_SLOT_BASE + 4 + i, depth_i);
+      }
       LLVMBuildBr(t->b, nxt);
 
       LLVMPositionBuilderAtEnd(t->b, nxt);   /* fall through to next pixel */
    }
    /* submit the whole quad in one op: desc = pos_mask (cov_mask|qx|qy, face 0),
-    * colour/depth already staged in the window. */
-   emit_vx_om4(t, pos_mask, VP_OM_SLOT_BASE);
+    * colour/depth already staged in the window. (SW OM already merged each
+    * sub-pixel above — no FF submit.) */
+   if (!t->sw_om)
+      emit_vx_om4(t, pos_mask, VP_OM_SLOT_BASE);
    LLVMBuildBr(t->b, loop);
 
    LLVMPositionBuilderAtEnd(t->b, exit);
