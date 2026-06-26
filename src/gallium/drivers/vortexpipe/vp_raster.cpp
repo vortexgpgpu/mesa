@@ -29,6 +29,7 @@
 
 #include "graphics.h"            /* vortex::graphics::rast_prim_t / rast_tile_header_t */
 #include "gfx_frontend_abi.h"    /* pipe_arg_t, setup_vertex_t, PIPE_STAGE_*, SETUP_* */
+#include "gfx_sw_abi.h"          /* §5 gfx_sw_texstate_t — SW sampler descriptor */
 #include "vp_gfx_frontend.h"     /* embedded setup_k + binning_k .vxbin */
 #include "VX_types.h"            /* VX_DCR_RASTER_*, VX_DCR_OM_*, VX_OM_* */
 #include "util/log.h"
@@ -93,6 +94,10 @@ struct vp_raster_pool {
     * of reloaded per draw. */
    vx_module_h fe_module;
    vx_kernel_h k_expand, k_setup, k_binning;
+   /* §5 SW sampler: a small resident gfx_sw_texstate_t the FS reads (arg[1])
+    * when texturing is routed to software; created once, rewritten per draw. */
+   vx_buffer_h texstate_buf;
+   uint64_t    texstate_dev;
 };
 
 extern "C" struct vp_raster_pool *
@@ -108,6 +113,7 @@ vp_raster_pool_destroy(struct vp_raster_pool *pool)
       return;
    for (vx_buffer_h b : pool->bufs)
       if (b) vx_buffer_release(b);
+   if (pool->texstate_buf) vx_buffer_release(pool->texstate_buf);
    if (pool->k_binning) vx_kernel_release(pool->k_binning);
    if (pool->k_setup)   vx_kernel_release(pool->k_setup);
    if (pool->k_expand)  vx_kernel_release(pool->k_expand);
@@ -189,7 +195,8 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                uint64_t color_dev, uint64_t depth_dev,
                uint32_t width, uint32_t height,
                const struct vp_om_params *om,
-               uint64_t tex_dev, const struct vp_tex_params *tex)
+               uint64_t tex_dev, const struct vp_tex_params *tex,
+               bool sw_tex)
 {
    const uint32_t num_tris = vertex_count / 3;
    if (num_tris == 0) {
@@ -359,6 +366,31 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       uint64_t argblk[8] = { 0 };
       argblk[0] = prim_dev;
 
+      /* §5 SW sampler: build the resident texture descriptor and hand the FS its
+       * device address (arg[1]). The FS (compiled with sw_tex) then samples via
+       * gfx_tex_sample_sw over the LSU instead of the FF TEX unit. The descriptor
+       * outlives vx_enqueue_draw / vx_queue_finish (declared in this scope). */
+      gfx_sw_texstate_t texstate{};
+      if (sw_tex && tex_dev && tex) {
+         texstate.base   = tex_dev;
+         for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i)
+            texstate.mip_off[i] = 0;   /* single mip (gfx-v1 textures) */
+         texstate.logdim = (vp_log2u(tex->height) << 16) | vp_log2u(tex->width);
+         texstate.format = VX_TEX_FORMAT_A8R8G8B8;
+         texstate.filter = tex->filter;
+         texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
+         if (!pool->texstate_buf) {
+            VP_CHECK(vx_buffer_create(dev, sizeof(gfx_sw_texstate_t), 0,
+                                      &pool->texstate_buf), "vx_buffer_create(texstate)");
+            VP_CHECK(vx_buffer_address(pool->texstate_buf, &pool->texstate_dev),
+                     "vx_buffer_address(texstate)");
+         }
+         VP_CHECK(vx_enqueue_write(q, pool->texstate_buf, 0, &texstate,
+                                   sizeof(texstate), 0, NULL, NULL),
+                  "vx_enqueue_write(texstate)");
+         argblk[1] = pool->texstate_dev;
+      }
+
       /* VS vertex-input upload + attribute table (VS arg slot 1; slot 0 = VS
        * output). The table is indexed by VS input driver_location. Both the
        * table and the VS arg block are declared here so they outlive
@@ -473,8 +505,9 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
       /* TEX unit (stage 0): the texels are residency-cached at tex_dev
        * (A8R8G8B8); program the sampler. Untextured draws (tex_dev==0) leave
-       * TEX state alone. */
-      if (tex_dev && tex) {
+       * TEX state alone. SW-textured draws (sw_tex) skip the FF TEX config —
+       * the FS samples in software from the resident descriptor (argblk[1]). */
+      if (tex_dev && tex && !sw_tex) {
          uint32_t logw = vp_log2u(tex->width);
          uint32_t logh = vp_log2u(tex->height);
          DCRW(VX_DCR_TEX_STAGE,        0);

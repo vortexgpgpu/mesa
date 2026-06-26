@@ -118,8 +118,8 @@ vp_create_compute_state(struct pipe_context *pipe,
       /* the set-0 descriptors the kernel reaches -> launch relocation. */
       vp_scan_descriptors((struct nir_shader *)state->prog,
                           cso->descs, &cso->num_descs);
-      if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL)) {
-         if (vp_compile_vxbin(ir, VP_STARTUP_FS, &cso->vxbin, &cso->vxbin_size))
+      if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL, NULL)) {
+         if (vp_compile_vxbin(ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
                       cso->vxbin_size);
          else
@@ -299,10 +299,10 @@ vp_create_vs_state(struct pipe_context *pipe,
    if (state->type == PIPE_SHADER_IR_NIR) {
       char *ir = NULL;
       if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir,
-                         &cso->vs_layout)) {
+                         &cso->vs_layout, NULL)) {
          /* VS links at a distinct base so it co-resides with the FS
           * (0x80000000) + front end (0x80200000) in one OP_DRAW. */
-         if (vp_compile_vxbin(ir, VP_STARTUP_VS, &cso->vxbin, &cso->vxbin_size))
+         if (vp_compile_vxbin(ir, VP_STARTUP_VS, false, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled vertex shader -> %zu-byte .vxbin",
                    cso->vxbin_size);
          else
@@ -359,6 +359,21 @@ vp_delete_vs_state(struct pipe_context *pipe, void *p)
 
 /* ---- graphics: fragment-shader hooks (Phase 4) --------------------- */
 
+/* §5 per-unit HW-vs-SW routing for a fragment shader, from device caps +
+ * the VORTEXPIPE_FORCE_SW knob. A unit absent from the device routes to its
+ * SIMT software path (never llvmpipe — charter pillar 4). TEX is wired here;
+ * OM/RASTER follow in later steps. */
+static struct vp_sw_routing
+vp_fs_routing(struct pipe_context *pipe)
+{
+   struct vp_screen *vps = vp_reg_get(pipe->screen);
+   struct vp_sw_routing r = { false, false, false };
+   const char *force = getenv("VORTEXPIPE_FORCE_SW");
+   bool force_tex = force && (strstr(force, "tex") || strstr(force, "all"));
+   r.sw_tex = (vps && !vps->has_tex) || force_tex;
+   return r;
+}
+
 /* The driver JIT-compiles the fragment shader at pipeline creation,
  * the same NIR -> LLVM -> .vxbin path the vertex/compute stages use
  * (a real GPU driver compiles every stage; nothing is prebuilt). */
@@ -372,13 +387,16 @@ vp_create_fs_state(struct pipe_context *pipe,
    if (!cso)
       return NULL;
    cso->lp_cso = vp->lp_create_fs_state(pipe, state);
+   cso->fs_routing = vp_fs_routing(pipe);
 
    if (state->type == PIPE_SHADER_IR_NIR) {
       char *ir = NULL;
-      if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir, NULL)) {
-         if (vp_compile_vxbin(ir, VP_STARTUP_FS, &cso->vxbin, &cso->vxbin_size))
-            vp_dbg("vortexpipe: compiled fragment shader -> %zu-byte .vxbin",
-                   cso->vxbin_size);
+      if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir, NULL,
+                         &cso->fs_routing)) {
+         bool uses_sw = cso->fs_routing.sw_tex || cso->fs_routing.sw_om;
+         if (vp_compile_vxbin(ir, VP_STARTUP_FS, uses_sw, &cso->vxbin, &cso->vxbin_size))
+            vp_dbg("vortexpipe: compiled fragment shader -> %zu-byte .vxbin%s",
+                   cso->vxbin_size, uses_sw ? " (SW units)" : "");
          else
             mesa_loge("vortexpipe: FS .vxbin compile failed");
          vp_free_ir(ir);
@@ -1113,10 +1131,14 @@ vp_draw_vbo(struct pipe_context *pipe,
       struct vp_screen *vps = vp_reg_get(pipe->screen);
       bool gfx_hw = vps && vps->has_raster && vps->has_om;
       bool tex_needed = vp->cur_tex != NULL;
-      if (gfx_hw && tex_needed && !vps->has_tex) {
-         mesa_logw("vortexpipe: draw_vbo: device lacks TEX extension; "
-                   "fragment shader needs a sampler — skipping hardware "
-                   "RASTER+OM path");
+      /* §5: a sampler on a TEX-less device no longer drops the whole draw to
+       * llvmpipe — the FS was compiled to sample in software (fs_routing.sw_tex),
+       * so the device path runs HW raster+OM + SW TEX. Only skip if the FS was
+       * NOT built for SW texturing (e.g. caps changed under a cached shader). */
+      bool fs_sw_tex = fs && fs->fs_routing.sw_tex;
+      if (gfx_hw && tex_needed && !vps->has_tex && !fs_sw_tex) {
+         mesa_logw("vortexpipe: draw_vbo: device lacks TEX extension and FS not "
+                   "compiled for SW texturing — skipping hardware RASTER+OM path");
          gfx_hw = false;
       }
       bool hw_path = vin_ok && !sw_raster && gfx_hw && fs && fs->vxbin &&
@@ -1190,7 +1212,8 @@ vp_draw_vbo(struct pipe_context *pipe,
                                   count, &vs->vs_layout,
                                   vs->vs_layout.needs_vertex_input ? &vin : NULL,
                                   color_dev, depth_dev, w, h, &om,
-                                  tex_used ? tex_dev : 0, tex_used ? &tex : NULL);
+                                  tex_used ? tex_dev : 0, tex_used ? &tex : NULL,
+                                  fs_sw_tex);
          if (drew) {
             vp->rfb_dirty = true;   /* device colour ahead of the resource */
             vp_dbg("vortexpipe: draw_vbo -> Vortex VS+RASTER+OM (one OP_DRAW) "

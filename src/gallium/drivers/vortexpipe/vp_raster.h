@@ -103,7 +103,8 @@ bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                     uint64_t color_dev, uint64_t depth_dev,
                     uint32_t width, uint32_t height,
                     const struct vp_om_params *om,
-                    uint64_t tex_dev, const struct vp_tex_params *tex);
+                    uint64_t tex_dev, const struct vp_tex_params *tex,
+                    bool sw_tex);
 
 #ifdef __cplusplus
 }

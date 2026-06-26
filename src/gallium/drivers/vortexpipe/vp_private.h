@@ -85,6 +85,10 @@ struct vp_cso {
     * evicts the previously-resident one (vp_bind_vs_state / vp_bind_fs_state). */
    vx_module_h vx_module;
    vx_kernel_h vx_kernel;
+   /* §5 per-unit SW routing baked into a fragment shader at compile time (from
+    * device caps + VORTEXPIPE_FORCE_SW). The draw path reads this to build +
+    * pass the resident SW descriptors the FS was compiled to expect. */
+   struct vp_sw_routing fs_routing;
 };
 
 /* Captured + VX-encoded output-merger state (Phase 5). create_*_state

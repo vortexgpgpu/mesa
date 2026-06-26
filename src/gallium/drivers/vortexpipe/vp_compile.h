@@ -27,8 +27,13 @@ extern "C" {
  * embedded front end already occupies 0x80200000). */
 #define VP_STARTUP_FS  0x80000000ull
 #define VP_STARTUP_VS  0x80400000ull
+/* link_gfx_sw: co-compile the gfx_v2 §5 software-fallback C ABI
+ * ($VORTEX_HOME/sw/gfx/gfx_sw_abi.cpp) into the kernel so the FS's
+ * gfx_tex_sample_sw / gfx_om_fragment_sw calls resolve and inline (the divergent
+ * OM merge needs the Vortex divergence pass over the whole kernel). Set when any
+ * unit is routed to software; ignored otherwise (--gc-sections drops it). */
 bool vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
-                      void **out_blob, size_t *out_size);
+                      bool link_gfx_sw, void **out_blob, size_t *out_size);
 
 void vp_free_blob(void *blob);
 

@@ -86,7 +86,7 @@ vp_xlen_is_64(void)
 
 bool
 vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
-                 void **out_blob, size_t *out_size)
+                 bool link_gfx_sw, void **out_blob, size_t *out_size)
 {
    *out_blob = NULL;
    *out_size = 0;
@@ -132,6 +132,19 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
    bool ok = write_text(p_ll, llvm_ir);
    char *cmd = NULL;
 
+   /* §5: when a unit is routed to software, co-compile the gfx_sw_abi C ABI into
+    * the kernel (compiled from the SSOT C++ headers, so the divergent OM merge is
+    * processed by the Vortex divergence pass over the whole kernel; --gc-sections
+    * drops unused entry points). VX_types.h is the generated copy under $bd/sw. */
+   char gfx_seg[1024] = "";
+   if (ok && link_gfx_sw) {
+      snprintf(gfx_seg, sizeof gfx_seg,
+         "-std=c++17 -D__VORTEX__ -DGFX_SW_DIVERGENCE_OK "
+         "-mllvm -vortex-divergence-max-bbs=512 "
+         "-I%s/sw/gfx -I%s/sw/common -I%s/third_party -I%s/sw %s/sw/gfx/gfx_sw_abi.cpp",
+         vh, vh, vh, bd, vh);
+   }
+
    /* compile + link the IR into a Vortex KMU kernel ELF */
    if (ok) {
       /* Device flags mirror the canonical Vortex kernel toolchain
@@ -154,7 +167,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
             "-Wno-unused-command-line-argument -Wno-override-module "
             "-O3 -mcmodel=medany -nostartfiles -nostdlib "
             "-fdata-sections -ffunction-sections -fuse-ld=lld "
-            "%s "
+            "%s %s "
             "-Wl,-Bstatic,--gc-sections,-T,%s/sw/kernel/scripts/%s,"
             "--defsym=STARTUP_ADDR=0x%llx "
             "%s/sw/kernel/libvortex2.a "
@@ -165,7 +178,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
             td, gnu_dir, target,
             td, gnu_dir,
             march, mabi,
-            p_ll,
+            p_ll, gfx_seg,
             vh, linker,
             startup_addr,
             bd,

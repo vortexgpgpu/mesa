@@ -32,13 +32,25 @@ struct vp_vs_layout {
    bool     needs_vertex_input;              /* VS fetches vertex attributes */
 };
 
+/* gfx_v2 §5 per-unit software-fallback routing (compile-time). When a unit is
+ * routed to software the FS calls the gfx_sw_abi entry points instead of the FF
+ * intrinsic; the host feeds resident descriptors via the kernel arg block. A
+ * NULL routing (or all-false) is the all-hardware path. */
+struct vp_sw_routing {
+   bool sw_tex;      /* sample via gfx_tex_sample_sw instead of vx_tex4 */
+   bool sw_om;       /* merge via gfx_om_fragment_sw instead of vx_om4 */
+   bool sw_raster;   /* (vp_raster_draw selects the iterate-bin-buffer kernel) */
+};
+
 /* Translate a NIR shader (compute or vertex) to LLVM IR. On success
  * returns true and, if out_ir is non-NULL, stores a freshly
  * allocated LLVM-IR text string in *out_ir (release with
  * vp_free_ir). For a vertex shader, *out_vs (when non-NULL) is
- * filled with the output-record layout. */
+ * filled with the output-record layout. `routing` (may be NULL) selects the
+ * per-unit HW/SW path for a fragment shader; ignored for VS/compute. */
 bool vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
-                    struct vp_vs_layout *out_vs);
+                    struct vp_vs_layout *out_vs,
+                    const struct vp_sw_routing *routing);
 
 /* Release a string returned via vp_nir_to_llvm()'s out_ir. */
 void vp_free_ir(char *ir);

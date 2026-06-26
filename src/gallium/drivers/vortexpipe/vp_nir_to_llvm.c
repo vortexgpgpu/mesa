@@ -137,6 +137,12 @@ struct vp_tr {
    LLVMValueRef   fs_out_base;  /* iptr output-colour area */
    struct vp_var  vars[VP_MAXV];
    unsigned       nvars;
+   /* gfx_v2 §5 per-unit SW routing (FS only). fs_texstate is fs_main's 3rd
+    * param: a resident gfx_sw_texstate_t[] (per sampler stage), used by
+    * emit_vx_tex when sw_tex; null pointer when texturing is HW. */
+   bool           sw_tex;
+   bool           sw_om;
+   LLVMValueRef   fs_texstate; /* ptr param (gfx_sw_texstate_t* table) */
    bool           ok;
 };
 
@@ -980,6 +986,19 @@ static LLVMValueRef
 emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
             LLVMValueRef lod)
 {
+   /* §5 software sampler: call gfx_tex_sample_sw(&texstate[0], u, v, lod) on the
+    * resident descriptor table (fs_main's 3rd param) instead of the FF TEX unit.
+    * Same fixed-point u/v/lod convention; returns the packed A8R8G8B8 texel. */
+   if (t->sw_tex) {
+      LLVMTypeRef params[4] = { t->ptr, t->i32, t->i32, t->i32 };
+      LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 4, false);
+      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_sw");
+      if (!fn)
+         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_sw", fty);
+      LLVMValueRef a[4] = { t->fs_texstate, u, v, lod };  /* stage 0 = table[0] */
+      return LLVMBuildCall2(t->b, fty, fn, a, 4, "texsw");
+   }
+
    emit_vx_gfx_set(t, VP_TEX_IN_SLOT,     u);
    emit_vx_gfx_set(t, VP_TEX_IN_SLOT + 1, v);
    char s[48];
@@ -1582,6 +1601,16 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
     * DCRs, so the kernel only needs the primitive buffer (arg[0]). */
    LLVMPositionBuilderAtEnd(t->b, entry);
    LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
+   /* §5 SW sampler: arg[1] is the resident gfx_sw_texstate_t[] device address
+    * (the host fills it when texturing is routed to software); null on the HW
+    * path. Passed to fs_main as its 3rd param. */
+   LLVMValueRef texstate_ptr;
+   if (t->sw_tex) {
+      LLVMValueRef ts_addr = emit_arg_i32(t, arg, 1);
+      texstate_ptr = LLVMBuildIntToPtr(t->b, ts_addr, t->ptr, "texstate");
+   } else {
+      texstate_ptr = LLVMConstNull(t->ptr);
+   }
    LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16),
                                           "fs_in");
    LLVMValueRef out_scr = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4),
@@ -1642,9 +1671,9 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
        * varyings (colour and/or texcoord, by declaration). */
       emit_fs_fill_varyings(t, prim, in_addr, dx, dy);
 
-      /* run the programmable fragment shader */
-      LLVMValueRef cargs[2] = { in_scr, out_scr };
-      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 2, "");
+      /* run the programmable fragment shader (3rd arg = §5 SW texstate table) */
+      LLVMValueRef cargs[3] = { in_scr, out_scr, texstate_ptr };
+      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 3, "");
 
       /* pack the FS output (4 floats) into an R8G8B8A8 pixel. */
       LLVMValueRef rgba = LLVMConstInt(t->i32, 0, false);
@@ -1685,7 +1714,8 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
 
 bool
 vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
-               struct vp_vs_layout *out_vs)
+               struct vp_vs_layout *out_vs,
+               const struct vp_sw_routing *routing)
 {
    if (out_ir)
       *out_ir = NULL;
@@ -1704,6 +1734,9 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    t.ok    = true;
    t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
    t.is_fs = (nir->info.stage == MESA_SHADER_FRAGMENT);
+   /* §5 per-unit SW routing (FS only). */
+   t.sw_tex = (t.is_fs && routing && routing->sw_tex);
+   t.sw_om  = (t.is_fs && routing && routing->sw_om);
    t.ctx   = LLVMContextCreate();
    t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
    LLVMSetTarget(t.mod, vp_target_triple());
@@ -1725,9 +1758,12 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    LLVMValueRef fn;
    LLVMTypeRef  fs_main_ty = NULL;
    if (t.is_fs) {
-      LLVMTypeRef p2[2] = { t.ptr, t.ptr };
+      /* fs_main(varyings_in, colour_out, texstate_table). The 3rd param carries
+       * the resident gfx_sw_texstate_t[] for the §5 SW sampler; it is null on the
+       * all-HW path (emit_vx_tex ignores it then). */
+      LLVMTypeRef p3[3] = { t.ptr, t.ptr, t.ptr };
       fs_main_ty = LLVMFunctionType(LLVMVoidTypeInContext(t.ctx),
-                                    p2, 2, false);
+                                    p3, 3, false);
       fn = LLVMAddFunction(t.mod, "fs_main", fs_main_ty);
       LLVMSetLinkage(fn, LLVMInternalLinkage);
    } else {
@@ -1789,6 +1825,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
                                         t.iptr, "fsin");
       t.fs_out_base = LLVMBuildPtrToInt(t.b, LLVMGetParam(fn, 1),
                                         t.iptr, "fsout");
+      t.fs_texstate = LLVMGetParam(fn, 2);   /* gfx_sw_texstate_t* (§5 SW tex) */
    }
 
    /* Compute-shader prologue: the workgroup's shared-memory base, read
