@@ -18,6 +18,8 @@
  */
 
 #include "vp_raster.h"
+#include "vp_launch.h"           /* struct vp_vertex_input (folded-in VS stage) */
+#include "vp_compile.h"          /* VP_STARTUP_VS link base */
 
 #include <vector>
 #include <new>
@@ -43,6 +45,12 @@ namespace graphics = vortex::graphics;
 
 /* sizeof(graphics::rast_prim_t): vec3e_t edges[3] + rast_attribs_t. */
 #define VP_RAST_PRIM_STRIDE 120
+
+/* Folded-in VS stage arg layout (mirrors vp_launch.c): arg slot 0 = VS output
+ * buffer device address, slot 1 = attribute table indexed by VS input
+ * driver_location with { device base, stride } entries. */
+#define VP_ARG_SLOTS        8
+#define VP_ATTR_TABLE_LOCS  8
 
 /* Hard error from the Vortex runtime — log as mesa_loge so the host /
  * test harness can detect it. Soft "feature not implemented" notices
@@ -162,9 +170,11 @@ vp_pool_ensure(vx_device_h dev, struct vp_raster_pool *pool,
 
 extern "C" bool
 vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
+               const void *vs_vxbin, size_t vs_vxbin_size,
                const void *fs_vxbin, size_t fs_vxbin_size,
-               uint64_t vsrec_addr, uint32_t vertex_count,
+               uint32_t vertex_count,
                const struct vp_vs_layout *layout,
+               const struct vp_vertex_input *vin,
                void *color, uint32_t width, uint32_t height,
                const struct vp_om_params *om,
                const struct vp_tex_params *tex)
@@ -179,8 +189,9 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       return false;
    }
 
-   /* The resident VS output (vsrec_addr) is expanded to setup_vertex_t
-    * on-device by expand_k below — no host readback or vertex expansion. */
+   /* The VS runs as stage 0 of this draw (below): its output buffer is sized
+    * + allocated here and consumed in-place by expand_k — no separate
+    * host-blocking VS launch, no readback, no host vertex expansion. */
 
    /* ---- dense tile grid, sized from the framebuffer ------------------- *
     * Bins == RASTER tiles, so the grid count (bin_cols*bin_rows) is the
@@ -209,12 +220,15 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
    bool ok = false;
    vx_queue_h  q     = NULL;
-   vx_module_h femod = NULL, kmod = NULL;
-   vx_kernel_h k_expand = NULL, k_setup = NULL, k_binning = NULL, kbuf = NULL;
+   vx_module_h femod = NULL, kmod = NULL, vsmod = NULL;
+   vx_kernel_h k_expand = NULL, k_setup = NULL, k_binning = NULL, kbuf = NULL,
+               k_vs = NULL;
 
    /* The front-end resident buffer set lives in the persistent pool; only the
-    * per-draw colour/depth/texture buffers are owned here. */
+    * per-draw VS-output / colour / depth / texture / vertex-input buffers are
+    * owned here. */
    vx_buffer_h cbuf = NULL, zbuf = NULL, xbuf = NULL;
+   vx_buffer_h vsbuf = NULL, vbuf = NULL, tbuf = NULL;
 
    char vxpath[] = "/tmp/vortexpipe-fs.XXXXXX";
    int  vxfd = -1;
@@ -255,6 +269,38 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       VP_CHECK(vx_module_get_kernel(femod, "binning_k", &k_binning),
                "vx_module_get_kernel(binning_k)");
 
+      /* VS stage 0: load the vertex shader (linked at VP_STARTUP_VS so it
+       * co-resides with the FS@0x80000000 + front end@0x80200000 — three
+       * distinct 2 MB slots) and size its resident output buffer. The VS runs
+       * first in this draw's OP_DRAW, then expand_k consumes its output. */
+      VP_CHECK(vx_module_load_bytes(dev, vs_vxbin, vs_vxbin_size, &vsmod),
+               "vx_module_load_bytes(vs)");
+      VP_CHECK(vx_module_get_kernel(vsmod, "main", &k_vs),
+               "vx_module_get_kernel(vs)");
+
+      uint64_t nt = 1, nw = 1, nc = 1;
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt), "vx_device_query(NUM_THREADS)");
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,   &nw), "vx_device_query(NUM_WARPS)");
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES,   &nc), "vx_device_query(NUM_CORES)");
+
+      /* VS launch geometry: one thread per vertex, rounded up to fill warps and
+       * spread across cores (mirrors the former vp_launch_vs). The output is
+       * padded for the trailing CTA's out-of-bounds threads; expand_k reads
+       * only the first vertex_count records. */
+      const uint32_t vstride  = layout->stride;
+      const uint32_t cta_max  = (uint32_t)(nt * nw);
+      uint32_t vs_block = (vertex_count + (uint32_t)nt - 1u) / (uint32_t)nt
+                        * (uint32_t)nt;
+      if (vs_block > cta_max) vs_block = cta_max;
+      if (vs_block == 0)      vs_block = (uint32_t)nt;
+      const uint32_t vs_grid    = (vertex_count + vs_block - 1u) / vs_block;
+      const uint32_t vs_threads = vs_grid * vs_block;
+      const uint32_t vsout_bytes = vs_threads * vstride;
+      VP_CHECK(vx_buffer_create(dev, vsout_bytes ? vsout_bytes : 1, 0, &vsbuf),
+               "vx_buffer_create(vsout)");
+      uint64_t vs_out_dev = 0;
+      VP_CHECK(vx_buffer_address(vsbuf, &vs_out_dev), "vx_buffer_address(vsout)");
+
       /* device-filling launch geometry: T = per-CTA threads, G = grid. */
       uint32_t one = 1, gdim[1] = { 1 }, bdim[1] = { 1 };
       VP_CHECK(vx_device_max_occupancy_grid(dev, 1, &one, gdim, bdim),
@@ -283,7 +329,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
        * records into the setup_vertex_t[] the front end consumes
        * (arg.verts_addr). */
       expand_arg_t earg{};
-      earg.vsrec_addr   = vsrec_addr;
+      earg.vsrec_addr   = vs_out_dev;        /* the folded-in VS stage's output */
       earg.verts_addr   = arg.verts_addr;
       earg.num_verts    = vertex_count;
       earg.vstride      = layout->stride;
@@ -339,19 +385,48 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                                    0, NULL, NULL), "vx_enqueue_write(tex)");
       }
 
-      /* FS launch fills every HW lane: block = threads × warps (one CTA/core),
-       * grid = cores. */
-      uint64_t nt = 1, nw = 1, nc = 1;
-      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt), "vx_device_query(NUM_THREADS)");
-      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS,   &nw), "vx_device_query(NUM_WARPS)");
-      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES,   &nc), "vx_device_query(NUM_CORES)");
+      /* VS vertex-input upload + attribute table (VS arg slot 1; slot 0 = VS
+       * output). The table is indexed by VS input driver_location. Both the
+       * table and the VS arg block are declared here so they outlive
+       * vx_enqueue_draw (async uploads + submit-time arg copy). */
+      uint32_t vs_attr_table[VP_ATTR_TABLE_LOCS * 2] = { 0 };
+      uint64_t vs_argblk[VP_ARG_SLOTS] = { 0 };
+      vs_argblk[0] = vs_out_dev;
+      if (vin && vin->num_attrs) {
+         VP_CHECK(vx_buffer_create(dev, vin->size, 0, &vbuf), "vx_buffer_create(vbuf)");
+         uint64_t vbuf_dev = 0;
+         VP_CHECK(vx_buffer_address(vbuf, &vbuf_dev), "vx_buffer_address(vbuf)");
+         VP_CHECK(vx_enqueue_write(q, vbuf, 0, vin->data, vin->size, 0, NULL, NULL),
+                  "vx_enqueue_write(vbuf)");
+         for (uint32_t i = 0; i < vin->num_attrs; i++) {
+            uint32_t loc = vin->attr_loc[i];
+            if (loc >= VP_ATTR_TABLE_LOCS) continue;
+            vs_attr_table[loc * 2 + 0] = (uint32_t)vbuf_dev + vin->base_offset
+                                       + vin->attr_offset[i];
+            vs_attr_table[loc * 2 + 1] = vin->attr_stride[i];
+         }
+         VP_CHECK(vx_buffer_create(dev, sizeof(vs_attr_table), 0, &tbuf),
+                  "vx_buffer_create(attrtab)");
+         uint64_t tbuf_dev = 0;
+         VP_CHECK(vx_buffer_address(tbuf, &tbuf_dev), "vx_buffer_address(attrtab)");
+         VP_CHECK(vx_enqueue_write(q, tbuf, 0, vs_attr_table, sizeof(vs_attr_table),
+                                   0, NULL, NULL), "vx_enqueue_write(attrtab)");
+         vs_argblk[1] = tbuf_dev;
+      }
 
-      /* Launch descriptors + per-stage args. These must outlive
-       * vx_enqueue_commands (the runtime copies them at submit). */
+      /* FS launch fills every HW lane: block = threads × warps (one CTA/core),
+       * grid = cores. (nt/nw/nc queried above for the VS geometry.)
+       * Launch descriptors + per-stage args must outlive vx_enqueue_draw
+       * (the runtime copies them at submit). */
       const uint32_t NSTAGE = 9;
       const uint32_t sgrid[NSTAGE] = { G, 1, G,  G, 1, G,  G, 1, G };
       pipe_arg_t       kargs[NSTAGE];
-      vx_launch_info_t eli{}, li[NSTAGE], fli{};
+      vx_launch_info_t vsli{}, eli{}, li[NSTAGE], fli{};
+
+      /* stage 0: vertex shader (one thread per vertex). */
+      vsli.struct_size = sizeof(vsli); vsli.kernel = k_vs;
+      vsli.args_host = vs_argblk; vsli.args_size = sizeof(vs_argblk);
+      vsli.ndim = 1; vsli.grid_dim[0] = vs_grid; vsli.block_dim[0] = vs_block;
 
       eli.struct_size = sizeof(eli); eli.kernel = k_expand;
       eli.args_host = &earg; eli.args_size = sizeof(earg);
@@ -392,6 +467,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          c.data.dcr.addr = a; c.data.dcr.value = v; cmds.push_back(c);
       };
 
+      LAUNCH(&vsli);   /* stage 0: vertex shader (folded into the draw) */
       LAUNCH(&eli);
       for (uint32_t s = 0; s < NSTAGE; ++s) LAUNCH(&li[s]);
 
@@ -451,16 +527,22 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
 done:
    /* the front-end working set is pool-owned and persists; only the per-draw
-    * colour / depth / texture buffers are released here. */
+    * VS-output / colour / depth / texture / vertex-input buffers are released
+    * here. */
+   if (tbuf) vx_buffer_release(tbuf);
+   if (vbuf) vx_buffer_release(vbuf);
    if (xbuf) vx_buffer_release(xbuf);
    if (zbuf) vx_buffer_release(zbuf);
    if (cbuf) vx_buffer_release(cbuf);
+   if (vsbuf) vx_buffer_release(vsbuf);
    if (k_binning) vx_kernel_release(k_binning);
    if (k_setup)   vx_kernel_release(k_setup);
    if (k_expand)  vx_kernel_release(k_expand);
+   if (k_vs)      vx_kernel_release(k_vs);
    if (kbuf)      vx_kernel_release(kbuf);
    if (femod)     vx_module_release(femod);
    if (kmod)      vx_module_release(kmod);
+   if (vsmod)     vx_module_release(vsmod);
    if (q)         vx_queue_release(q);
    unlink(vxpath);
    return ok;

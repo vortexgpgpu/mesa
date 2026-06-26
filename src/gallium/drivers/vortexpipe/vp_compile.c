@@ -85,7 +85,8 @@ vp_xlen_is_64(void)
 }
 
 bool
-vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
+vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
+                 void **out_blob, size_t *out_size)
 {
    *out_blob = NULL;
    *out_size = 0;
@@ -155,7 +156,7 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
             "-fdata-sections -ffunction-sections -fuse-ld=lld "
             "%s "
             "-Wl,-Bstatic,--gc-sections,-T,%s/sw/kernel/scripts/%s,"
-            "--defsym=STARTUP_ADDR=0x80000000 "
+            "--defsym=STARTUP_ADDR=0x%llx "
             "%s/sw/kernel/libvortex2.a "
             "-L%s/%s/lib -lm -lc "
             "%s/%s/lib/baremetal/%s "
@@ -166,6 +167,7 @@ vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size)
             march, mabi,
             p_ll,
             vh, linker,
+            startup_addr,
             bd,
             td, libc,
             td, libcrt, crt_a,

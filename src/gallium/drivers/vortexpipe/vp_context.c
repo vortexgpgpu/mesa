@@ -119,7 +119,7 @@ vp_create_compute_state(struct pipe_context *pipe,
       vp_scan_descriptors((struct nir_shader *)state->prog,
                           cso->descs, &cso->num_descs);
       if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL)) {
-         if (vp_compile_vxbin(ir, &cso->vxbin, &cso->vxbin_size))
+         if (vp_compile_vxbin(ir, VP_STARTUP_FS, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
                       cso->vxbin_size);
          else
@@ -300,7 +300,9 @@ vp_create_vs_state(struct pipe_context *pipe,
       char *ir = NULL;
       if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir,
                          &cso->vs_layout)) {
-         if (vp_compile_vxbin(ir, &cso->vxbin, &cso->vxbin_size))
+         /* VS links at a distinct base so it co-resides with the FS
+          * (0x80000000) + front end (0x80200000) in one OP_DRAW. */
+         if (vp_compile_vxbin(ir, VP_STARTUP_VS, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled vertex shader -> %zu-byte .vxbin",
                    cso->vxbin_size);
          else
@@ -357,7 +359,7 @@ vp_create_fs_state(struct pipe_context *pipe,
    if (state->type == PIPE_SHADER_IR_NIR) {
       char *ir = NULL;
       if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir, NULL)) {
-         if (vp_compile_vxbin(ir, &cso->vxbin, &cso->vxbin_size))
+         if (vp_compile_vxbin(ir, VP_STARTUP_FS, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled fragment shader -> %zu-byte .vxbin",
                    cso->vxbin_size);
          else
@@ -944,139 +946,135 @@ vp_draw_vbo(struct pipe_context *pipe,
       bool vin_ok = !vs->vs_layout.needs_vertex_input ||
                     vp_gather_vertex_input(pipe, vp, draws, &vin, &vxfer);
 
-      /* Run the VS on Vortex; keep its transformed output resident so the
-       * on-device front end consumes it with no host round-trip. */
-      vx_buffer_h vsbuf  = NULL;
-      uint64_t    vsaddr = 0;
-      bool vs_ok = vin_ok &&
-         vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
-                      count, count * stride,
-                      vs->vs_layout.needs_vertex_input ? &vin : NULL,
-                      &vsbuf, &vsaddr);
-      if (vxfer)
-         pipe_buffer_unmap(pipe, vxfer);
+      /* Decide the hardware-raster path up front (caps only, no VS needed) so
+       * the supported path can fold the VS into the device draw. The hardware
+       * RASTER + OM + (optional) TEX path needs the matching ISA extensions —
+       * a compute-only build traps on the first vx_rast/vx_om/vx_tex — so gate
+       * on the cached caps; VORTEXPIPE_SW_RASTER forces the llvmpipe fallback. */
+      static int sw_raster = -1;
+      if (sw_raster < 0)
+         sw_raster = getenv("VORTEXPIPE_SW_RASTER") != NULL;
+      struct vp_screen *vps = vp_reg_get(pipe->screen);
+      bool gfx_hw = vps && vps->has_raster && vps->has_om;
+      bool tex_needed = vp->cur_tex != NULL;
+      if (gfx_hw && tex_needed && !vps->has_tex) {
+         mesa_logw("vortexpipe: draw_vbo: device lacks TEX extension; "
+                   "fragment shader needs a sampler — skipping hardware "
+                   "RASTER+OM path");
+         gfx_hw = false;
+      }
+      bool hw_path = vin_ok && !sw_raster && gfx_hw && fs && fs->vxbin &&
+                     vp->fb_color && vp->fb_width && vp->fb_height;
 
-      if (vs_ok) {
-         /* VORTEXPIPE_SW_RASTER forces the Phase 3 llvmpipe-raster
-          * path; otherwise rasterize on the Vortex RASTER unit. */
-         static int sw_raster = -1;
-         if (sw_raster < 0)
-            sw_raster = getenv("VORTEXPIPE_SW_RASTER") != NULL;
+      /* Vortex hardware raster + OM path: the VS is folded into the draw —
+       * vp_raster_draw runs it as stage 0, so the whole VS→setup→bin→FF→FS
+       * draw is one device-orchestrated OP_DRAW with NO host round-trip (no
+       * separate host-blocking VS launch). */
+      if (hw_path) {
+         uint32_t w = vp->fb_width, h = vp->fb_height;
 
-         /* The hardware RASTER + OM + (optional) TEX path requires the
-          * matching ISA extensions to be present on the device — a
-          * compute-only build will trap on the first vx_rast/vx_om/
-          * vx_tex it executes. Gate the path on the cached caps so a
-          * stripped-down device falls back to llvmpipe rasterization
-          * (the Phase 3 path below) without crashing the kernel. */
-         struct vp_screen *vps = vp_reg_get(pipe->screen);
-         bool gfx_hw = vps && vps->has_raster && vps->has_om;
-         bool tex_needed = vp->cur_tex != NULL;
-         if (gfx_hw && tex_needed && !vps->has_tex) {
-            mesa_logw("vortexpipe: draw_vbo: device lacks TEX extension; "
-                      "fragment shader needs a sampler — skipping hardware "
-                      "RASTER+OM path");
-            gfx_hw = false;
+         /* gather the OM state from the bound depth/blend csos */
+         struct vp_om_params om = { 0 };
+         if (vp->cur_dsa) {
+            om.depth_test  = vp->cur_dsa->depth_test;
+            om.depth_func  = vp->cur_dsa->depth_func;
+            om.depth_write = vp->cur_dsa->depth_write;
+         }
+         if (vp->cur_blend) {
+            om.blend_mode = vp->cur_blend->blend_mode;
+            om.blend_func = vp->cur_blend->blend_func;
+            om.colormask  = vp->cur_blend->colormask;
+         } else {
+            /* no blend cso bound: passthrough (src*ONE + dst*ZERO) */
+            om.blend_mode = (VX_OM_BLEND_MODE_ADD << 16)
+                          | VX_OM_BLEND_MODE_ADD;
+            om.blend_func = (VX_OM_BLEND_FUNC_ZERO << 24)
+                          | (VX_OM_BLEND_FUNC_ZERO << 16)
+                          | (VX_OM_BLEND_FUNC_ONE  << 8)
+                          | (VX_OM_BLEND_FUNC_ONE  << 0);
+            om.colormask  = 0xf;
          }
 
-         /* Vortex hardware raster + OM path: round-trip the colour
-          * attachment through the RASTER unit + fragment kernel; the
-          * OM unit depth-tests and blends. */
-         if (!sw_raster && gfx_hw && fs && fs->vxbin &&
-             vp->fb_color && vp->fb_width && vp->fb_height) {
-            uint32_t w = vp->fb_width, h = vp->fb_height;
-
-            /* gather the OM state from the bound depth/blend csos */
-            struct vp_om_params om = { 0 };
-            if (vp->cur_dsa) {
-               om.depth_test  = vp->cur_dsa->depth_test;
-               om.depth_func  = vp->cur_dsa->depth_func;
-               om.depth_write = vp->cur_dsa->depth_write;
-            }
-            if (vp->cur_blend) {
-               om.blend_mode = vp->cur_blend->blend_mode;
-               om.blend_func = vp->cur_blend->blend_func;
-               om.colormask  = vp->cur_blend->colormask;
-            } else {
-               /* no blend cso bound: passthrough (src*ONE + dst*ZERO) */
-               om.blend_mode = (VX_OM_BLEND_MODE_ADD << 16)
-                             | VX_OM_BLEND_MODE_ADD;
-               om.blend_func = (VX_OM_BLEND_FUNC_ZERO << 24)
-                             | (VX_OM_BLEND_FUNC_ZERO << 16)
-                             | (VX_OM_BLEND_FUNC_ONE  << 8)
-                             | (VX_OM_BLEND_FUNC_ONE  << 0);
-               om.colormask  = 0xf;
-            }
-
-            /* gather the bound texture for TEX stage 0, if any. The
-             * sampler-view image is read back to a tight host buffer
-             * (vp_raster_draw converts + uploads it); gfx-v1 supports
-             * a single power-of-two 2D texture. */
-            struct vp_tex_params tex = { 0 };
-            void *tex_px = NULL;
-            if (vp->cur_tex) {
-               uint32_t tw = vp->cur_tex->width0;
-               uint32_t th = vp->cur_tex->height0;
-               if (tw && th && !(tw & (tw - 1)) && !(th & (th - 1))) {
-                  tex_px = malloc((size_t)tw * th * 4);
-                  if (tex_px &&
-                      vp_resource_rw(pipe, vp->cur_tex, tw, th, tex_px,
-                                     false)) {
-                     tex.pixels = tex_px;
-                     tex.width  = tw;
-                     tex.height = th;
-                     tex.filter = vp->cur_sampler ? vp->cur_sampler->filter
-                                                  : VX_TEX_FILTER_POINT;
-                     tex.wrap_u = vp->cur_sampler ? vp->cur_sampler->wrap_u
-                                                  : VX_TEX_WRAP_CLAMP;
-                     tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
-                                                  : VX_TEX_WRAP_CLAMP;
-                  } else {
-                     free(tex_px);
-                     tex_px = NULL;
-                  }
+         /* gather the bound texture for TEX stage 0, if any (power-of-two 2D). */
+         struct vp_tex_params tex = { 0 };
+         void *tex_px = NULL;
+         if (vp->cur_tex) {
+            uint32_t tw = vp->cur_tex->width0;
+            uint32_t th = vp->cur_tex->height0;
+            if (tw && th && !(tw & (tw - 1)) && !(th & (th - 1))) {
+               tex_px = malloc((size_t)tw * th * 4);
+               if (tex_px &&
+                   vp_resource_rw(pipe, vp->cur_tex, tw, th, tex_px, false)) {
+                  tex.pixels = tex_px;
+                  tex.width  = tw;
+                  tex.height = th;
+                  tex.filter = vp->cur_sampler ? vp->cur_sampler->filter
+                                               : VX_TEX_FILTER_POINT;
+                  tex.wrap_u = vp->cur_sampler ? vp->cur_sampler->wrap_u
+                                               : VX_TEX_WRAP_CLAMP;
+                  tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
+                                               : VX_TEX_WRAP_CLAMP;
                } else {
-                  mesa_logw("vortexpipe: draw_vbo: non-power-of-two "
-                            "texture %ux%u unsupported (gfx-v1)", tw, th);
+                  free(tex_px);
+                  tex_px = NULL;
                }
+            } else {
+               mesa_logw("vortexpipe: draw_vbo: non-power-of-two "
+                         "texture %ux%u unsupported (gfx-v1)", tw, th);
             }
-
-            void *cbuf = malloc((size_t)w * h * 4);
-            if (cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
-                vp_raster_draw(vp->dev, vp->raster_pool, fs->vxbin, fs->vxbin_size,
-                               vsaddr, count, &vs->vs_layout,
-                               cbuf, w, h, &om, tex_px ? &tex : NULL) &&
-                vp_fb_color_write(pipe, vp, cbuf)) {
-               vp_dbg("vortexpipe: draw_vbo -> Vortex RASTER+OM "
-                      "(%u verts, %ux%u, depth_test=%d, textured=%d)",
-                      count, w, h, om.depth_test, tex_px != NULL);
-               free(tex_px);
-               free(cbuf);
-               vx_buffer_release(vsbuf);
-               return;
-            }
-            free(tex_px);
-            free(cbuf);
          }
 
-         /* fallback: VS on Vortex, rasterization on llvmpipe — read the
-          * resident VS output back to a host vertex buffer for llvmpipe. */
-         void *xverts = malloc((size_t)count * stride);
-         if (xverts &&
-             vp_buffer_readback(vp->dev, vsbuf, xverts,
-                                (uint32_t)((size_t)count * stride)) &&
-             vp_draw_passthrough(vp, pipe, info, drawid_offset,
-                                 xverts, count)) {
-            vp_dbg("vortexpipe: draw_vbo ran the %u-vertex VS on Vortex "
-                   "(llvmpipe raster)", count);
-            free(xverts);
-            vx_buffer_release(vsbuf);
+         void *cbuf = malloc((size_t)w * h * 4);
+         bool drew = cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
+             vp_raster_draw(vp->dev, vp->raster_pool,
+                            vs->vxbin, vs->vxbin_size,
+                            fs->vxbin, fs->vxbin_size,
+                            count, &vs->vs_layout,
+                            vs->vs_layout.needs_vertex_input ? &vin : NULL,
+                            cbuf, w, h, &om, tex_px ? &tex : NULL) &&
+             vp_fb_color_write(pipe, vp, cbuf);
+         if (drew)
+            vp_dbg("vortexpipe: draw_vbo -> Vortex VS+RASTER+OM (one OP_DRAW) "
+                   "(%u verts, %ux%u, depth_test=%d, textured=%d)",
+                   count, w, h, om.depth_test, tex_px != NULL);
+         free(tex_px);
+         free(cbuf);
+         if (drew) {
+            if (vxfer) pipe_buffer_unmap(pipe, vxfer);
             return;
          }
-         free(xverts);
+         /* hw path failed → fall through to VS-on-Vortex + llvmpipe raster */
       }
-      if (vsbuf)
-         vx_buffer_release(vsbuf);
+
+      /* fallback: run the VS on Vortex as a standalone launch, read its output
+       * back to a host vertex buffer and rasterize on llvmpipe (unsupported
+       * state / no hardware raster). */
+      if (vin_ok) {
+         vx_buffer_h vsbuf  = NULL;
+         uint64_t    vsaddr = 0;
+         if (vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
+                          count, count * stride,
+                          vs->vs_layout.needs_vertex_input ? &vin : NULL,
+                          &vsbuf, &vsaddr)) {
+            void *xverts = malloc((size_t)count * stride);
+            if (xverts &&
+                vp_buffer_readback(vp->dev, vsbuf, xverts,
+                                   (uint32_t)((size_t)count * stride)) &&
+                vp_draw_passthrough(vp, pipe, info, drawid_offset,
+                                    xverts, count)) {
+               vp_dbg("vortexpipe: draw_vbo ran the %u-vertex VS on Vortex "
+                      "(llvmpipe raster)", count);
+               free(xverts);
+               vx_buffer_release(vsbuf);
+               if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+               return;
+            }
+            free(xverts);
+            if (vsbuf) vx_buffer_release(vsbuf);
+         }
+      }
+      if (vxfer)
+         pipe_buffer_unmap(pipe, vxfer);
    }
 
    /* inherit-and-accelerate fallback */

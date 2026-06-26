@@ -25,6 +25,9 @@
 extern "C" {
 #endif
 
+/* The vertex-buffer geometry feeding the VS stage (defined in vp_launch.h). */
+struct vp_vertex_input;
+
 /* Persistent front-end working set (§6.6): the binning pipeline's resident
  * buffer set, laid out once over VX_MEM_PHYS and reused across the frame's
  * draws (grown on demand) instead of allocated per draw. Owned by the
@@ -56,15 +59,21 @@ struct vp_tex_params {
    uint32_t    wrap_v;
 };
 
-/* Rasterize the Vortex-VS-transformed vertices on the hardware RASTER
- * unit and shade them with the fragment-shader kernel `fs_vxbin`; the
- * kernel submits fragments to the OM unit, which depth-tests, blends
- * and writes the colour buffer.
+/* Run the WHOLE draw as one device-orchestrated command: the vertex shader
+ * `vs_vxbin` is stage 0 of the draw program (linked at VP_STARTUP_VS so it
+ * co-resides with the FS + front end), so its transformed output is consumed
+ * by the on-device front end (expand_k) with no host round-trip — the VS no
+ * longer runs as a separate host-blocking launch. The hardware RASTER unit
+ * walks the binned primitives and `fs_vxbin` shades them; the OM unit
+ * depth-tests, blends and writes the colour buffer.
  *
- *   vsrec_addr    device address of the resident VS output: vertex_count
- *                 records of layout->stride bytes, slot 0 the clip-space
- *                 gl_Position, slots 1.. the varyings. expand_k turns these
- *                 into setup_vertex_t on-device (no host round-trip).
+ *   vs_vxbin      the compiled vertex shader; launched as stage 0, one thread
+ *                 per vertex, writing layout->stride-byte records expand_k
+ *                 consumes. VS->setup->bin->FF->FS is one OP_DRAW.
+ *   vertex_count  vertices in the draw (3 per triangle).
+ *   layout        VS output record layout (stride + varyings) for expand_k.
+ *   vin           vertex-buffer geometry the VS fetches inputs from, or NULL
+ *                 for a self-contained VS (gl_VertexIndex only).
  *   color         a width*height R8G8B8A8 host buffer -- on entry the
  *                 cleared framebuffer, on return the rendered image.
  *   om            depth/blend state for the OM unit.
@@ -74,9 +83,11 @@ struct vp_tex_params {
  * Returns true on success; false leaves `color` untouched so the
  * caller can fall back. */
 bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
+                    const void *vs_vxbin, size_t vs_vxbin_size,
                     const void *fs_vxbin, size_t fs_vxbin_size,
-                    uint64_t vsrec_addr, uint32_t vertex_count,
+                    uint32_t vertex_count,
                     const struct vp_vs_layout *layout,
+                    const struct vp_vertex_input *vin,
                     void *color, uint32_t width, uint32_t height,
                     const struct vp_om_params *om,
                     const struct vp_tex_params *tex);

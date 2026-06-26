@@ -16,10 +16,19 @@ extern "C" {
 #endif
 
 /* Compile LLVM-IR text (a Vortex KMU kernel module, as produced by
- * vp_nir_to_llvm) into a Vortex .vxbin image. On success returns
- * true and stores a malloc'd blob + size in *out_blob / *out_size;
- * release it with vp_free_blob(). */
-bool vp_compile_vxbin(const char *llvm_ir, void **out_blob, size_t *out_size);
+ * vp_nir_to_llvm) into a Vortex .vxbin image linked at `startup_addr`.
+ * On success returns true and stores a malloc'd blob + size in
+ * *out_blob / *out_size; release it with vp_free_blob().
+ *
+ * `startup_addr` is the device VMA the kernel image is linked at. Stages
+ * that co-reside in one device-orchestrated draw must use distinct bases so
+ * their images don't overlap: VP_STARTUP_FS (0x80000000) for the fragment
+ * shader / compute, VP_STARTUP_VS (0x80400000) for the vertex shader (the
+ * embedded front end already occupies 0x80200000). */
+#define VP_STARTUP_FS  0x80000000ull
+#define VP_STARTUP_VS  0x80400000ull
+bool vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
+                      void **out_blob, size_t *out_size);
 
 void vp_free_blob(void *blob);
 
