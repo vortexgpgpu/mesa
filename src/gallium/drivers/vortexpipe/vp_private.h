@@ -78,6 +78,13 @@ struct vp_cso {
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
    struct vp_desc descs[VP_MAX_DESCS];  /* set-0 descriptors the kernel uses */
    unsigned        num_descs;
+   /* §6.6 residency: the vxbin loaded onto the device once and reused across
+    * draws (compile-once + upload-resident-once — no per-draw module reload,
+    * no /tmp round-trip). Lazily loaded by vp_raster_draw, released on delete.
+    * Same-stage CSOs share one device address, so binding a different VS/FS
+    * evicts the previously-resident one (vp_bind_vs_state / vp_bind_fs_state). */
+   vx_module_h vx_module;
+   vx_kernel_h vx_kernel;
 };
 
 /* Captured + VX-encoded output-merger state (Phase 5). create_*_state

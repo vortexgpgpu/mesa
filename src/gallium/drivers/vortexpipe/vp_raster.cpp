@@ -88,6 +88,11 @@ struct vp_raster_pool {
    uint32_t    cap_bins;
    uint32_t    cap_keys;
    uint32_t    cap_T;
+   /* §6.6 residency: the embedded front end (expand/setup/binning) loaded onto
+    * the device once and reused across every draw (it never changes), instead
+    * of reloaded per draw. */
+   vx_module_h fe_module;
+   vx_kernel_h k_expand, k_setup, k_binning;
 };
 
 extern "C" struct vp_raster_pool *
@@ -103,6 +108,10 @@ vp_raster_pool_destroy(struct vp_raster_pool *pool)
       return;
    for (vx_buffer_h b : pool->bufs)
       if (b) vx_buffer_release(b);
+   if (pool->k_binning) vx_kernel_release(pool->k_binning);
+   if (pool->k_setup)   vx_kernel_release(pool->k_setup);
+   if (pool->k_expand)  vx_kernel_release(pool->k_expand);
+   if (pool->fe_module) vx_module_release(pool->fe_module);
    delete pool;
 }
 
@@ -171,7 +180,9 @@ vp_pool_ensure(vx_device_h dev, struct vp_raster_pool *pool,
 extern "C" bool
 vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                const void *vs_vxbin, size_t vs_vxbin_size,
+               vx_module_h *vs_module_io, vx_kernel_h *vs_kernel_io,
                const void *fs_vxbin, size_t fs_vxbin_size,
+               vx_module_h *fs_module_io, vx_kernel_h *fs_kernel_io,
                uint32_t vertex_count,
                const struct vp_vs_layout *layout,
                const struct vp_vertex_input *vin,
@@ -220,9 +231,6 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
    bool ok = false;
    vx_queue_h  q     = NULL;
-   vx_module_h femod = NULL, kmod = NULL, vsmod = NULL;
-   vx_kernel_h k_expand = NULL, k_setup = NULL, k_binning = NULL, kbuf = NULL,
-               k_vs = NULL;
 
    /* The front-end resident buffer set lives in the persistent pool; only the
     * per-draw VS-output / colour / depth / texture / vertex-input buffers are
@@ -230,53 +238,53 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
    vx_buffer_h cbuf = NULL, zbuf = NULL, xbuf = NULL;
    vx_buffer_h vsbuf = NULL, vbuf = NULL, tbuf = NULL;
 
-   char vxpath[] = "/tmp/vortexpipe-fs.XXXXXX";
-   int  vxfd = -1;
-
-   vxfd = mkstemp(vxpath);
-   if (vxfd < 0) {
-      mesa_loge("vortexpipe: raster: mkstemp failed");
-      return false;
-   }
-   if (write(vxfd, fs_vxbin, fs_vxbin_size) != (ssize_t)fs_vxbin_size) {
-      mesa_loge("vortexpipe: raster: writing .vxbin failed");
-      close(vxfd);
-      unlink(vxpath);
-      return false;
-   }
-   close(vxfd);
+   /* kernels resolved from the residency caches below (the modules persist
+    * across draws — caller-owned VS/FS slots + the pool's front end). */
+   vx_kernel_h k_vs = NULL, kbuf = NULL, k_expand = NULL, k_setup = NULL,
+               k_binning = NULL;
 
    {
       vx_queue_info_t qi = { sizeof(qi), NULL, VX_QUEUE_PRIORITY_NORMAL, 0 };
       VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
 
-      /* Load BOTH code modules resident: the per-draw FS at the default
-       * STARTUP_ADDR (0x80000000) and the embedded front end at its distinct
-       * base (kernels/gfx_frontend linked at 0x80200000). Co-residence lets
-       * one CP command batch sequence expand -> setup -> binning -> raster ->
-       * FS with no host module swap between stages (§6.4). */
-      VP_CHECK(vx_module_load_file(dev, vxpath, &kmod), "vx_module_load_file(fs)");
-      VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf), "vx_module_get_kernel(fs)");
+      /* §6.6 residency: load each code module onto the device ONCE and reuse it
+       * across draws. The FS (0x80000000), VS (VP_STARTUP_VS=0x80400000) and the
+       * embedded front end (0x80200000) co-reside in three distinct slots, so
+       * one OP_DRAW sequences VS -> expand -> setup -> binning -> raster -> FS
+       * with no host module swap. The VS/FS modules cache in caller-owned CSO
+       * slots (*_module_io); the front end caches on the pool. compile-once,
+       * upload-resident-once — no /tmp round-trip, no per-draw reload. */
+      if (*fs_module_io == NULL) {
+         VP_CHECK(vx_module_load_bytes(dev, fs_vxbin, fs_vxbin_size, fs_module_io),
+                  "vx_module_load_bytes(fs)");
+         VP_CHECK(vx_module_get_kernel(*fs_module_io, "main", fs_kernel_io),
+                  "vx_module_get_kernel(fs)");
+      }
+      kbuf = *fs_kernel_io;
 
-      size_t fe_size = 0;
-      const void *fe_bytes = vp_gfx_frontend_vxbin(&fe_size);
-      VP_CHECK(vx_module_load_bytes(dev, fe_bytes, fe_size, &femod),
-               "vx_module_load_bytes(frontend)");
-      VP_CHECK(vx_module_get_kernel(femod, "expand_k", &k_expand),
-               "vx_module_get_kernel(expand_k)");
-      VP_CHECK(vx_module_get_kernel(femod, "setup_k", &k_setup),
-               "vx_module_get_kernel(setup_k)");
-      VP_CHECK(vx_module_get_kernel(femod, "binning_k", &k_binning),
-               "vx_module_get_kernel(binning_k)");
+      if (*vs_module_io == NULL) {
+         VP_CHECK(vx_module_load_bytes(dev, vs_vxbin, vs_vxbin_size, vs_module_io),
+                  "vx_module_load_bytes(vs)");
+         VP_CHECK(vx_module_get_kernel(*vs_module_io, "main", vs_kernel_io),
+                  "vx_module_get_kernel(vs)");
+      }
+      k_vs = *vs_kernel_io;
 
-      /* VS stage 0: load the vertex shader (linked at VP_STARTUP_VS so it
-       * co-resides with the FS@0x80000000 + front end@0x80200000 — three
-       * distinct 2 MB slots) and size its resident output buffer. The VS runs
-       * first in this draw's OP_DRAW, then expand_k consumes its output. */
-      VP_CHECK(vx_module_load_bytes(dev, vs_vxbin, vs_vxbin_size, &vsmod),
-               "vx_module_load_bytes(vs)");
-      VP_CHECK(vx_module_get_kernel(vsmod, "main", &k_vs),
-               "vx_module_get_kernel(vs)");
+      if (pool->fe_module == NULL) {
+         size_t fe_size = 0;
+         const void *fe_bytes = vp_gfx_frontend_vxbin(&fe_size);
+         VP_CHECK(vx_module_load_bytes(dev, fe_bytes, fe_size, &pool->fe_module),
+                  "vx_module_load_bytes(frontend)");
+         VP_CHECK(vx_module_get_kernel(pool->fe_module, "expand_k", &pool->k_expand),
+                  "vx_module_get_kernel(expand_k)");
+         VP_CHECK(vx_module_get_kernel(pool->fe_module, "setup_k", &pool->k_setup),
+                  "vx_module_get_kernel(setup_k)");
+         VP_CHECK(vx_module_get_kernel(pool->fe_module, "binning_k", &pool->k_binning),
+                  "vx_module_get_kernel(binning_k)");
+      }
+      k_expand  = pool->k_expand;
+      k_setup   = pool->k_setup;
+      k_binning = pool->k_binning;
 
       uint64_t nt = 1, nw = 1, nc = 1;
       VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt), "vx_device_query(NUM_THREADS)");
@@ -526,24 +534,15 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
    }
 
 done:
-   /* the front-end working set is pool-owned and persists; only the per-draw
-    * VS-output / colour / depth / texture / vertex-input buffers are released
-    * here. */
+   /* the front-end working set + all code modules are resident (pool- or
+    * CSO-cached) and persist across draws; only the per-draw VS-output /
+    * colour / depth / texture / vertex-input buffers are released here. */
    if (tbuf) vx_buffer_release(tbuf);
    if (vbuf) vx_buffer_release(vbuf);
    if (xbuf) vx_buffer_release(xbuf);
    if (zbuf) vx_buffer_release(zbuf);
    if (cbuf) vx_buffer_release(cbuf);
    if (vsbuf) vx_buffer_release(vsbuf);
-   if (k_binning) vx_kernel_release(k_binning);
-   if (k_setup)   vx_kernel_release(k_setup);
-   if (k_expand)  vx_kernel_release(k_expand);
-   if (k_vs)      vx_kernel_release(k_vs);
-   if (kbuf)      vx_kernel_release(kbuf);
-   if (femod)     vx_module_release(femod);
-   if (kmod)      vx_module_release(kmod);
-   if (vsmod)     vx_module_release(vsmod);
    if (q)         vx_queue_release(q);
-   unlink(vxpath);
    return ok;
 }

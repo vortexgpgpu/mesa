@@ -82,9 +82,15 @@ struct vp_tex_params {
  *
  * Returns true on success; false leaves `color` untouched so the
  * caller can fall back. */
+/* The VS/FS module + kernel handles are cached across draws via the *_io
+ * pointers (the caller's CSO-resident slots): NULL on first use → loaded from
+ * the vxbin and stored back; reused thereafter (compile-once / upload-once, no
+ * /tmp round-trip). The front-end module is cached on `pool`. */
 bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                     const void *vs_vxbin, size_t vs_vxbin_size,
+                    vx_module_h *vs_module_io, vx_kernel_h *vs_kernel_io,
                     const void *fs_vxbin, size_t fs_vxbin_size,
+                    vx_module_h *fs_module_io, vx_kernel_h *fs_kernel_io,
                     uint32_t vertex_count,
                     const struct vp_vs_layout *layout,
                     const struct vp_vertex_input *vin,

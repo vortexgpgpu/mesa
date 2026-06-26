@@ -319,11 +319,27 @@ vp_create_vs_state(struct pipe_context *pipe,
    return cso;
 }
 
+/* §6.6 residency: release a CSO's device-resident module (its vxbin loaded
+ * onto the device). Frees the stage's fixed device address so a different
+ * same-stage shader can take it. Safe to call when nothing is resident. */
+static void
+vp_cso_evict_module(struct vp_cso *cso)
+{
+   if (!cso)
+      return;
+   if (cso->vx_kernel) { vx_kernel_release(cso->vx_kernel); cso->vx_kernel = NULL; }
+   if (cso->vx_module) { vx_module_release(cso->vx_module); cso->vx_module = NULL; }
+}
+
 static void
 vp_bind_vs_state(struct pipe_context *pipe, void *p)
 {
    struct vp_context *vp  = vp_reg_get(pipe);
    struct vp_cso     *cso = p;
+   /* The VS device address is fixed (VP_STARTUP_VS); evict the previously
+    * resident VS so the newly-bound one can load there on the next draw. */
+   if (vp->cur_vs && vp->cur_vs != cso)
+      vp_cso_evict_module(vp->cur_vs);
    vp->cur_vs = cso;
    vp->lp_bind_vs_state(pipe, cso ? cso->lp_cso : NULL);
 }
@@ -335,6 +351,7 @@ vp_delete_vs_state(struct pipe_context *pipe, void *p)
    struct vp_cso     *cso = p;
    if (vp->cur_vs == cso)
       vp->cur_vs = NULL;
+   vp_cso_evict_module(cso);
    vp->lp_delete_vs_state(pipe, cso->lp_cso);
    vp_free_blob(cso->vxbin);
    FREE(cso);
@@ -378,6 +395,10 @@ vp_bind_fs_state(struct pipe_context *pipe, void *p)
 {
    struct vp_context *vp  = vp_reg_get(pipe);
    struct vp_cso     *cso = p;
+   /* FS device address is fixed (VP_STARTUP_FS); evict the previously resident
+    * FS so the newly-bound one can load there on the next draw. */
+   if (vp->cur_fs && vp->cur_fs != cso)
+      vp_cso_evict_module(vp->cur_fs);
    vp->cur_fs = cso;
    vp->lp_bind_fs_state(pipe, cso ? cso->lp_cso : NULL);
 }
@@ -389,6 +410,7 @@ vp_delete_fs_state(struct pipe_context *pipe, void *p)
    struct vp_cso     *cso = p;
    if (vp->cur_fs == cso)
       vp->cur_fs = NULL;
+   vp_cso_evict_module(cso);
    vp->lp_delete_fs_state(pipe, cso->lp_cso);
    vp_free_blob(cso->vxbin);
    FREE(cso);
@@ -1028,7 +1050,9 @@ vp_draw_vbo(struct pipe_context *pipe,
          bool drew = cbuf && vp_fb_color_read(pipe, vp, cbuf) &&
              vp_raster_draw(vp->dev, vp->raster_pool,
                             vs->vxbin, vs->vxbin_size,
+                            &vs->vx_module, &vs->vx_kernel,
                             fs->vxbin, fs->vxbin_size,
+                            &fs->vx_module, &fs->vx_kernel,
                             count, &vs->vs_layout,
                             vs->vs_layout.needs_vertex_input ? &vin : NULL,
                             cbuf, w, h, &om, tex_px ? &tex : NULL) &&
