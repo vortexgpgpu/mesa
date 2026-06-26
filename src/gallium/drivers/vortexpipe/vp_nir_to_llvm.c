@@ -65,6 +65,12 @@
  * [2+axis*4+corner]=bcoord. Base slot matches RTL VX_gfx_window_pkg
  * GFXW_FRAG_SLOT_BASE and the kernel ABI VX_GFX_FRAG_SLOT_BASE. */
 #define VP_FRAG_SLOT_BASE       8
+/* gfx-window slot allocation for the FS (disjoint from the frag payload 8..21):
+ *   OM quad staging  : color[0..3] @ 0..3, depth[0..3] @ 4..7
+ *   TEX windowed I/O : u @ 22, v @ 23, texel @ 24 */
+#define VP_OM_SLOT_BASE         0
+#define VP_TEX_IN_SLOT          22
+#define VP_TEX_OUT_SLOT         24
 
 /* vortex::graphics::rast_prim_t layout (sw/kernel/include/vx_graphics.h,
  * FIXEDPOINT):
@@ -928,22 +934,66 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    }
 }
 
-/* vx_tex(): sample TEX stage 0 (custom-1, funct3=1, R4-type, funct2=
- * stage). Returns the filtered texel as a packed A8R8G8B8 word. */
-static LLVMValueRef
-emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
-            LLVMValueRef lod)
+/* vx_gfx_set(slot, val): write one gfx-window slot (SETW, custom-1 funct3=6
+ * funct2=1; slot in funct7[6:2], value in rs1, no rd). */
+static void
+emit_vx_gfx_set(struct vp_tr *t, unsigned slot, LLVMValueRef val)
 {
-   const char *s = ".insn r4 43, 1, 0, $0, $1, $2, $3";
-   LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 3, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r,r,r", 8,
+   char s[48];
+   snprintf(s, sizeof s, ".insn r 43, 6, %u, x0, $0, x0", (slot << 2) | 1u);
+   LLVMTypeRef args[1] = { t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                       args, 1, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r", 1,
                                       /*HasSideEffects*/ true,
                                       /*IsAlignStack*/ false,
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
-   LLVMValueRef a[3] = { u, v, lod };
-   return LLVMBuildCall2(t->b, fnty, ia, a, 3, "tex");
+   LLVMValueRef a[1] = { val };
+   LLVMBuildCall2(t->b, fnty, ia, a, 1, "");
+}
+
+/* vx_gfx_get_after(slot, handle): read one gfx-window slot into rd (single-slot
+ * GETW, custom-1 funct3=6 funct2=3, count=1 via rs2=x1), chained on `handle`
+ * (rs1) so the scoreboard stalls the read until the producer wrote the slot. */
+static LLVMValueRef
+emit_vx_gfx_get_after(struct vp_tr *t, unsigned slot, LLVMValueRef handle)
+{
+   char s[48];
+   snprintf(s, sizeof s, ".insn r 43, 6, %u, $0, $1, x1", (slot << 2) | 3u);
+   LLVMTypeRef args[1] = { t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r", 4,
+                                      /*HasSideEffects*/ true,
+                                      /*IsAlignStack*/ false,
+                                      LLVMInlineAsmDialectATT,
+                                      /*CanThrow*/ false);
+   LLVMValueRef a[1] = { handle };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "texw");
+}
+
+/* vx_tex4_single: sample TEX stage 0 on the gfx window (custom-1 funct3=5,
+ * R-type; funct7={out_slot<<2|stage<<1|mode}, mode=0 single, stage=0). Stage
+ * u,v into the window, issue the sample (rd=sync handle, rs1=lod, rs2=in_slot),
+ * read the texel back handle-chained. Returns the packed A8R8G8B8 texel. */
+static LLVMValueRef
+emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
+            LLVMValueRef lod)
+{
+   emit_vx_gfx_set(t, VP_TEX_IN_SLOT,     u);
+   emit_vx_gfx_set(t, VP_TEX_IN_SLOT + 1, v);
+   char s[48];
+   snprintf(s, sizeof s, ".insn r 43, 5, %u, $0, $1, $2", VP_TEX_OUT_SLOT << 2);
+   LLVMTypeRef args[2] = { t->i32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 2, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r,r", 6,
+                                      /*HasSideEffects*/ true,
+                                      /*IsAlignStack*/ false,
+                                      LLVMInlineAsmDialectATT,
+                                      /*CanThrow*/ false);
+   LLVMValueRef a[2] = { lod, LLVMConstInt(t->i32, VP_TEX_IN_SLOT, false) };
+   LLVMValueRef handle = LLVMBuildCall2(t->b, fnty, ia, a, 2, "texh");
+   return emit_vx_gfx_get_after(t, VP_TEX_OUT_SLOT, handle);
 }
 
 /* ── RTU (ray-tracing unit) ops — ISA v2 window ABI ──────────────────
@@ -1427,24 +1477,25 @@ emit_vx_rast_begin(struct vp_tr *t)
    LLVMBuildCall2(t->b, fnty, ia, NULL, 0, "");
 }
 
-/* vx_om: submit a fragment to the output-merger unit (custom-1,
- * funct3=2, R4-type). pos_face = (y<<16)|(x<<1)|face; the OM does
- * depth/stencil/blend and writes the colour + depth buffers. */
+/* vx_om4: submit a 2x2 quad to the output-merger unit (custom-1 funct3=2,
+ * R-type, rd=x0 fire-and-forget). rs1=desc (cov_mask[3:0]|qx@[4+:14]|qy@[18+:13]
+ * |face@31 — the frag payload's pos_mask, face 0), rs2=base (gfx-window slot of
+ * colour[0..3]@base, depth[0..3]@base+4). The OM does depth/stencil/blend per
+ * covered sub-pixel and writes the colour + depth buffers. */
 static void
-emit_vx_om(struct vp_tr *t, LLVMValueRef pos_face,
-           LLVMValueRef color, LLVMValueRef depth)
+emit_vx_om4(struct vp_tr *t, LLVMValueRef desc, unsigned base)
 {
-   const char *s = ".insn r4 43, 2, 0, x0, $0, $1, $2";
-   LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
+   const char *s = ".insn r 43, 2, 0, x0, $0, $1";
+   LLVMTypeRef args[2] = { t->i32, t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
-                                       args, 3, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,r,r", 5,
+                                       args, 2, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,r", 3,
                                       /*HasSideEffects*/ true,
                                       /*IsAlignStack*/ false,
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
-   LLVMValueRef a[3] = { pos_face, color, depth };
-   LLVMBuildCall2(t->b, fnty, ia, a, 3, "");
+   LLVMValueRef a[2] = { desc, LLVMConstInt(t->i32, base, false) };
+   LLVMBuildCall2(t->b, fnty, ia, a, 2, "");
 }
 
 /* reinterpret a raw fixed-point i32 as float: (float)raw / 2^frac */
@@ -1584,14 +1635,6 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
                                     vp_to_iptr(t, poff), "prim");
    LLVMValueRef mask = LLVMBuildAnd(t->b, pos_mask,
       LLVMConstInt(t->i32, 0xf, false), "mask");
-   unsigned dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
-   LLVMValueRef qx = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4, false), ""),
-      LLVMConstInt(t->i32, dim_mask, false), "qx");
-   LLVMValueRef qy = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask,
-                    LLVMConstInt(t->i32, 4 + VX_RASTER_DIM_BITS - 1, false), ""),
-      LLVMConstInt(t->i32, dim_mask, false), "qy");
 
    for (unsigned i = 0; i < 4; i++) {
       LLVMBasicBlockRef px  = LLVMAppendBasicBlockInContext(t->ctx, fn, "px");
@@ -1645,23 +1688,18 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
          LLVMBuildFMul(t->b, dz, LLVMConstReal(t->f32, 16777216.0), ""),
          t->i32, "");
 
-      /* submit the fragment to the OM unit: it does depth/stencil/
-       * blend and writes the colour + depth buffers. pos_face packs
-       * (y<<16)|(x<<1)|face -- face 0 (front). */
-      LLVMValueRef px_i = LLVMBuildAdd(t->b,
-         LLVMBuildShl(t->b, qx, LLVMConstInt(t->i32, 1, false), ""),
-         LLVMConstInt(t->i32, i & 1, false), "");
-      LLVMValueRef py_i = LLVMBuildAdd(t->b,
-         LLVMBuildShl(t->b, qy, LLVMConstInt(t->i32, 1, false), ""),
-         LLVMConstInt(t->i32, i >> 1, false), "");
-      LLVMValueRef pos_face = LLVMBuildOr(t->b,
-         LLVMBuildShl(t->b, py_i, LLVMConstInt(t->i32, 16, false), ""),
-         LLVMBuildShl(t->b, px_i, LLVMConstInt(t->i32, 1, false), ""), "");
-      emit_vx_om(t, pos_face, rgba, depth_i);
+      /* stage this covered sub-pixel's colour + depth into the OM quad
+       * window (colour[i]@base+i, depth[i]@base+4+i). The single vx_om4
+       * after the loop submits the whole quad; cov_mask gates valid slots. */
+      emit_vx_gfx_set(t, VP_OM_SLOT_BASE + i, rgba);
+      emit_vx_gfx_set(t, VP_OM_SLOT_BASE + 4 + i, depth_i);
       LLVMBuildBr(t->b, nxt);
 
       LLVMPositionBuilderAtEnd(t->b, nxt);   /* fall through to next pixel */
    }
+   /* submit the whole quad in one op: desc = pos_mask (cov_mask|qx|qy, face 0),
+    * colour/depth already staged in the window. */
+   emit_vx_om4(t, pos_mask, VP_OM_SLOT_BASE);
    LLVMBuildBr(t->b, loop);
 
    LLVMPositionBuilderAtEnd(t->b, exit);
