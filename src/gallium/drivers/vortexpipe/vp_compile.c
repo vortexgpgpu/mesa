@@ -138,8 +138,10 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
     * drops unused entry points). VX_types.h is the generated copy under $bd/sw. */
    char gfx_seg[1024] = "";
    if (ok && link_gfx_sw) {
+      /* -DNDEBUG: the shared tex/OM headers (and cocogfx) use assert(); the
+       * baremetal link has no __assert_func, so compile assertions out. */
       snprintf(gfx_seg, sizeof gfx_seg,
-         "-std=c++17 -D__VORTEX__ -DGFX_SW_DIVERGENCE_OK "
+         "-std=c++17 -DNDEBUG -D__VORTEX__ -DGFX_SW_DIVERGENCE_OK "
          "-mllvm -vortex-divergence-max-bbs=512 "
          "-I%s/sw/gfx -I%s/sw/common -I%s/third_party -I%s/sw %s/sw/gfx/gfx_sw_abi.cpp",
          vh, vh, vh, bd, vh);
