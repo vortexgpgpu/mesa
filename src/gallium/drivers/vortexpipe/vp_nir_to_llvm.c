@@ -1456,27 +1456,6 @@ emit_vx_frag_payload(struct vp_tr *t, unsigned word, LLVMValueRef tok)
    return LLVMBuildCall2(t->b, fnty, ia, a, 1, "fragw");
 }
 
-/* vx_rast_begin(): per-frame raster trigger (custom-1, funct3=4).
- * The kernel-side commit that tells the cluster raster_core to fetch
- * tile/prim data from the currently-programmed DCRs. Idempotent in
- * hardware (the raster dedupes concurrent pulses from multiple warps
- * via its fetch_triggered state), so every thread of every
- * participating warp can call it without a barrier. Must be issued
- * once per frame before the first vx_rast() poll. */
-static void
-emit_vx_rast_begin(struct vp_tr *t)
-{
-   const char *s = ".insn r 43, 4, 0, x0, x0, x0";
-   LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
-                                       NULL, 0, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "", 0,
-                                      /*HasSideEffects*/ true,
-                                      /*IsAlignStack*/ false,
-                                      LLVMInlineAsmDialectATT,
-                                      /*CanThrow*/ false);
-   LLVMBuildCall2(t->b, fnty, ia, NULL, 0, "");
-}
-
 /* vx_om4: submit a 2x2 quad to the output-merger unit (custom-1 funct3=2,
  * R-type, rd=x0 fire-and-forget). rs1=desc (cov_mask[3:0]|qx@[4+:14]|qy@[18+:13]
  * |face@31 — the frag payload's pos_mask, face 0), rs2=base (gfx-window slot of
@@ -1609,11 +1588,8 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
                                           "fs_out");
    LLVMValueRef in_addr  = LLVMBuildPtrToInt(t->b, in_scr,  t->iptr, "");
    LLVMValueRef out_addr = LLVMBuildPtrToInt(t->b, out_scr, t->iptr, "");
-   /* Per-frame raster trigger. Every participating warp/thread
-    * issues this; HW dedupes into one fetch. Required before any
-    * vx_rast() poll — without it, the raster sits in IDLE and the
-    * loop below immediately exits on the boot-state done sentinel. */
-   emit_vx_rast_begin(t);
+   /* No begin op: the RASTER producer auto-arms on its DCR config write and
+    * kicks off the tile/prim load on the first vx_rast_fetch below. */
    LLVMBuildBr(t->b, loop);
 
    /* loop: pull a wave into the gfx window; stop when the producer drains. */
