@@ -582,22 +582,6 @@ vp_launch(vx_device_h dev,
    uint32_t    res_bytes[VP_MAX_DESCS]= { 0 };
    struct vp_as_ctx asc = { .ok = true };       /* acceleration-structure BVHs */
    uint8_t    *stage = NULL;
-   char vxpath[] = "/tmp/vortexpipe-k.XXXXXX";
-   int  vxfd = -1;
-
-   /* materialize the .vxbin in a temp file for vx_module_load_file */
-   vxfd = mkstemp(vxpath);
-   if (vxfd < 0) {
-      mesa_loge("vortexpipe: launch: mkstemp failed");
-      return false;
-   }
-   if (write(vxfd, vxbin, vxbin_size) != (ssize_t)vxbin_size) {
-      mesa_loge("vortexpipe: launch: writing .vxbin failed");
-      close(vxfd);
-      unlink(vxpath);
-      return false;
-   }
-   close(vxfd);
 
    /* A private copy of the descriptor buffer: vp_launch rewrites the
     * resource pointers inside it to device addresses. It must outlive
@@ -605,7 +589,6 @@ vp_launch(vx_device_h dev,
    stage = malloc(desc_bytes);
    if (!stage) {
       mesa_loge("vortexpipe: launch: descriptor staging OOM");
-      unlink(vxpath);
       return false;
    }
    memcpy(stage, desc_host, desc_bytes);
@@ -619,8 +602,11 @@ vp_launch(vx_device_h dev,
    asc.q   = q;
    asc.has_rtu = has_rtu;
 
-   VP_CHECK(vx_module_load_file(dev, vxpath, &kmod),
-            "vx_module_load_file");
+   /* Load the kernel image straight from memory — no /tmp round-trip (mirrors
+    * the gfx draw path's vx_module_load_bytes; the §6.6 module-residency cache
+    * is the next increment). */
+   VP_CHECK(vx_module_load_bytes(dev, vxbin, vxbin_size, &kmod),
+            "vx_module_load_bytes");
    /* "main" is the public name vxbin.py assigns the single conventional
     * kernel (the C entry is "kernel_main"); match the native runtime. */
    VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf),
@@ -724,7 +710,6 @@ done:
    if (kmod) vx_module_release(kmod);
    if (q)    vx_queue_release(q);
    free(stage);
-   unlink(vxpath);
    return ok;
 }
 
