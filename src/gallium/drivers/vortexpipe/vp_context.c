@@ -361,19 +361,24 @@ vp_delete_vs_state(struct pipe_context *pipe, void *p)
 
 /* §5 per-unit HW-vs-SW routing for a fragment shader, from device caps +
  * the VORTEXPIPE_FORCE_SW knob. A unit absent from the device routes to its
- * SIMT software path (never llvmpipe — charter pillar 4). TEX is wired here;
- * OM/RASTER follow in later steps. */
+ * SIMT software path (never llvmpipe — charter pillar 4). All three units
+ * (TEX/OM/RASTER) are wired here. SW raster implies SW OM (the one-thread-per-
+ * tile kernel merges over the LSU; it has no FF frag window to feed vx_om4). */
 static struct vp_sw_routing
 vp_fs_routing(struct pipe_context *pipe)
 {
    struct vp_screen *vps = vp_reg_get(pipe->screen);
    struct vp_sw_routing r = { false, false, false };
    const char *force = getenv("VORTEXPIPE_FORCE_SW");
-   bool force_all = force && strstr(force, "all");
-   bool force_tex = force && (strstr(force, "tex") || force_all);
-   bool force_om  = force && (strstr(force, "om")  || force_all);
-   r.sw_tex = (vps && !vps->has_tex) || force_tex;
-   r.sw_om  = (vps && !vps->has_om)  || force_om;
+   bool force_all    = force && strstr(force, "all");
+   bool force_tex    = force && (strstr(force, "tex")    || force_all);
+   bool force_om     = force && (strstr(force, "om")     || force_all);
+   bool force_raster = force && (strstr(force, "raster") || force_all);
+   r.sw_tex    = (vps && !vps->has_tex)    || force_tex;
+   r.sw_om     = (vps && !vps->has_om)     || force_om;
+   r.sw_raster = (vps && !vps->has_raster) || force_raster;
+   if (r.sw_raster)
+      r.sw_om = true;   /* SW raster has no FF window → must merge in software */
    return r;
 }
 
@@ -1133,10 +1138,13 @@ vp_draw_vbo(struct pipe_context *pipe,
          sw_raster = getenv("VORTEXPIPE_SW_RASTER") != NULL;
       struct vp_screen *vps = vp_reg_get(pipe->screen);
       /* §5: a unit absent from the device runs in software (the FS was compiled
-       * for it) rather than dropping the whole draw to llvmpipe — RASTER must be
-       * HW here (its SW fork is a separate wrapper variant), but OM may be SW. */
-      bool fs_sw_om  = fs && fs->fs_routing.sw_om;
-      bool gfx_hw = vps && vps->has_raster && (vps->has_om || fs_sw_om);
+       * for it) rather than dropping the whole draw to llvmpipe. RASTER, OM and
+       * TEX may each be HW or SW; the device path is taken as long as every unit
+       * the draw needs is satisfied HW-or-SW. */
+      bool fs_sw_om     = fs && fs->fs_routing.sw_om;
+      bool fs_sw_raster = fs && fs->fs_routing.sw_raster;
+      bool gfx_hw = vps && (vps->has_raster || fs_sw_raster)
+                        && (vps->has_om     || fs_sw_om);
       bool tex_needed = vp->cur_tex != NULL;
       /* A sampler on a TEX-less device no longer drops to llvmpipe — the FS was
        * compiled to sample in software (fs_routing.sw_tex), so the device path
@@ -1220,7 +1228,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                                   vs->vs_layout.needs_vertex_input ? &vin : NULL,
                                   color_dev, depth_dev, w, h, &om,
                                   tex_used ? tex_dev : 0, tex_used ? &tex : NULL,
-                                  fs_sw_tex, fs_sw_om);
+                                  fs_sw_tex, fs_sw_om, fs_sw_raster);
          if (drew) {
             vp->rfb_dirty = true;   /* device colour ahead of the resource */
             vp_dbg("vortexpipe: draw_vbo -> Vortex VS+RASTER+OM (one OP_DRAW) "

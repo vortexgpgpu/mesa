@@ -200,7 +200,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                uint32_t width, uint32_t height,
                const struct vp_om_params *om,
                uint64_t tex_dev, const struct vp_tex_params *tex,
-               bool sw_tex, bool sw_om)
+               bool sw_tex, bool sw_om, bool sw_raster)
 {
    const uint32_t num_tris = vertex_count / 3;
    if (num_tris == 0) {
@@ -365,9 +365,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       uint64_t prim_dev = arg.prim_addr;
       uint64_t tile_dev = arg.tilebuf_addr;
 
-      /* the FS kernel only needs the primitive buffer; the OM reaches the
-       * colour/depth buffers through its DCRs. */
-      uint64_t argblk[8] = { 0 };
+      /* the FS kernel needs the primitive buffer (arg[0]); SW units add the
+       * texstate/omstate descriptors (arg[1]/[2]); SW raster adds the tile-walk
+       * counts (arg[3..8]). The HW path reaches colour/depth via the OM DCRs. */
+      uint64_t argblk[9] = { 0 };
       argblk[0] = prim_dev;
 
       /* §5 SW sampler: build the resident texture descriptor and hand the FS its
@@ -515,9 +516,41 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
       fli.struct_size = sizeof(fli); fli.kernel = kbuf;
       fli.args_host = argblk; fli.args_size = sizeof(argblk);
-      fli.ndim = 1; fli.grid_dim[0] = (uint32_t)nc;
-      fli.block_dim[0] = (uint32_t)(nt * nw);
-      /* FWD-5: vx_frag_fetch stages the payload into the gfx window, not LMEM. */
+      fli.ndim = 1;
+      if (sw_raster) {
+         /* §5 SW raster: the FS is the one-thread-per-tile kernel, not the HW
+          * frag-window poll loop. Launch one thread per 8x8 screen tile (matching
+          * the FS VP_SW_RAST_TILE_LOG); each walks every prim over its tile in
+          * draw order. The dense rast_prim_t[] is still front-end-produced; the
+          * RASTER DCRs / FF producer are skipped below. */
+         const uint32_t SW_TILE_LOG = 3;            /* 8x8 px (FS-side constant) */
+         const uint32_t SW_TILE     = 1u << SW_TILE_LOG;
+         const uint32_t nx_sw = (width  + SW_TILE - 1) / SW_TILE;
+         const uint32_t ny_sw = (height + SW_TILE - 1) / SW_TILE;
+         const uint32_t num_tiles_sw = nx_sw * ny_sw;
+         /* One WARP per tile: block = NT threads (= one warp), grid = one CTA per
+          * tile. The warp's NT lanes cooperate on the tile's quads (lane L shades
+          * quads L, L+NT, …), the CudaRaster fine-rasterizer mapping. This keeps
+          * the FS kernel's loops uniform-trip across the warp (the divergence-safe
+          * shape — the earlier one-thread-per-tile mapping diverged per-lane on the
+          * covered-quad count and the SIMT reconvergence dropped fragments). Full
+          * occupancy: every warp/core runs, lanes shade in parallel. */
+         fli.grid_dim[0]  = num_tiles_sw;     /* one warp (CTA) per screen tile */
+         fli.block_dim[0] = (uint32_t)nt;     /* NT threads = exactly one warp   */
+         /* num_prims = num_tris exactly: gfx-v1 uses cull=NONE and no clipping,
+          * so setup writes one dense prim per input triangle. (Clipping/cull →
+          * read the kept-prim count from the front-end meta; §6.2 follow-up.) */
+         argblk[3] = num_tris;
+         argblk[4] = nx_sw;
+         argblk[5] = num_tiles_sw;
+         argblk[6] = SW_TILE_LOG;
+         argblk[7] = width;
+         argblk[8] = height;
+      } else {
+         fli.grid_dim[0]  = (uint32_t)nc;
+         fli.block_dim[0] = (uint32_t)(nt * nw);
+         /* FWD-5: vx_frag_fetch stages the payload into the gfx window, not LMEM. */
+      }
 
       /* The whole draw as ONE CP command batch (§6.4): expand -> setup ->
        * binning, then RASTER/OM/TEX config, then FS. The CP retires the
@@ -540,12 +573,16 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       LAUNCH(&eli);
       for (uint32_t s = 0; s < NSTAGE; ++s) LAUNCH(&li[s]);
 
+      /* FF RASTER producer config — skipped when raster is routed to software
+       * (the one-thread-per-tile FS walks the primbuf itself; no FF producer). */
+      if (!sw_raster) {
       DCRW(VX_DCR_RASTER_TBUF_ADDR,   (uint32_t)(tile_dev / 64));
       DCRW(VX_DCR_RASTER_TILE_COUNT,  num_bins);
       DCRW(VX_DCR_RASTER_PBUF_ADDR,   (uint32_t)(prim_dev / 64));
       DCRW(VX_DCR_RASTER_PBUF_STRIDE, VP_RAST_PRIM_STRIDE);
       DCRW(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
       DCRW(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
+      }
 
       /* FF OM config — skipped when OM is routed to software (the FS merges via
        * gfx_om_fragment_sw from the resident om descriptor instead). */

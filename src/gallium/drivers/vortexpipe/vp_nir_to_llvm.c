@@ -142,6 +142,7 @@ struct vp_tr {
     * emit_vx_tex when sw_tex; null pointer when texturing is HW. */
    bool           sw_tex;
    bool           sw_om;
+   bool           sw_raster;  /* FS is the one-thread-per-tile SW-raster kernel */
    LLVMValueRef   fs_texstate; /* ptr param (gfx_sw_texstate_t* table) */
    bool           ok;
 };
@@ -160,6 +161,15 @@ vp_to_iptr(struct vp_tr *t, LLVMValueRef v)
    if (t->iptr == t->i32)
       return v;
    return LLVMBuildZExt(t->b, v, t->iptr, "");
+}
+
+/* Narrow an iptr value to i32 (no-op on rv32). */
+static inline LLVMValueRef
+emit_to_i32(struct vp_tr *t, LLVMValueRef v)
+{
+   if (t->iptr == t->i32)
+      return v;
+   return LLVMBuildTrunc(t->b, v, t->i32, "");
 }
 
 static LLVMValueRef
@@ -1579,6 +1589,143 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
    }
 }
 
+/* Source of a covered quad's per-corner edge (barycentric) values, the one
+ * thing that differs between the two raster variants: the HW path reads them
+ * from the FF frag window (GETW, chained on `drained`); the SW path reads them
+ * from a resident gfx_rast_quad_t in memory (`quad_addr`, words 1+axis*4+corner,
+ * pos_mask is word 0). Exactly one field is non-null. */
+struct vp_bc_src {
+   LLVMValueRef drained;     /* HW: chain GETW reads on this token */
+   LLVMValueRef quad_addr;   /* SW: iptr address of the gfx_rast_quad_t */
+};
+
+/* Edge value F[axis] at corner `i` of the quad, as a float (fixed_t<16> raw). */
+static LLVMValueRef
+emit_bc(struct vp_tr *t, const struct vp_bc_src *bc, unsigned axis, unsigned i)
+{
+   LLVMValueRef raw;
+   if (bc->drained) {
+      /* window payload: word 2 + axis*4 + corner (X,Y,Z planes). */
+      raw = emit_vx_frag_payload(t, 2 + axis * 4 + i, bc->drained);
+   } else {
+      /* gfx_rast_quad_t: pos_mask @word0, bcoords[axis*4+corner] @word 1+.. */
+      raw = emit_load_i32(t, addk(t, bc->quad_addr, (1 + axis * 4 + i) * 4));
+   }
+   return emit_fixed_to_float(t, raw, 16);
+}
+
+/* Shade one covered 2x2 quad: for each covered sub-pixel, interpolate the
+ * varyings from the edge gradient, run fs_main, then merge via the SW OM
+ * (gfx_om_fragment_sw) or stage it into the OM window for the trailing vx_om4.
+ * Shared by both raster wrappers; `bc` selects the edge-value source. */
+static void
+emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
+                LLVMValueRef fs_main, LLVMTypeRef fs_main_ty,
+                LLVMValueRef prim, LLVMValueRef in_scr, LLVMValueRef out_scr,
+                LLVMValueRef in_addr, LLVMValueRef out_addr,
+                LLVMValueRef texstate_ptr, LLVMValueRef omstate_ptr,
+                LLVMValueRef pos_mask, const struct vp_bc_src *bc)
+{
+   LLVMValueRef mask = LLVMBuildAnd(t->b, pos_mask,
+      LLVMConstInt(t->i32, 0xf, false), "mask");
+
+   /* decode the quad origin + face from pos_mask so each covered sub-pixel can
+    * be addressed directly (qx@[4+:DIM-1], qy@[4+DIM-1+:DIM-1], face@31).
+    * px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
+   const uint32_t dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
+   LLVMValueRef qx = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4, false), ""),
+      LLVMConstInt(t->i32, dim_mask, false), "qx");
+   LLVMValueRef qy = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4 + VX_RASTER_DIM_BITS - 1, false), ""),
+      LLVMConstInt(t->i32, dim_mask, false), "qy");
+   LLVMValueRef face = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 31, false), ""),
+      LLVMConstInt(t->i32, 1, false), "face");
+
+   for (unsigned i = 0; i < 4; i++) {
+      LLVMBasicBlockRef px  = LLVMAppendBasicBlockInContext(t->ctx, fn, "px");
+      LLVMBasicBlockRef nxt = LLVMAppendBasicBlockInContext(t->ctx, fn, "nxt");
+      LLVMValueRef cov = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, mask, LLVMConstInt(t->i32, i, false), ""),
+         LLVMConstInt(t->i32, 1, false), "");
+      LLVMBuildCondBr(t->b,
+         LLVMBuildICmp(t->b, LLVMIntNE, cov,
+                       LLVMConstInt(t->i32, 0, false), ""), px, nxt);
+
+      LLVMPositionBuilderAtEnd(t->b, px);
+      /* barycentric gradient: dx = F0/(F0+F1+F2), dy = F1/sum. */
+      LLVMValueRef f0 = emit_bc(t, bc, 0, i);
+      LLVMValueRef f1 = emit_bc(t, bc, 1, i);
+      LLVMValueRef f2 = emit_bc(t, bc, 2, i);
+      LLVMValueRef sum = LLVMBuildFAdd(t->b,
+         LLVMBuildFAdd(t->b, f0, f1, ""), f2, "");
+      LLVMValueRef recip = LLVMBuildFDiv(t->b,
+         LLVMConstReal(t->f32, 1.0), sum, "recip");
+      LLVMValueRef dx = LLVMBuildFMul(t->b, recip, f0, "dx");
+      LLVMValueRef dy = LLVMBuildFMul(t->b, recip, f1, "dy");
+
+      /* interpolate the RASTER attribute planes into the FS input
+       * varyings (colour and/or texcoord, by declaration). */
+      emit_fs_fill_varyings(t, prim, in_addr, dx, dy);
+
+      /* run the programmable fragment shader (3rd arg = §5 SW texstate table) */
+      LLVMValueRef cargs[3] = { in_scr, out_scr, texstate_ptr };
+      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 3, "");
+
+      /* pack the FS output (4 floats) into an R8G8B8A8 pixel. */
+      LLVMValueRef rgba = LLVMConstInt(t->i32, 0, false);
+      for (unsigned c = 0; c < 4; c++) {
+         LLVMValueRef fc = LLVMBuildBitCast(t->b,
+            emit_load_i32(t, addk(t, out_addr, c * 4)), t->f32, "");
+         LLVMValueRef bc8 = LLVMBuildShl(t->b, emit_to_byte(t, fc),
+            LLVMConstInt(t->i32, c * 8, false), "");
+         rgba = LLVMBuildOr(t->b, rgba, bc8, "");
+      }
+
+      /* interpolate the fragment depth (rast_attribs.z, [0,1]) and
+       * convert to the OM's 24-bit fixed-point depth. */
+      LLVMValueRef dz = emit_interp(t, addk(t, prim, VP_RAST_ATTR_Z),
+                                    dx, dy);
+      LLVMValueRef depth_i = LLVMBuildFPToUI(t->b,
+         LLVMBuildFMul(t->b, dz, LLVMConstReal(t->f32, 16777216.0), ""),
+         t->i32, "");
+
+      if (t->sw_om) {
+         /* §5 SW output-merger: merge this covered sub-pixel directly via
+          * gfx_om_fragment_sw(omstate, px, py, face, colour, depth) over the LSU
+          * (no window staging, no vx_om4). px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
+         LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+         LLVMValueRef pxc = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
+            LLVMConstInt(t->i32, i & 1, false), "px");
+         LLVMValueRef pyc = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
+            LLVMConstInt(t->i32, i >> 1, false), "py");
+         LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
+         LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                            params, 6, false);
+         LLVMValueRef ofn = LLVMGetNamedFunction(t->mod, "gfx_om_fragment_sw");
+         if (!ofn)
+            ofn = LLVMAddFunction(t->mod, "gfx_om_fragment_sw", fty);
+         LLVMValueRef a[6] = { omstate_ptr, pxc, pyc, face, rgba, depth_i };
+         LLVMBuildCall2(t->b, fty, ofn, a, 6, "");
+      } else {
+         /* stage this covered sub-pixel's colour + depth into the OM quad
+          * window (colour[i]@base+i, depth[i]@base+4+i). The single vx_om4
+          * after the loop submits the whole quad; cov_mask gates valid slots. */
+         emit_vx_gfx_set(t, VP_OM_SLOT_BASE + i, rgba);
+         emit_vx_gfx_set(t, VP_OM_SLOT_BASE + 4 + i, depth_i);
+      }
+      LLVMBuildBr(t->b, nxt);
+
+      LLVMPositionBuilderAtEnd(t->b, nxt);   /* fall through to next pixel */
+   }
+   /* submit the whole quad in one op: desc = pos_mask (cov_mask|qx|qy, face 0),
+    * colour/depth already staged in the window. (SW OM already merged each
+    * sub-pixel above — no FF submit.) */
+   if (!t->sw_om)
+      emit_vx_om4(t, pos_mask, VP_OM_SLOT_BASE);
+}
+
 /* Build kernel_main: the rasterizer poll-loop wrapper that drives the
  * translated fragment body `fs_main`. arg block: [0]=primitive buffer,
  * [1]=colour buffer, [2]=colour-buffer row pitch (bytes). */
@@ -1646,109 +1793,176 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
       LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base,
                                     vp_to_iptr(t, poff), "prim");
-   LLVMValueRef mask = LLVMBuildAnd(t->b, pos_mask,
-      LLVMConstInt(t->i32, 0xf, false), "mask");
 
-   /* §5 SW OM: decode the quad origin + face from pos_mask so the wrapper can
-    * address each covered sub-pixel directly (qx@[4+:DIM-1], qy@[4+DIM-1+:DIM-1],
-    * face@31). px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
-   const uint32_t dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
-   LLVMValueRef qx = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4, false), ""),
-      LLVMConstInt(t->i32, dim_mask, false), "qx");
-   LLVMValueRef qy = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4 + VX_RASTER_DIM_BITS - 1, false), ""),
-      LLVMConstInt(t->i32, dim_mask, false), "qy");
-   LLVMValueRef face = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 31, false), ""),
-      LLVMConstInt(t->i32, 1, false), "face");
-
-   for (unsigned i = 0; i < 4; i++) {
-      LLVMBasicBlockRef px  = LLVMAppendBasicBlockInContext(t->ctx, fn, "px");
-      LLVMBasicBlockRef nxt = LLVMAppendBasicBlockInContext(t->ctx, fn, "nxt");
-      LLVMValueRef cov = LLVMBuildAnd(t->b,
-         LLVMBuildLShr(t->b, mask, LLVMConstInt(t->i32, i, false), ""),
-         LLVMConstInt(t->i32, 1, false), "");
-      LLVMBuildCondBr(t->b,
-         LLVMBuildICmp(t->b, LLVMIntNE, cov,
-                       LLVMConstInt(t->i32, 0, false), ""), px, nxt);
-
-      LLVMPositionBuilderAtEnd(t->b, px);
-      /* barycentric gradient: dx = F0/(F0+F1+F2), dy = F1/sum. */
-      /* bcoords from the window payload: word 2 + axis*4 + corner (X,Y,Z planes). */
-      LLVMValueRef f0 = emit_fixed_to_float(t,
-         emit_vx_frag_payload(t, 2 + 0 * 4 + i, drained), 16);
-      LLVMValueRef f1 = emit_fixed_to_float(t,
-         emit_vx_frag_payload(t, 2 + 1 * 4 + i, drained), 16);
-      LLVMValueRef f2 = emit_fixed_to_float(t,
-         emit_vx_frag_payload(t, 2 + 2 * 4 + i, drained), 16);
-      LLVMValueRef sum = LLVMBuildFAdd(t->b,
-         LLVMBuildFAdd(t->b, f0, f1, ""), f2, "");
-      LLVMValueRef recip = LLVMBuildFDiv(t->b,
-         LLVMConstReal(t->f32, 1.0), sum, "recip");
-      LLVMValueRef dx = LLVMBuildFMul(t->b, recip, f0, "dx");
-      LLVMValueRef dy = LLVMBuildFMul(t->b, recip, f1, "dy");
-
-      /* interpolate the RASTER attribute planes into the FS input
-       * varyings (colour and/or texcoord, by declaration). */
-      emit_fs_fill_varyings(t, prim, in_addr, dx, dy);
-
-      /* run the programmable fragment shader (3rd arg = §5 SW texstate table) */
-      LLVMValueRef cargs[3] = { in_scr, out_scr, texstate_ptr };
-      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 3, "");
-
-      /* pack the FS output (4 floats) into an R8G8B8A8 pixel. */
-      LLVMValueRef rgba = LLVMConstInt(t->i32, 0, false);
-      for (unsigned c = 0; c < 4; c++) {
-         LLVMValueRef fc = LLVMBuildBitCast(t->b,
-            emit_load_i32(t, addk(t, out_addr, c * 4)), t->f32, "");
-         LLVMValueRef bc = LLVMBuildShl(t->b, emit_to_byte(t, fc),
-            LLVMConstInt(t->i32, c * 8, false), "");
-         rgba = LLVMBuildOr(t->b, rgba, bc, "");
-      }
-
-      /* interpolate the fragment depth (rast_attribs.z, [0,1]) and
-       * convert to the OM's 24-bit fixed-point depth. */
-      LLVMValueRef dz = emit_interp(t, addk(t, prim, VP_RAST_ATTR_Z),
-                                    dx, dy);
-      LLVMValueRef depth_i = LLVMBuildFPToUI(t->b,
-         LLVMBuildFMul(t->b, dz, LLVMConstReal(t->f32, 16777216.0), ""),
-         t->i32, "");
-
-      if (t->sw_om) {
-         /* §5 SW output-merger: merge this covered sub-pixel directly via
-          * gfx_om_fragment_sw(omstate, px, py, face, colour, depth) over the LSU
-          * (no window staging, no vx_om4). px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
-         LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
-         LLVMValueRef px = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
-            LLVMConstInt(t->i32, i & 1, false), "px");
-         LLVMValueRef py = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
-            LLVMConstInt(t->i32, i >> 1, false), "py");
-         LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
-         LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
-                                            params, 6, false);
-         LLVMValueRef ofn = LLVMGetNamedFunction(t->mod, "gfx_om_fragment_sw");
-         if (!ofn)
-            ofn = LLVMAddFunction(t->mod, "gfx_om_fragment_sw", fty);
-         LLVMValueRef a[6] = { omstate_ptr, px, py, face, rgba, depth_i };
-         LLVMBuildCall2(t->b, fty, ofn, a, 6, "");
-      } else {
-         /* stage this covered sub-pixel's colour + depth into the OM quad
-          * window (colour[i]@base+i, depth[i]@base+4+i). The single vx_om4
-          * after the loop submits the whole quad; cov_mask gates valid slots. */
-         emit_vx_gfx_set(t, VP_OM_SLOT_BASE + i, rgba);
-         emit_vx_gfx_set(t, VP_OM_SLOT_BASE + 4 + i, depth_i);
-      }
-      LLVMBuildBr(t->b, nxt);
-
-      LLVMPositionBuilderAtEnd(t->b, nxt);   /* fall through to next pixel */
-   }
-   /* submit the whole quad in one op: desc = pos_mask (cov_mask|qx|qy, face 0),
-    * colour/depth already staged in the window. (SW OM already merged each
-    * sub-pixel above — no FF submit.) */
-   if (!t->sw_om)
-      emit_vx_om4(t, pos_mask, VP_OM_SLOT_BASE);
+   /* edge values come from the FF frag window (GETW chained on `drained`). */
+   struct vp_bc_src bc = { .drained = drained, .quad_addr = NULL };
+   emit_shade_quad(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
+                   in_addr, out_addr, texstate_ptr, omstate_ptr, pos_mask, &bc);
    LLVMBuildBr(t->b, loop);
+
+   LLVMPositionBuilderAtEnd(t->b, exit);
+   LLVMBuildRetVoid(t->b);
+   return fn;
+}
+
+/* gfx_v2 §5 SW-raster FS wrapper (one WARP per screen tile; lanes cooperate).
+ * When RASTER is routed to software the FS is NOT the frag-window poll loop. Each
+ * WARP owns one 8x8 screen tile; its lanes share the tile and split the covered
+ * quads (lane L shades quads L, L+NT, L+2NT, …). All lanes walk every primitive
+ * over the SAME tile in draw order (gfx_rast_walk_tile_sw, redundant but identical
+ * across the warp — uniform control flow), then split the quad list. This is the
+ * CudaRaster fine-rasterizer mapping and, critically, it is SIMT-safe: the loops
+ * are uniform-trip (same for every lane) and the only divergence is per-quad
+ * coverage — exactly the per-fragment shape the HW frag wrapper already runs
+ * correctly. (The earlier one-thread-per-tile shape gave each lane its own tile,
+ * so the per-lane covered-quad counts diverged and the SIMT reconvergence dropped
+ * fragments at full-warp occupancy.) The per-pixel OM ordering (one tile owned by
+ * one warp, prims in draw order) holds because each pixel belongs to exactly one
+ * tile = one warp, and a warp serializes its prims. arg block: [0]=prim base,
+ * [1]=texstate, [2]=omstate, [3]=num_prims, [4]=nx (tiles/row), [5]=num_tiles,
+ * [6]=tile_logsize (reserved; matches the constant below), [7]=scissor_w,
+ * [8]=scissor_h. */
+#define VP_SW_RAST_TILE_LOG  3u                                  /* 8x8 px tile  */
+#define VP_SW_RAST_MAX_QUADS (1u << (2 * (VP_SW_RAST_TILE_LOG - 1)))/* (tile/2)^2 */
+#define VP_RAST_QUAD_WORDS   13u                  /* sizeof(gfx_rast_quad_t)/4    */
+
+static LLVMValueRef
+emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
+                          LLVMTypeRef fs_main_ty)
+{
+   LLVMTypeRef  p1[1] = { t->ptr };
+   LLVMTypeRef  kty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                       p1, 1, false);
+   LLVMValueRef fn  = LLVMAddFunction(t->mod, "kernel_main", kty);
+   LLVMValueRef arg = LLVMGetParam(fn, 0);
+
+   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t->ctx, fn, "entry");
+   LLVMBasicBlockRef setup = LLVMAppendBasicBlockInContext(t->ctx, fn, "setup");
+   LLVMBasicBlockRef ploop = LLVMAppendBasicBlockInContext(t->ctx, fn, "ploop");
+   LLVMBasicBlockRef pbody = LLVMAppendBasicBlockInContext(t->ctx, fn, "pbody");
+   LLVMBasicBlockRef qloop = LLVMAppendBasicBlockInContext(t->ctx, fn, "qloop");
+   LLVMBasicBlockRef qchk  = LLVMAppendBasicBlockInContext(t->ctx, fn, "qchk");
+   LLVMBasicBlockRef qbody = LLVMAppendBasicBlockInContext(t->ctx, fn, "qbody");
+   LLVMBasicBlockRef qinc  = LLVMAppendBasicBlockInContext(t->ctx, fn, "qinc");
+   LLVMBasicBlockRef pnext = LLVMAppendBasicBlockInContext(t->ctx, fn, "pnext");
+   LLVMBasicBlockRef exit  = LLVMAppendBasicBlockInContext(t->ctx, fn, "exit");
+
+   /* entry: read the arg block + per-lane scratch (counters/quads in allocas so
+    * mem2reg promotes the loop induction; no hand-built phi). */
+   LLVMPositionBuilderAtEnd(t->b, entry);
+   LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
+   LLVMValueRef texstate_ptr = LLVMConstNull(t->ptr);
+   if (t->sw_tex)
+      texstate_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 1), t->ptr, "texstate");
+   LLVMValueRef omstate_ptr = LLVMConstNull(t->ptr);
+   if (t->sw_om)
+      omstate_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 2), t->ptr, "omstate");
+   /* arg-block counts are i64 device words; narrow to i32 for the loop math. */
+   LLVMValueRef num_prims = emit_to_i32(t, emit_arg_i32(t, arg, 3));
+   LLVMValueRef nx        = emit_to_i32(t, emit_arg_i32(t, arg, 4));
+   LLVMValueRef num_tiles = emit_to_i32(t, emit_arg_i32(t, arg, 5));
+   LLVMValueRef scis_w    = emit_to_i32(t, emit_arg_i32(t, arg, 7));
+   LLVMValueRef scis_h    = emit_to_i32(t, emit_arg_i32(t, arg, 8));
+
+   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16), "fs_in");
+   LLVMValueRef out_scr = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4), "fs_out");
+   LLVMValueRef quadbuf = LLVMBuildAlloca(t->b,
+      LLVMArrayType(t->i32, VP_SW_RAST_MAX_QUADS * VP_RAST_QUAD_WORDS), "quads");
+   LLVMValueRef pid_slot  = LLVMBuildAlloca(t->b, t->i32, "pid");
+   LLVMValueRef base_slot = LLVMBuildAlloca(t->b, t->i32, "base");
+   LLVMValueRef cnt_slot  = LLVMBuildAlloca(t->b, t->i32, "cnt");
+   LLVMValueRef in_addr   = LLVMBuildPtrToInt(t->b, in_scr,  t->iptr, "");
+   LLVMValueRef out_addr  = LLVMBuildPtrToInt(t->b, out_scr, t->iptr, "");
+   LLVMValueRef quad_base = LLVMBuildPtrToInt(t->b, quadbuf, t->iptr, "");
+
+   /* tile id = blockIdx.x (one warp == one CTA == one tile, set by the launch
+    * geometry); lane = threadIdx.x (0..NT-1); NT = blockDim.x. tile_idx is
+    * UNIFORM across the warp, so the bounds branch is uniform — no divergence. */
+   LLVMValueRef tile_idx = emit_csr_read(t, VX_CSR_CTA_BLOCK_ID_X, "tile_idx");
+   LLVMValueRef lane     = emit_csr_read(t, VX_CSR_CTA_THREAD_ID_X, "lane");
+   LLVMValueRef ntv      = emit_csr_read(t, VX_CSR_CTA_BLOCK_DIM_X, "nt");
+   LLVMBuildCondBr(t->b,
+      LLVMBuildICmp(t->b, LLVMIntULT, tile_idx, num_tiles, ""), setup, exit);
+
+   /* setup: tile origin in pixels, then start the prim walk at pid 0. */
+   LLVMPositionBuilderAtEnd(t->b, setup);
+   LLVMValueRef logc = LLVMConstInt(t->i32, VP_SW_RAST_TILE_LOG, false);
+   LLVMValueRef tx = LLVMBuildShl(t->b,
+      LLVMBuildURem(t->b, tile_idx, nx, ""), logc, "tx");
+   LLVMValueRef ty = LLVMBuildShl(t->b,
+      LLVMBuildUDiv(t->b, tile_idx, nx, ""), logc, "ty");
+   LLVMBuildStore(t->b, LLVMConstInt(t->i32, 0, false), pid_slot);
+   LLVMBuildBr(t->b, ploop);
+
+   /* ploop: for each primitive in draw order (uniform: num_prims is warp-wide). */
+   LLVMPositionBuilderAtEnd(t->b, ploop);
+   LLVMValueRef pid = LLVMBuildLoad2(t->b, t->i32, pid_slot, "pid.v");
+   LLVMBuildCondBr(t->b,
+      LLVMBuildICmp(t->b, LLVMIntULT, pid, num_prims, ""), pbody, exit);
+
+   /* pbody: every lane walks this prim over the SAME tile — identical args →
+    * identical control flow, so the call is uniform across the warp (no divergent
+    * recursion/loops). Each lane fills its own quad buffer; the lanes then split
+    * the quad list below. (Redundant walk; a shared-memory single walk is the perf
+    * follow-up.) */
+   LLVMPositionBuilderAtEnd(t->b, pbody);
+   LLVMValueRef poff = LLVMBuildMul(t->b, pid,
+      LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
+   LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base, vp_to_iptr(t, poff), "prim");
+   LLVMTypeRef wparams[9] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
+                              t->i32, t->i32, t->ptr, t->i32 };
+   LLVMTypeRef wty = LLVMFunctionType(t->i32, wparams, 9, false);
+   LLVMValueRef wfn = LLVMGetNamedFunction(t->mod, "gfx_rast_walk_tile_sw");
+   if (!wfn)
+      wfn = LLVMAddFunction(t->mod, "gfx_rast_walk_tile_sw", wty);
+   LLVMValueRef wargs[9] = {
+      LLVMBuildIntToPtr(t->b, prim, t->ptr, "primp"), pid, tx, ty, logc,
+      scis_w, scis_h, quadbuf, LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false) };
+   LLVMValueRef cnt = LLVMBuildCall2(t->b, wty, wfn, wargs, 9, "cnt");
+   LLVMBuildStore(t->b, cnt, cnt_slot);
+   LLVMBuildStore(t->b, lane, base_slot);   /* this lane starts at quad #lane */
+   LLVMBuildBr(t->b, qloop);
+
+   /* qloop: split the tile's covered quads across the warp's lanes. The loop is
+    * UNIFORM — every lane steps base by NT until base >= MAX, the same trip count
+    * for all lanes (MAX is a constant) — so reconvergence is trivial. Lane L
+    * handles quads L, L+NT, L+2NT, … */
+   LLVMPositionBuilderAtEnd(t->b, qloop);
+   LLVMValueRef base = LLVMBuildLoad2(t->b, t->i32, base_slot, "base.v");
+   LLVMBuildCondBr(t->b,
+      LLVMBuildICmp(t->b, LLVMIntULT, base,
+         LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false), ""), qchk, pnext);
+
+   /* qchk: shade this lane's slot only if it holds a real quad (base < cnt). A
+    * per-lane divergent *if* (not a loop) — the same shape the HW frag wrapper's
+    * per-fragment coverage branch uses, which the SIMT core handles correctly. */
+   LLVMPositionBuilderAtEnd(t->b, qchk);
+   LLVMValueRef cntv = LLVMBuildLoad2(t->b, t->i32, cnt_slot, "cnt.v");
+   LLVMBuildCondBr(t->b,
+      LLVMBuildICmp(t->b, LLVMIntULT, base, cntv, ""), qbody, qinc);
+
+   /* qbody: shade quad #base from this lane's buffer. */
+   LLVMPositionBuilderAtEnd(t->b, qbody);
+   LLVMValueRef qoff = LLVMBuildMul(t->b, base,
+      LLVMConstInt(t->i32, VP_RAST_QUAD_WORDS * 4, false), "");
+   LLVMValueRef quad_addr = LLVMBuildAdd(t->b, quad_base, vp_to_iptr(t, qoff), "quad");
+   LLVMValueRef pos_mask = emit_load_i32(t, quad_addr);
+   struct vp_bc_src bc = { .drained = NULL, .quad_addr = quad_addr };
+   emit_shade_quad(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
+                   in_addr, out_addr, texstate_ptr, omstate_ptr, pos_mask, &bc);
+   /* builder is now at emit_shade_quad's trailing fall-through block. */
+   LLVMBuildBr(t->b, qinc);
+
+   /* qinc: advance by NT (uniform stride) to this lane's next quad. */
+   LLVMPositionBuilderAtEnd(t->b, qinc);
+   LLVMBuildStore(t->b, LLVMBuildAdd(t->b, base, ntv, ""), base_slot);
+   LLVMBuildBr(t->b, qloop);
+
+   /* pnext: advance to the next primitive. */
+   LLVMPositionBuilderAtEnd(t->b, pnext);
+   LLVMBuildStore(t->b,
+      LLVMBuildAdd(t->b, pid, LLVMConstInt(t->i32, 1, false), ""), pid_slot);
+   LLVMBuildBr(t->b, ploop);
 
    LLVMPositionBuilderAtEnd(t->b, exit);
    LLVMBuildRetVoid(t->b);
@@ -1778,8 +1992,9 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
    t.is_fs = (nir->info.stage == MESA_SHADER_FRAGMENT);
    /* §5 per-unit SW routing (FS only). */
-   t.sw_tex = (t.is_fs && routing && routing->sw_tex);
-   t.sw_om  = (t.is_fs && routing && routing->sw_om);
+   t.sw_tex    = (t.is_fs && routing && routing->sw_tex);
+   t.sw_om     = (t.is_fs && routing && routing->sw_om);
+   t.sw_raster = (t.is_fs && routing && routing->sw_raster);
    t.ctx   = LLVMContextCreate();
    t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
    LLVMSetTarget(t.mod, vp_target_triple());
@@ -1896,7 +2111,8 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
     * kernel_main. Compute/vertex shaders are already kernel_main. */
    LLVMValueRef kfn = fn;
    if (t.is_fs && t.ok)
-      kfn = emit_fs_wrapper(&t, fn, fs_main_ty);
+      kfn = t.sw_raster ? emit_fs_wrapper_sw_raster(&t, fn, fs_main_ty)
+                        : emit_fs_wrapper(&t, fn, fs_main_ty);
 
    if (t.ok) {
       /* Annotate the kernel "vortex.kernel" + retain it. The llvm-vortex
