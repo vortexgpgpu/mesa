@@ -846,6 +846,9 @@ vp_launch_vs(vx_device_h dev,
                                 0, NULL, NULL), "vx_enqueue_write(attrtab)");
       argblk[1] = tbuf_dev;
    }
+   /* slot 2: index buffer base. The standalone VS launch is the non-indexed
+    * fallback path, so it is always 0 (the vid is the sequential global id). */
+   argblk[2] = 0;
 
    /* One thread per vertex, sized to fill warps and saturate cores
     * (see geometry-query comment above). */

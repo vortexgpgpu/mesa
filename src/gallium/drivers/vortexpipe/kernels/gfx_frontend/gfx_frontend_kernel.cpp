@@ -2,8 +2,8 @@
 //
 // Single translation unit that materialises the two front-end kernel entries
 // (setup_k stages 0-2, binning_k stages 3-8) for vortexpipe to launch in place
-// of the host graphics::Binning(). The stage logic lives in pipe_frontend.h;
+// of the host graphics::Binning(). The stage logic lives in gfx_frontend_k.h;
 // this file is the compile unit the Vortex kernel toolchain turns into a
-// .vxbin (see Makefile). Device-only (pulls vx_spawn2.h via pipe_frontend.h).
+// .vxbin (see Makefile). Device-only (pulls vx_spawn2.h via gfx_frontend_k.h).
 
-#include "pipe_frontend.h"
+#include "gfx_frontend_k.h"

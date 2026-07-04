@@ -1096,6 +1096,51 @@ vp_gather_vertex_input(struct pipe_context *pipe, struct vp_context *vp,
    return true;
 }
 
+/* Upload the draw's index buffer to the device as a flat u32-per-vertex array
+ * (widening 16-bit indices and folding in the base-vertex bias), so the VS can
+ * resolve gl_VertexIndex / vertex-attribute fetch on device. Returns the device
+ * address + owning buffer (caller releases). False -> caller drops to llvmpipe. */
+static bool
+vp_gather_index_u32(struct pipe_context *pipe, struct vp_context *vp,
+                    const struct pipe_draw_info *info,
+                    const struct pipe_draw_start_count_bias *draws,
+                    uint64_t *out_dev, vx_buffer_h *out_buf)
+{
+   const unsigned isz   = info->index_size;     /* 2 or 4 */
+   const unsigned count = draws[0].count;
+   struct pipe_transfer *xfer = NULL;
+   const uint8_t *src = NULL;
+
+   if (info->has_user_indices) {
+      src = (const uint8_t *)info->index.user;
+   } else if (info->index.resource) {
+      src = (const uint8_t *)pipe_buffer_map(pipe, info->index.resource,
+                                             PIPE_MAP_READ, &xfer);
+   }
+   if (!src)
+      return false;
+   src += (size_t)draws[0].start * isz;
+
+   uint32_t *u32 = (uint32_t *)malloc((size_t)count * 4u);
+   if (!u32) {
+      if (xfer) pipe_buffer_unmap(pipe, xfer);
+      return false;
+   }
+   const int32_t bias = draws[0].index_bias;    /* base vertex */
+   if (isz == 4) {
+      const uint32_t *s = (const uint32_t *)src;
+      for (unsigned i = 0; i < count; i++) u32[i] = s[i] + (uint32_t)bias;
+   } else {
+      const uint16_t *s = (const uint16_t *)src;
+      for (unsigned i = 0; i < count; i++) u32[i] = (uint32_t)s[i] + (uint32_t)bias;
+   }
+
+   bool ok = vp_dev_upload(vp->dev, u32, (size_t)count * 4u, out_buf, out_dev);
+   free(u32);
+   if (xfer) pipe_buffer_unmap(pipe, xfer);
+   return ok;
+}
+
 static void
 vp_draw_vbo(struct pipe_context *pipe,
             const struct pipe_draw_info *info,
@@ -1108,12 +1153,16 @@ vp_draw_vbo(struct pipe_context *pipe,
    struct vp_cso     *vs = vp->cur_vs;
    struct vp_cso     *fs = vp->cur_fs;
 
-   /* Run on Vortex only for a simple direct, non-indexed, non-
-    * instanced single draw with a translated VS; everything else
-    * falls back wholly to llvmpipe (§4.5). */
+   /* Run on Vortex for a simple direct, non-instanced single draw with a
+    * translated VS. Indexed draws are supported on the hardware path: the
+    * index buffer is uploaded (widened to u32) and resolved per-vertex in the
+    * VS (arg slot 2), so the i-th VS thread renders index_buf[i]. Everything
+    * else falls back wholly to llvmpipe (§4.5). */
+   bool indexed = info->index_size == 2 || info->index_size == 4;
    bool simple =
       vp->dev && vs && vs->vxbin && vs->vs_layout.stride &&
-      !indirect && num_draws == 1 && info->index_size == 0 &&
+      !indirect && num_draws == 1 &&
+      (info->index_size == 0 || indexed) &&
       !info->primitive_restart && info->instance_count == 1 &&
       draws[0].count > 0;
 
@@ -1127,6 +1176,18 @@ vp_draw_vbo(struct pipe_context *pipe,
       struct pipe_transfer  *vxfer = NULL;
       bool vin_ok = !vs->vs_layout.needs_vertex_input ||
                     vp_gather_vertex_input(pipe, vp, draws, &vin, &vxfer);
+
+      /* Indexed draw: upload the index buffer (widened to u32) so the VS can
+       * resolve the per-vertex index on device. If it can't be gathered, drop
+       * the whole indexed draw to llvmpipe. */
+      uint64_t    index_dev = 0;
+      vx_buffer_h ibuf      = NULL;
+      bool index_ok = !indexed ||
+                      vp_gather_index_u32(pipe, vp, info, draws, &index_dev, &ibuf);
+      if (!index_ok) {
+         if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+         goto llvmpipe;
+      }
 
       /* Decide the hardware-raster path up front (caps only, no VS needed) so
        * the supported path can fold the VS into the device draw. The hardware
@@ -1226,6 +1287,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                                   &fs->vx_module, &fs->vx_kernel,
                                   count, &vs->vs_layout,
                                   vs->vs_layout.needs_vertex_input ? &vin : NULL,
+                                  index_dev,
                                   color_dev, depth_dev, w, h, &om,
                                   tex_used ? tex_dev : 0, tex_used ? &tex : NULL,
                                   fs_sw_tex, fs_sw_om, fs_sw_raster);
@@ -1235,6 +1297,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                    "(%u verts, %ux%u, depth_test=%d, textured=%d)",
                    count, w, h, om.depth_test, tex_used);
             if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+            if (ibuf) vx_buffer_release(ibuf);
             return;
          }
          /* hw path failed → fall through to VS-on-Vortex + llvmpipe raster */
@@ -1247,8 +1310,10 @@ vp_draw_vbo(struct pipe_context *pipe,
 
       /* fallback: run the VS on Vortex as a standalone launch, read its output
        * back to a host vertex buffer and rasterize on llvmpipe (unsupported
-       * state / no hardware raster). */
-      if (vin_ok) {
+       * state / no hardware raster). Indexed draws skip this path — the
+       * standalone VS launch does not resolve the index buffer — and drop
+       * straight to the llvmpipe indexed draw. */
+      if (vin_ok && !indexed) {
          vx_buffer_h vsbuf  = NULL;
          uint64_t    vsaddr = 0;
          if (vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
@@ -1274,8 +1339,10 @@ vp_draw_vbo(struct pipe_context *pipe,
       }
       if (vxfer)
          pipe_buffer_unmap(pipe, vxfer);
+      if (ibuf) vx_buffer_release(ibuf);
    }
 
+llvmpipe:
    /* inherit-and-accelerate fallback */
    if (vp_strict_mode()) {
       mesa_loge("vortexpipe: draw_vbo: Vortex path unavailable, "

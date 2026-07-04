@@ -127,7 +127,11 @@ struct vp_tr {
    unsigned       nval;
    /* vertex-shader state (is_vs only) */
    bool           is_vs;
-   LLVMValueRef   vid;          /* i32 vertex id */
+   LLVMValueRef   vid;          /* i32 vertex id (index-resolved): gl_VertexIndex
+                                 * + attribute fetch use this. */
+   LLVMValueRef   vraw;         /* i32 sequential global id: VS output slot. For a
+                                 * direct draw vraw == vid; for an indexed draw
+                                 * vid = index_buf[vraw]. */
    LLVMValueRef   out_base;     /* iptr output-buffer device address */
    unsigned       out_stride;   /* bytes per output vertex record */
    LLVMValueRef   attr_table;   /* iptr addr of the {base,stride}[] table */
@@ -631,8 +635,11 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
          if (!e || e->out_off < 0) { t->ok = false; return; }
          LLVMValueRef off = vp_iptr_const(t, (unsigned)e->out_off);
          if (t->is_vs) {
-            /* vertex shader: out_base + vid * stride + slot_offset */
-            LLVMValueRef voff = LLVMBuildMul(t->b, vp_to_iptr(t, t->vid),
+            /* vertex shader: out_base + vraw * stride + slot_offset. The output
+             * slot is the sequential global id (vraw), not the index-resolved
+             * vid, so an indexed draw writes records[0..count) in draw order for
+             * in-order triangle assembly. */
+            LLVMValueRef voff = LLVMBuildMul(t->b, vp_to_iptr(t, t->vraw),
                vp_iptr_const(t, t->out_stride), "");
             addr = LLVMBuildAdd(t->b, t->out_base, voff, "");
             addr = LLVMBuildAdd(t->b, addr, off, "vsout");
@@ -1443,45 +1450,31 @@ emit_store_i32(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef val)
       LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
 }
 
-/* vx_frag_fetch(): RASTER dispatch v2 self-pull (custom-1, funct3=3, funct7=1).
- * Pops the next covered-quad wave from the single-owner raster producer and
- * stages each lane's frag_payload_t straight into the warp's gfx register window
- * (FWD-5); returns the drained flag in rd (1 = producer drained -> worker exits).
- * The FS reads the payload back with vx_frag_payload (GETW) — no LMEM/LSU. */
+/* vx_frag_payload(word): read one staged frag_payload_t word for this lane from
+ * the gfx window. RASTER dispatch v2 is PUSH: the raster work distributor seeds
+ * the per-lane payload into the gfx register window at warp launch (FWD-5),
+ * indexing the window's WARP dimension by the fragment warp's block_idx — NOT the
+ * minted warp-id. So the FS must read it back with GETWS (custom-1 funct3=4; slot
+ * in funct7[6:2], rs1 = block_idx, count=1 via rs2=x1), exactly like the native
+ * vx_frag_load / vx_gfx_get_slot in sw/kernel/include. A plain GETW (funct3=6,
+ * executing-warp indexed) reads the wrong slot whenever warp-id != block_idx.
+ * block_idx comes from CSR VX_CSR_CTA_BLOCK_ID_X. Returns the raw 32-bit slot. */
 static LLVMValueRef
-emit_vx_frag_fetch(struct vp_tr *t)
+emit_vx_frag_payload(struct vp_tr *t, unsigned word)
 {
-   const char *s = ".insn r 43, 3, 1, $0, x0, x0";
-   const char *c = "=r";
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, NULL, 0, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
-                                      /*HasSideEffects*/ true,
-                                      /*IsAlignStack*/ false,
-                                      LLVMInlineAsmDialectATT,
-                                      /*CanThrow*/ false);
-   return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, "drained");
-}
-
-/* vx_frag_payload(word, tok): read one staged frag_payload_t word for this lane
- * from the gfx window (GETW, custom-1 funct3=6 funct2=3; slot in funct7[6:2],
- * count=1 via rs2=x1). `tok` is the drained flag from emit_vx_frag_fetch, passed
- * as rs1 to chain the scoreboard dependency onto the fetch's window write (the
- * SFU ignores rs1's value). Returns the raw 32-bit slot. */
-static LLVMValueRef
-emit_vx_frag_payload(struct vp_tr *t, unsigned word, LLVMValueRef tok)
-{
+   LLVMValueRef bidx = emit_csr_read(t, VX_CSR_CTA_BLOCK_ID_X, "frag_bid");
    char s[48];
-   unsigned f7 = ((VP_FRAG_SLOT_BASE + word) << 2) | 3;   /* GETW sub-op */
-   snprintf(s, sizeof s, ".insn r 43, 6, %u, $0, $1, x1", f7);
+   unsigned f7 = (VP_FRAG_SLOT_BASE + word) << 2;   /* GETWS: slot<<2, funct3=4 */
+   snprintf(s, sizeof s, ".insn r 43, 4, %u, $0, $1, x1", f7);
    const char *c = "=r,r";
-   LLVMTypeRef args[1] = { t->i32 };
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
+   LLVMTypeRef arg = t->i32;
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, &arg, 1, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
                                       /*HasSideEffects*/ true,
                                       /*IsAlignStack*/ false,
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
-   LLVMValueRef a[1] = { tok };
+   LLVMValueRef a[1] = { bidx };
    return LLVMBuildCall2(t->b, fnty, ia, a, 1, "fragw");
 }
 
@@ -1515,31 +1508,53 @@ emit_fixed_to_float(struct vp_tr *t, LLVMValueRef raw, unsigned frac)
       LLVMConstReal(t->f32, 1.0 / (double)(1u << frac)), "");
 }
 
-/* interpolate one rast_attrib_t {x,y,z} plane: x*dx + y*dy + z. */
+/* fixed24 product, (i64(a)*i64(b)) >> 24 truncated to i32 -- the exact
+ * fixed_t<24> operator* of the native FS (vx_gfx_abi.h). */
 static LLVMValueRef
-emit_interp(struct vp_tr *t, LLVMValueRef attr,
-            LLVMValueRef dx, LLVMValueRef dy)
+emit_fx24_mul(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b)
 {
-   LLVMValueRef ax = emit_fixed_to_float(t, emit_load_i32(t, attr), 24);
-   LLVMValueRef ay = emit_fixed_to_float(t, emit_load_i32(t, addk(t, attr, 4)), 24);
-   LLVMValueRef az = emit_fixed_to_float(t, emit_load_i32(t, addk(t, attr, 8)), 24);
-   LLVMValueRef r  = LLVMBuildFMul(t->b, ax, dx, "");
-   r = LLVMBuildFAdd(t->b, r, LLVMBuildFMul(t->b, ay, dy, ""), "");
-   return LLVMBuildFAdd(t->b, r, az, "");
+   LLVMValueRef p = LLVMBuildMul(t->b,
+      LLVMBuildSExt(t->b, a, t->i64, ""),
+      LLVMBuildSExt(t->b, b, t->i64, ""), "");
+   return LLVMBuildTrunc(t->b,
+      LLVMBuildAShr(t->b, p, LLVMConstInt(t->i64, 24, false), ""), t->i32, "");
 }
 
-/* float colour component in [0,1] -> 8-bit integer (clamped). */
+/* interpolate one rast_attrib_t {x,y,z} plane in Q7.24 integer arithmetic,
+ * bit-identical to the native FS: x*dxq + z + y*dyq with fixed24 products and
+ * wrapping i32 sums. dxq/dyq are the Q7.24-quantized gradients; returns the
+ * raw Q7.24 result bits. */
+static LLVMValueRef
+emit_interp(struct vp_tr *t, LLVMValueRef attr,
+            LLVMValueRef dxq, LLVMValueRef dyq)
+{
+   LLVMValueRef ax = emit_load_i32(t, attr);
+   LLVMValueRef ay = emit_load_i32(t, addk(t, attr, 4));
+   LLVMValueRef az = emit_load_i32(t, addk(t, attr, 8));
+   LLVMValueRef r  = LLVMBuildAdd(t->b, emit_fx24_mul(t, ax, dxq), az, "");
+   return LLVMBuildAdd(t->b, emit_fx24_mul(t, ay, dyq), r, "");
+}
+
+/* float colour component -> 8-bit integer, bit-identical to the native FS's
+ * (uint8_t)(fixed24 * 255): quantize to Q7.24 (trunc toward zero), then the
+ * wrapping i32 *255 >> 24 byte pack. The [-127,127] pre-clamp only guards
+ * FPToSI poison; every representable Q7.24 value is inside it. */
 static LLVMValueRef
 emit_to_byte(struct vp_tr *t, LLVMValueRef f)
 {
-   LLVMValueRef z = LLVMConstReal(t->f32, 0.0);
-   LLVMValueRef o = LLVMConstReal(t->f32, 1.0);
-   f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, f, z, ""),
-                       f, z, "");
-   f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, f, o, ""),
-                       f, o, "");
-   return LLVMBuildFPToUI(t->b,
-      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, 255.0), ""), t->i32, "");
+   LLVMValueRef lo = LLVMConstReal(t->f32, -127.0);
+   LLVMValueRef hi = LLVMConstReal(t->f32,  127.0);
+   f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, f, lo, ""),
+                       f, lo, "");
+   f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, f, hi, ""),
+                       f, hi, "");
+   LLVMValueRef q = LLVMBuildFPToSI(t->b,
+      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, 16777216.0), ""),
+      t->i32, "");
+   LLVMValueRef v = LLVMBuildMul(t->b, q,
+      LLVMConstInt(t->i32, 255, false), "");
+   v = LLVMBuildAShr(t->b, v, LLVMConstInt(t->i32, 24, false), "");
+   return LLVMBuildAnd(t->b, v, LLVMConstInt(t->i32, 0xff, false), "");
 }
 
 /* read arg-block slot k (an i64 device address) widened/narrowed to iptr */
@@ -1565,7 +1580,7 @@ emit_arg_i32(struct vp_tr *t, LLVMValueRef arg, unsigned k)
 static void
 emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
                       LLVMValueRef in_addr,
-                      LLVMValueRef dx, LLVMValueRef dy)
+                      LLVMValueRef dxq, LLVMValueRef dyq)
 {
    static const unsigned colour[4]   = {
       VP_RAST_ATTR_R, VP_RAST_ATTR_G, VP_RAST_ATTR_B, VP_RAST_ATTR_A };
@@ -1582,7 +1597,8 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
       unsigned        planes = (nc <= 2) ? 2u : 4u;
       LLVMValueRef    slot   = addk(t, in_addr, (unsigned)t->vars[i].out_off);
       for (unsigned c = 0; c < nc && c < planes; c++) {
-         LLVMValueRef f = emit_interp(t, addk(t, prim, plane[c]), dx, dy);
+         LLVMValueRef q = emit_interp(t, addk(t, prim, plane[c]), dxq, dyq);
+         LLVMValueRef f = emit_fixed_to_float(t, q, 24);
          emit_store_i32(t, addk(t, slot, c * 4),
                         LLVMBuildBitCast(t->b, f, t->i32, ""));
       }
@@ -1590,23 +1606,39 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
 }
 
 /* Source of a covered quad's per-corner edge (barycentric) values, the one
- * thing that differs between the two raster variants: the HW path reads them
- * from the FF frag window (GETW, chained on `drained`); the SW path reads them
- * from a resident gfx_rast_quad_t in memory (`quad_addr`, words 1+axis*4+corner,
- * pos_mask is word 0). Exactly one field is non-null. */
+ * thing that differs between the two raster variants: the HW path recomputes
+ * them in-shader from the primitive's edge planes (P2 dropped the per-corner
+ * bcoord payload from the frag window — it now carries only {pos_mask, pid}); the
+ * SW path reads them from a resident gfx_rast_quad_t in memory (`quad_addr`,
+ * words 1+axis*4+corner, pos_mask is word 0). `from_window` selects the HW path;
+ * otherwise `quad_addr` is the SW source. */
 struct vp_bc_src {
-   LLVMValueRef drained;     /* HW: chain GETW reads on this token */
-   LLVMValueRef quad_addr;   /* SW: iptr address of the gfx_rast_quad_t */
+   bool         from_window;  /* HW: recompute from the primitive's edge planes */
+   LLVMValueRef quad_addr;    /* SW: iptr address of the gfx_rast_quad_t */
 };
 
-/* Edge value F[axis] at corner `i` of the quad, as a float (fixed_t<16> raw). */
+/* Edge value F[axis] at corner `i` of the quad, as a float (fixed_t<16> raw).
+ * HW path: recompute F = ex*px + ey*py + ez from the primitive's edge plane
+ * {x,y,z} (Q16.16 at `prim` + axis*12), with the sub-pixel coord px=(qx<<1)|(i&1),
+ * py=(qy<<1)|(i>>1) — a 32-bit integer MAC bit-identical to the raster HW bcoord
+ * and the native FS (vx_graphics.h). SW path ignores prim/qx/qy. */
 static LLVMValueRef
-emit_bc(struct vp_tr *t, const struct vp_bc_src *bc, unsigned axis, unsigned i)
+emit_bc(struct vp_tr *t, const struct vp_bc_src *bc, LLVMValueRef prim,
+        LLVMValueRef qx, LLVMValueRef qy, unsigned axis, unsigned i)
 {
    LLVMValueRef raw;
-   if (bc->drained) {
-      /* window payload: word 2 + axis*4 + corner (X,Y,Z planes). */
-      raw = emit_vx_frag_payload(t, 2 + axis * 4 + i, bc->drained);
+   if (bc->from_window) {
+      LLVMValueRef ex = emit_load_i32(t, addk(t, prim, axis * 12 + 0));
+      LLVMValueRef ey = emit_load_i32(t, addk(t, prim, axis * 12 + 4));
+      LLVMValueRef ez = emit_load_i32(t, addk(t, prim, axis * 12 + 8));
+      LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+      LLVMValueRef px = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
+         LLVMConstInt(t->i32, i & 1, false), "px");
+      LLVMValueRef py = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
+         LLVMConstInt(t->i32, i >> 1, false), "py");
+      raw = LLVMBuildAdd(t->b,
+         LLVMBuildAdd(t->b, LLVMBuildMul(t->b, ex, px, ""),
+                            LLVMBuildMul(t->b, ey, py, ""), ""), ez, "bcraw");
    } else {
       /* gfx_rast_quad_t: pos_mask @word0, bcoords[axis*4+corner] @word 1+.. */
       raw = emit_load_i32(t, addk(t, bc->quad_addr, (1 + axis * 4 + i) * 4));
@@ -1614,9 +1646,13 @@ emit_bc(struct vp_tr *t, const struct vp_bc_src *bc, unsigned axis, unsigned i)
    return emit_fixed_to_float(t, raw, 16);
 }
 
-/* Shade one covered 2x2 quad: for each covered sub-pixel, interpolate the
- * varyings from the edge gradient, run fs_main, then merge via the SW OM
- * (gfx_om_fragment_sw) or stage it into the OM window for the trailing vx_om4.
+/* Shade one covered 2x2 quad. STRAIGHT-LINE by design, like the native FS:
+ * every sub-pixel of the quad is shaded unconditionally (the helper-invocation
+ * model — uncovered corners compute garbage) and coverage is applied at the
+ * merge: the FF vx_om4 drops uncovered slots via cov_mask, and the SW OM
+ * receives the corner's coverage bit as an argument. Per-corner branches are
+ * forbidden here: each SIMT lane holds a different quad, so a coverage branch
+ * diverges between lanes.
  * Shared by both raster wrappers; `bc` selects the edge-value source. */
 static void
 emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
@@ -1643,31 +1679,32 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
       LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 31, false), ""),
       LLVMConstInt(t->i32, 1, false), "face");
 
+   (void)fn;
    for (unsigned i = 0; i < 4; i++) {
-      LLVMBasicBlockRef px  = LLVMAppendBasicBlockInContext(t->ctx, fn, "px");
-      LLVMBasicBlockRef nxt = LLVMAppendBasicBlockInContext(t->ctx, fn, "nxt");
       LLVMValueRef cov = LLVMBuildAnd(t->b,
          LLVMBuildLShr(t->b, mask, LLVMConstInt(t->i32, i, false), ""),
-         LLVMConstInt(t->i32, 1, false), "");
-      LLVMBuildCondBr(t->b,
-         LLVMBuildICmp(t->b, LLVMIntNE, cov,
-                       LLVMConstInt(t->i32, 0, false), ""), px, nxt);
+         LLVMConstInt(t->i32, 1, false), "cov");
 
-      LLVMPositionBuilderAtEnd(t->b, px);
-      /* barycentric gradient: dx = F0/(F0+F1+F2), dy = F1/sum. */
-      LLVMValueRef f0 = emit_bc(t, bc, 0, i);
-      LLVMValueRef f1 = emit_bc(t, bc, 1, i);
-      LLVMValueRef f2 = emit_bc(t, bc, 2, i);
+      /* barycentric gradient: dx = F0/(F0+F1+F2), dy = F1/sum, quantized to
+       * Q7.24 exactly like the native FS's FloatA(recip * F0) -- the f32
+       * product truncated toward zero. All downstream interpolation is then
+       * integer fixed24, bit-identical to the native kernel. */
+      LLVMValueRef f0 = emit_bc(t, bc, prim, qx, qy, 0, i);
+      LLVMValueRef f1 = emit_bc(t, bc, prim, qx, qy, 1, i);
+      LLVMValueRef f2 = emit_bc(t, bc, prim, qx, qy, 2, i);
       LLVMValueRef sum = LLVMBuildFAdd(t->b,
          LLVMBuildFAdd(t->b, f0, f1, ""), f2, "");
       LLVMValueRef recip = LLVMBuildFDiv(t->b,
          LLVMConstReal(t->f32, 1.0), sum, "recip");
-      LLVMValueRef dx = LLVMBuildFMul(t->b, recip, f0, "dx");
-      LLVMValueRef dy = LLVMBuildFMul(t->b, recip, f1, "dy");
+      LLVMValueRef k24 = LLVMConstReal(t->f32, 16777216.0);
+      LLVMValueRef dxq = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
+         LLVMBuildFMul(t->b, recip, f0, ""), k24, ""), t->i32, "dxq");
+      LLVMValueRef dyq = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
+         LLVMBuildFMul(t->b, recip, f1, ""), k24, ""), t->i32, "dyq");
 
       /* interpolate the RASTER attribute planes into the FS input
        * varyings (colour and/or texcoord, by declaration). */
-      emit_fs_fill_varyings(t, prim, in_addr, dx, dy);
+      emit_fs_fill_varyings(t, prim, in_addr, dxq, dyq);
 
       /* run the programmable fragment shader (3rd arg = §5 SW texstate table) */
       LLVMValueRef cargs[3] = { in_scr, out_scr, texstate_ptr };
@@ -1683,41 +1720,56 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
          rgba = LLVMBuildOr(t->b, rgba, bc8, "");
       }
 
-      /* interpolate the fragment depth (rast_attribs.z, [0,1]) and
-       * convert to the OM's 24-bit fixed-point depth. */
-      LLVMValueRef dz = emit_interp(t, addk(t, prim, VP_RAST_ATTR_Z),
-                                    dx, dy);
-      LLVMValueRef depth_i = LLVMBuildFPToUI(t->b,
-         LLVMBuildFMul(t->b, dz, LLVMConstReal(t->f32, 16777216.0), ""),
-         t->i32, "");
+      /* fragment depth: the fixed-function screen-space plane MAC over
+       * rast_attribs.z {A',B',C'} (Q7.24), bit-identical to the raster
+       * early-Z (VX_raster_earlyz / earlyz_plane_depth) and the native FS's
+       * PLANE_Z: zbits = trunc32(A'*px + B'*py + C'), saturated to the OM's
+       * 24-bit depth range. px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
+      LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+      LLVMValueRef pxc = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
+         LLVMConstInt(t->i32, i & 1, false), "px");
+      LLVMValueRef pyc = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
+         LLVMConstInt(t->i32, i >> 1, false), "py");
+      LLVMValueRef zpx = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z));
+      LLVMValueRef zpy = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z + 4));
+      LLVMValueRef zpz = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z + 8));
+      LLVMValueRef acc = LLVMBuildAdd(t->b,
+         LLVMBuildAdd(t->b,
+            LLVMBuildMul(t->b, LLVMBuildSExt(t->b, zpx, t->i64, ""),
+                               LLVMBuildSExt(t->b, pxc, t->i64, ""), ""),
+            LLVMBuildMul(t->b, LLVMBuildSExt(t->b, zpy, t->i64, ""),
+                               LLVMBuildSExt(t->b, pyc, t->i64, ""), ""), ""),
+         LLVMBuildSExt(t->b, zpz, t->i64, ""), "");
+      LLVMValueRef z32 = LLVMBuildTrunc(t->b, acc, t->i32, "zbits");
+      LLVMValueRef zmask = LLVMConstInt(t->i32, 0xffffff, false);
+      LLVMValueRef depth_i = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, z32, LLVMConstInt(t->i32, 0, false), ""),
+         LLVMConstInt(t->i32, 0, false),
+         LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntSGT, z32, zmask, ""), zmask, z32, ""),
+         "depth");
 
       if (t->sw_om) {
-         /* §5 SW output-merger: merge this covered sub-pixel directly via
-          * gfx_om_fragment_sw(omstate, px, py, face, colour, depth) over the LSU
-          * (no window staging, no vx_om4). px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
-         LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
-         LLVMValueRef pxc = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
-            LLVMConstInt(t->i32, i & 1, false), "px");
-         LLVMValueRef pyc = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
-            LLVMConstInt(t->i32, i >> 1, false), "py");
-         LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
+         /* §5 SW output-merger: merge this sub-pixel via gfx_om_fragment_sw(
+          * omstate, covered, px, py, face, colour, depth) over the LSU (no
+          * window staging, no vx_om4). The callee applies the coverage bit —
+          * keeping this wrapper straight-line. */
+         LLVMTypeRef params[7] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
+                                   t->i32, t->i32 };
          LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
-                                            params, 6, false);
+                                            params, 7, false);
          LLVMValueRef ofn = LLVMGetNamedFunction(t->mod, "gfx_om_fragment_sw");
          if (!ofn)
             ofn = LLVMAddFunction(t->mod, "gfx_om_fragment_sw", fty);
-         LLVMValueRef a[6] = { omstate_ptr, pxc, pyc, face, rgba, depth_i };
-         LLVMBuildCall2(t->b, fty, ofn, a, 6, "");
+         LLVMValueRef a[7] = { omstate_ptr, cov, pxc, pyc, face, rgba, depth_i };
+         LLVMBuildCall2(t->b, fty, ofn, a, 7, "");
       } else {
-         /* stage this covered sub-pixel's colour + depth into the OM quad
-          * window (colour[i]@base+i, depth[i]@base+4+i). The single vx_om4
-          * after the loop submits the whole quad; cov_mask gates valid slots. */
+         /* stage this sub-pixel's colour + depth into the OM quad window
+          * (colour[i]@base+i, depth[i]@base+4+i). The single vx_om4 after the
+          * loop submits the whole quad; cov_mask gates valid slots. */
          emit_vx_gfx_set(t, VP_OM_SLOT_BASE + i, rgba);
          emit_vx_gfx_set(t, VP_OM_SLOT_BASE + 4 + i, depth_i);
       }
-      LLVMBuildBr(t->b, nxt);
-
-      LLVMPositionBuilderAtEnd(t->b, nxt);   /* fall through to next pixel */
    }
    /* submit the whole quad in one op: desc = pos_mask (cov_mask|qx|qy, face 0),
     * colour/depth already staged in the window. (SW OM already merged each
@@ -1726,9 +1778,13 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
       emit_vx_om4(t, pos_mask, VP_OM_SLOT_BASE);
 }
 
-/* Build kernel_main: the rasterizer poll-loop wrapper that drives the
- * translated fragment body `fs_main`. arg block: [0]=primitive buffer,
- * [1]=colour buffer, [2]=colour-buffer row pitch (bytes). */
+/* Build kernel_main: the straight-line run-once wrapper that drives the
+ * translated fragment body `fs_main`. RASTER dispatch v2 is PUSH: the raster work
+ * distributor launches one 1-warp fragment CTA per covered-quad wave and seeds
+ * that wave's per-lane frag_payload_t into the warp's gfx register window at
+ * launch (FWD-5). The FS therefore runs once, reads its pre-seeded payload back
+ * with GETW, shades its covered sub-pixels, and returns — no poll loop, no fetch
+ * op, no begin op. arg block: [0]=primitive buffer, [1]=texstate, [2]=omstate. */
 static LLVMValueRef
 emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
 {
@@ -1739,9 +1795,6 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
    LLVMValueRef arg = LLVMGetParam(fn, 0);
 
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t->ctx, fn, "entry");
-   LLVMBasicBlockRef loop  = LLVMAppendBasicBlockInContext(t->ctx, fn, "loop");
-   LLVMBasicBlockRef body  = LLVMAppendBasicBlockInContext(t->ctx, fn, "body");
-   LLVMBasicBlockRef exit  = LLVMAppendBasicBlockInContext(t->ctx, fn, "exit");
 
    /* entry: read the arg block, allocate per-pixel scratch. The
     * colour/depth buffers are reached by the OM unit through its
@@ -1772,35 +1825,23 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
                                           "fs_out");
    LLVMValueRef in_addr  = LLVMBuildPtrToInt(t->b, in_scr,  t->iptr, "");
    LLVMValueRef out_addr = LLVMBuildPtrToInt(t->b, out_scr, t->iptr, "");
-   /* No begin op: the RASTER producer auto-arms on its DCR config write and
-    * kicks off the tile/prim load on the first vx_rast_fetch below. */
-   LLVMBuildBr(t->b, loop);
 
-   /* loop: pull a wave into the gfx window; stop when the producer drains. */
-   LLVMPositionBuilderAtEnd(t->b, loop);
-   LLVMValueRef drained = emit_vx_frag_fetch(t);
-   LLVMBuildCondBr(t->b,
-      LLVMBuildICmp(t->b, LLVMIntNE, drained,
-                    LLVMConstInt(t->i32, 0, false), ""),
-      exit, body);
-
-   /* body: read this lane's staged quad payload from the window (GETW, chained
-    * on `drained`), shade its covered sub-pixels. */
-   LLVMPositionBuilderAtEnd(t->b, body);
-   LLVMValueRef pos_mask = emit_vx_frag_payload(t, 0, drained);
-   LLVMValueRef pid      = emit_vx_frag_payload(t, 1, drained);
+   /* read this lane's pre-seeded quad payload from the window (GETW), then shade
+    * its covered sub-pixels. emit_shade_quad masks per-sub-pixel on cov_mask, so
+    * an uncovered lane (pos_mask=0) does nothing. */
+   LLVMValueRef pos_mask = emit_vx_frag_payload(t, 0);
+   LLVMValueRef pid      = emit_vx_frag_payload(t, 1);
    LLVMValueRef poff = LLVMBuildMul(t->b, pid,
       LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base,
                                     vp_to_iptr(t, poff), "prim");
 
-   /* edge values come from the FF frag window (GETW chained on `drained`). */
-   struct vp_bc_src bc = { .drained = drained, .quad_addr = NULL };
+   /* HW raster: edge values are recomputed in-shader from prim[pid]'s edge planes
+    * (the window carries only pos_mask + pid; P2 dropped the bcoord payload). */
+   struct vp_bc_src bc = { .from_window = true, .quad_addr = NULL };
    emit_shade_quad(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
                    in_addr, out_addr, texstate_ptr, omstate_ptr, pos_mask, &bc);
-   LLVMBuildBr(t->b, loop);
 
-   LLVMPositionBuilderAtEnd(t->b, exit);
    LLVMBuildRetVoid(t->b);
    return fn;
 }
@@ -1947,7 +1988,7 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
       LLVMConstInt(t->i32, VP_RAST_QUAD_WORDS * 4, false), "");
    LLVMValueRef quad_addr = LLVMBuildAdd(t->b, quad_base, vp_to_iptr(t, qoff), "quad");
    LLVMValueRef pos_mask = emit_load_i32(t, quad_addr);
-   struct vp_bc_src bc = { .drained = NULL, .quad_addr = quad_addr };
+   struct vp_bc_src bc = { .from_window = false, .quad_addr = quad_addr };
    emit_shade_quad(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
                    in_addr, out_addr, texstate_ptr, omstate_ptr, pos_mask, &bc);
    /* builder is now at emit_shade_quad's trailing fall-through block. */
@@ -2072,6 +2113,38 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       LLVMValueRef at64 = LLVMBuildLoad2(t.b, t.i64, atp, "attrtab64");
       t.attr_table = (t.iptr == t.i64) ? at64
                                        : LLVMBuildTrunc(t.b, at64, t.i32, "attrtab");
+      /* arg slot 2: index buffer base (a u32 index per vertex), or 0 for a
+       * direct (non-indexed) draw. On an indexed draw the i-th VS thread must
+       * render index_buf[i], so the vertex id that drives gl_VertexIndex AND
+       * vertex-attribute fetch is resolved through the index buffer here. When
+       * arg[2] == 0 the vid stays the sequential global id, so the non-indexed
+       * path is byte-identical to the prior ABI. */
+      LLVMValueRef two   = LLVMConstInt(t.i32, 2, false);
+      LLVMValueRef ibp   = LLVMBuildGEP2(t.b, t.i64, t.arg, &two, 1, "");
+      LLVMValueRef ib64  = LLVMBuildLoad2(t.b, t.i64, ibp, "idxbuf64");
+      LLVMValueRef hasix = LLVMBuildICmp(t.b, LLVMIntNE, ib64,
+                                         LLVMConstInt(t.i64, 0, false), "hasidx");
+      LLVMValueRef raw_vid = t.vid;
+      t.vraw = raw_vid;            /* sequential global id -> VS output slot */
+      LLVMBasicBlockRef from_bb = LLVMGetInsertBlock(t.b);
+      LLVMBasicBlockRef idx_bb  = LLVMAppendBasicBlockInContext(t.ctx, fn, "vid_idx");
+      LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(t.ctx, fn, "vid_cont");
+      LLVMBuildCondBr(t.b, hasix, idx_bb, cont_bb);
+      LLVMPositionBuilderAtEnd(t.b, idx_bb);
+      LLVMValueRef ib_iptr = (t.iptr == t.i64) ? ib64
+                                               : LLVMBuildTrunc(t.b, ib64, t.i32, "idxbuf");
+      LLVMValueRef ioff = LLVMBuildMul(t.b, vp_to_iptr(&t, raw_vid),
+                                       vp_iptr_const(&t, 4), "");
+      LLVMValueRef iea  = LLVMBuildAdd(t.b, ib_iptr, ioff, "");
+      LLVMValueRef idx_vid = LLVMBuildLoad2(t.b, t.i32,
+                               LLVMBuildIntToPtr(t.b, iea, t.ptr, ""), "idxvid");
+      LLVMBuildBr(t.b, cont_bb);
+      LLVMPositionBuilderAtEnd(t.b, cont_bb);
+      LLVMValueRef vphi = LLVMBuildPhi(t.b, t.i32, "vid");
+      LLVMValueRef vin_vals[2]  = { raw_vid, idx_vid };
+      LLVMBasicBlockRef vin_bb[2] = { from_bb, idx_bb };
+      LLVMAddIncoming(vphi, vin_vals, vin_bb, 2);
+      t.vid = vphi;
    }
 
    /* Fragment-shader prologue: assign varying/output slots. fs_main's
@@ -2099,8 +2172,11 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       if (!t.val) { t.ok = false; break; }
 
       /* walk the control-flow graph (emits each block's terminator,
-       * including the function return). */
-      emit_cfg(&t, impl, fn, entry);
+       * including the function return). NIR block 0 reuses the prologue's
+       * current tail block so they stay contiguous — for the VS this is the
+       * index-resolve merge block (cont_bb), not the original entry, which the
+       * index-buffer branch already terminated. */
+      emit_cfg(&t, impl, fn, LLVMGetInsertBlock(t.b));
 
       free(t.val);
       t.val = NULL;

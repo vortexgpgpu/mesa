@@ -196,6 +196,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                uint32_t vertex_count,
                const struct vp_vs_layout *layout,
                const struct vp_vertex_input *vin,
+               uint64_t index_dev,
                uint64_t color_dev, uint64_t depth_dev,
                uint32_t width, uint32_t height,
                const struct vp_om_params *om,
@@ -246,7 +247,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
    /* The front-end working set + colour/depth/texture buffers are resident
     * (pool- / context-owned); only the per-draw VS-output + vertex-input
     * buffers are owned here. */
-   vx_buffer_h vsbuf = NULL, vbuf = NULL, tbuf = NULL;
+   vx_buffer_h vsbuf = NULL, vbuf = NULL, tbuf = NULL, fabuf = NULL;
 
    /* kernels resolved from the residency caches below (the modules persist
     * across draws — caller-owned VS/FS slots + the pool's front end). */
@@ -483,6 +484,9 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                                    0, NULL, NULL), "vx_enqueue_write(attrtab)");
          vs_argblk[1] = tbuf_dev;
       }
+      /* slot 2: index buffer (u32 index per vertex); 0 = direct (non-indexed)
+       * draw, in which case the VS uses its sequential global id as the vid. */
+      vs_argblk[2] = index_dev;
 
       /* FS launch fills every HW lane: block = threads × warps (one CTA/core),
        * grid = cores. (nt/nw/nc queried above for the VS geometry.)
@@ -547,9 +551,30 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          argblk[7] = width;
          argblk[8] = height;
       } else {
-         fli.grid_dim[0]  = (uint32_t)nc;
+         /* FWD-5 grid-less kick: no host fragment grid. The RASTER fragment work
+          * distributor (armed below via VX_DCR_RASTER_FRAG_ENTRY/PARAM) injects
+          * one 1-warp fragment CTA per covered-quad wave and seeds its payload
+          * into the gfx window; the straight-line FS reads it back with GETWS.
+          * A non-zero host grid would instead launch a fixed handful of warps
+          * that each run the FS once against an un-seeded window — shading only a
+          * few quads and leaving the rest of the primitive at the clear colour. */
+         fli.grid_dim[0]  = 0;
          fli.block_dim[0] = (uint32_t)(nt * nw);
-         /* FWD-5: vx_frag_fetch stages the payload into the gfx window, not LMEM. */
+      }
+
+      /* HW raster: arm the fragment work distributor. The grid-less FS launch
+       * carries no host args, so the injected fragment warps take their arg
+       * pointer (a0) from VX_DCR_RASTER_FRAG_PARAM — stage the (now-complete)
+       * arg block in a device buffer and resolve the FS entry PC for FRAG_ENTRY.
+       * The write is enqueued before the draw so it lands before any warp runs. */
+      uint64_t frag_entry = 0, fa_dev = 0;
+      if (!sw_raster) {
+         VP_CHECK(vx_buffer_create(dev, sizeof(argblk), VX_MEM_READ, &fabuf),
+                  "vx_buffer_create(fragargs)");
+         VP_CHECK(vx_buffer_address(fabuf, &fa_dev), "vx_buffer_address(fragargs)");
+         VP_CHECK(vx_enqueue_write(q, fabuf, 0, argblk, sizeof(argblk), 0, NULL, NULL),
+                  "vx_enqueue_write(fragargs)");
+         VP_CHECK(vx_kernel_address(kbuf, &frag_entry), "vx_kernel_address(fs)");
       }
 
       /* The whole draw as ONE CP command batch (§6.4): expand -> setup ->
@@ -582,6 +607,13 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_RASTER_PBUF_STRIDE, VP_RAST_PRIM_STRIDE);
       DCRW(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
       DCRW(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
+      /* Arm the fragment work distributor: FS entry PC + device args pointer.
+       * The simx/HW RASTER unit injects a fragment warp per covered quad only
+       * when FRAG_ENTRY is non-zero — without this the grid-less FS never runs. */
+      DCRW(VX_DCR_RASTER_FRAG_ENTRY_LO, (uint32_t)(frag_entry & 0xffffffffu));
+      DCRW(VX_DCR_RASTER_FRAG_ENTRY_HI, (uint32_t)(frag_entry >> 32));
+      DCRW(VX_DCR_RASTER_FRAG_PARAM_LO, (uint32_t)(fa_dev & 0xffffffffu));
+      DCRW(VX_DCR_RASTER_FRAG_PARAM_HI, (uint32_t)(fa_dev >> 32));
       }
 
       /* FF OM config — skipped when OM is routed to software (the FS merges via
@@ -645,6 +677,7 @@ done:
    if (tbuf) vx_buffer_release(tbuf);
    if (vbuf) vx_buffer_release(vbuf);
    if (vsbuf) vx_buffer_release(vsbuf);
+   if (fabuf) vx_buffer_release(fabuf);
    if (q)         vx_queue_release(q);
    return ok;
 }

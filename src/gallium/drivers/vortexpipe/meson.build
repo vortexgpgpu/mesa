@@ -34,6 +34,14 @@ if vp_vortex_home == ''
         'install prefix)')
 endif
 
+# The Vortex out-of-tree build dir (libvortex2.a + generated config headers).
+# Defaults to <vortex-home>/build to match the front-end Makefile's own
+# default; set -Dvortex-build for a CI tree built under build32/build64/etc.
+vp_vortex_build = get_option('vortex-build')
+if vp_vortex_build == ''
+  vp_vortex_build = vp_vortex_home / 'build'
+endif
+
 # make builds the .vxbin out-of-tree into the custom_target's @OUTDIR@;
 # xxd.py then embeds it as a C byte array (-b: binary, no trailing nul).
 gfx_frontend_vxbin = custom_target(
@@ -47,20 +55,27 @@ gfx_frontend_vxbin = custom_target(
     # is this target's output directory (where meson expects the .vxbin).
     'OUTDIR=' + meson.current_build_dir(),
     'VORTEX_HOME=' + vp_vortex_home,
+    # VORTEX_BUILD is the Vortex out-of-tree build dir holding libvortex2.a
+    # (sw/kernel/) and the generated config headers (sw/, hw/) the front-end
+    # kernel links/includes. The Makefile defaults it to <VORTEX_HOME>/build,
+    # which is wrong for a CI tree configured under a differently named build
+    # dir (build32/build64/build32_amo); forward the real one so the kernel
+    # links the matching libvortex2.a.
+    'VORTEX_BUILD=' + vp_vortex_build,
     'VORTEX_TOOLDIR=' + get_option('vortex-tooldir'),
     'all',
   ],
   # Rebuild the blob when the SDK kernel sources (sw/gfx, sw/common) or the
-  # build recipe change — meson does not see make's own prerequisites.
+  # build recipe change — meson does not see make's own prerequisites. Headers
+  # follow the 06-10 consolidation: the fused stage logic is gfx_frontend_k.h;
+  # the shared ABI/setup math live in sw/common (gfx_frontend_abi.h + gfx_setup.h).
   depend_files : files(
       'kernels/gfx_frontend/gfx_frontend_kernel.cpp',
       'kernels/gfx_frontend/Makefile',
     ) + [
-      vp_vortex_home / 'sw' / 'gfx' / 'pipe_frontend.h',
-      vp_vortex_home / 'sw' / 'gfx' / 'pipe_abi.h',
-      vp_vortex_home / 'sw' / 'gfx' / 'setup_math.h',
-      vp_vortex_home / 'sw' / 'gfx' / 'setup_types.h',
+      vp_vortex_home / 'sw' / 'gfx' / 'gfx_frontend_k.h',
       vp_vortex_home / 'sw' / 'common' / 'gfx_frontend_abi.h',
+      vp_vortex_home / 'sw' / 'common' / 'gfx_setup.h',
       vp_vortex_home / 'sw' / 'common' / 'vx_gfx_abi.h',
     ],
   console : true,
@@ -98,8 +113,12 @@ files_vortexpipe = files(
 # -I<vortex-home>/sw/common gives vp_raster.cpp the gfx_v2 front-end ABI
 # (gfx_frontend_abi.h: pipe_arg_t, setup_vertex_t, PIPE_STAGE_*) it shares
 # with the embedded device kernel; that header is not in the install prefix.
+# VP_VORTEX_HOME/VP_TOOLDIR are the compile-time fallbacks vp_compile.c uses
+# when the VORTEX_HOME/VORTEX_TOOLDIR env vars are unset (it reads VP_VORTEX_HOME,
+# not a path/install macro). Bake the source tree so the .vxbin compiler locates
+# sw/kernel scripts + libvortex2.a without relying on the run-time environment.
 vp_def_args = [
-  '-DVP_VORTEX_PATH="' + get_option('vortex-path') + '"',
+  '-DVP_VORTEX_HOME="' + vp_vortex_home + '"',
   '-DVP_TOOLDIR="'     + get_option('vortex-tooldir') + '"',
   '-I' + vp_vortex_home / 'sw' / 'common',
 ]

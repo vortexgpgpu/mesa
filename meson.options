@@ -128,6 +128,17 @@ option(
 )
 
 option(
+  'vortex-build',
+  type : 'string',
+  value : '',
+  description : 'Path to the Vortex out-of-tree build dir (VORTEX_BUILD) ' +
+                'holding libvortex2.a and the generated config headers the ' +
+                'gfx_v2 front-end kernel links/includes. Defaults to ' +
+                '<vortex-home>/build; set this for a CI tree built under a ' +
+                'differently named build dir (build32 / build64 / build32_amo).',
+)
+
+option(
   'gallium-vdpau',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},
