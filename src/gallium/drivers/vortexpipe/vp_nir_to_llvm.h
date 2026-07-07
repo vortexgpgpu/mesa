@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: MIT
  *
  * vp_nir_to_llvm -- the scalar NIR -> LLVM-IR translator (Shape C).
- * See docs/proposals/vulkan_support_proposal.md §3 in the Vortex tree.
  */
 
 #ifndef VP_NIR_TO_LLVM_H
@@ -17,7 +16,7 @@ extern "C" {
 
 struct nir_shader;
 
-/* Vertex-shader output layout (Phase 3). vortexpipe's VS kernel
+/* Vertex-shader output layout. vortexpipe's VS kernel
  * writes one record per vertex into a device buffer; the draw
  * integration reads it back with this layout. All sizes in bytes.
  * Each slot is a padded vec4 (16 bytes): slot 0 is gl_Position,
@@ -32,7 +31,7 @@ struct vp_vs_layout {
    bool     needs_vertex_input;              /* VS fetches vertex attributes */
 };
 
-/* gfx_v2 §5 per-unit software-fallback routing (compile-time). When a unit is
+/* Per-unit software-fallback routing (compile-time). When a unit is
  * routed to software the FS calls the gfx_sw_abi entry points instead of the FF
  * intrinsic; the host feeds resident descriptors via the kernel arg block. A
  * NULL routing (or all-false) is the all-hardware path. */
@@ -62,8 +61,18 @@ void vp_free_ir(char *ir);
  *    address at `offset`. */
 enum vp_desc_kind { VP_DESC_BUFFER, VP_DESC_AS };
 struct vp_desc {
-   unsigned          offset;   /* byte offset in the set-0 descriptor buffer */
+   unsigned          offset;   /* byte offset in the descriptor buffer */
+   /* The constant-buffer index holding this descriptor = descriptor set + 1
+    * (lavapipe binds set N's descriptor blob at constant-buffer index N+1). The
+    * FS reaches it via load_const_buf_base_addr_lvp(cbuf_index); the relocation
+    * must rewrite the lp_jit_buffer.ptr inside that set's blob, not always set 0. */
+   unsigned          cbuf_index;
    enum vp_desc_kind kind;
+   /* Byte multiplier for the descriptor's lp_jit_buffer.num_elements field (at
+    * +8): an SSBO stores num_elements in bytes (1), a UBO in dwords (4, from
+    * lp_jit_buffer_from_pipe_const's DIV_ROUND_UP(size, sizeof(float))). Used
+    * by the FS descriptor relocation to size the device upload; 0 for AS. */
+   unsigned          elem_bytes;
 };
 #define VP_MAX_DESCS 16
 

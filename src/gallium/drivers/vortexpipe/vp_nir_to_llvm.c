@@ -11,20 +11,19 @@
  *
  *   - Compute: one thread per work-item. SSBO base addresses come
  *     from the lavapipe descriptor buffer, reached through %arg.
- *   - Vertex (Phase 3): one thread per vertex. gl_VertexIndex is the
+ *   - Vertex: one thread per vertex. gl_VertexIndex is the
  *     CTA thread id; the kernel writes one padded-vec4 record per
  *     vertex into the output buffer whose device address is %arg[0].
  *
  * NIR SSA values are untyped bit patterns; each component is held as
  * an LLVM iN and ops bit-cast to the type they need. NIR derefs
  * resolve to iptr byte addresses (i32 on rv32, i64 on rv64).
- *
- * See docs/proposals/vulkan_support_proposal.md §3 in the Vortex tree.
  */
 
 #include "vp_nir_to_llvm.h"
 #include "vp_compile.h"      /* vp_xlen_is_64 */
 #include "vp_private.h"      /* vp_dbg */
+#include "gfx_fs_desc_abi.h" /* GFX_FS_ARG_DESC, GFX_FS_DESC_SLOTS */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,23 +60,28 @@
 #define VX_CSR_RASTER_BCOORD_Z0 0x7C9
 #define VX_CSR_RASTER_PID       0x7CD
 #define VX_RASTER_DIM_BITS      15     /* pos_mask x/y field width + 1 */
-/* frag_payload_t in the gfx window (FWD-5): word [0]=pos_mask, [1]=pid,
- * [2+axis*4+corner]=bcoord. Base slot matches RTL VX_gfx_window_pkg
- * GFXW_FRAG_SLOT_BASE and the kernel ABI VX_GFX_FRAG_SLOT_BASE. */
-#define VP_FRAG_SLOT_BASE       8
-/* gfx-window slot allocation for the FS (disjoint from the frag payload 8..21):
+/* frag_payload_t in the gfx window: word [0]=pos_mask, [1]=pid.
+ * The base sits outside the RTU object-ray range [8..13] at [19..20] so a
+ * fragment shader can hold this record and an in-flight RTU query at once. Must
+ * stay equal to the kernel ABI VX_GFX_FRAG_SLOT_BASE (VX_types.toml [gfx_window]). */
+#define VP_FRAG_SLOT_BASE       19
+/* gfx-window slot allocation for the FS (disjoint from the frag record 19..20):
  *   OM quad staging  : color[0..3] @ 0..3, depth[0..3] @ 4..7
  *   TEX windowed I/O : u @ 22, v @ 23, texel @ 24 */
 #define VP_OM_SLOT_BASE         0
 #define VP_TEX_IN_SLOT          22
 #define VP_TEX_OUT_SLOT         24
 
-/* vortex::graphics::rast_prim_t layout (sw/kernel/include/vx_graphics.h,
- * FIXEDPOINT):
- * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v}, each a
- * rast_attrib_t {x,y,z} of fixed24. r/g/b/a are the colour planes,
- * u/v the texcoord planes. */
-#define VP_RAST_PRIM_STRIDE 120
+/* vortex::graphics::rast_prim_t layout (sw/common/vx_gfx_abi.h, FIXEDPOINT):
+ * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v,rhw}, each a
+ * rast_attrib_t {x,y,z} of fixed24 (12B). r/g/b/a are the colour planes,
+ * u/v the texcoord planes; rhw is the perspective 1/w plane (appended last,
+ * so the z/r/g/b/a/u/v offsets below are unchanged). At w==1 the premultiplied
+ * colour/uv planes equal the raw attributes and rhw is constant, so reading them
+ * affinely is exact; the trailing rhw pushes the per-prim stride to 132B.
+ * NOTE: duplicated as VP_RAST_PRIM_STRIDE in vp_raster.cpp (the DCR writer) —
+ * keep the two in sync. */
+#define VP_RAST_PRIM_STRIDE 132
 #define VP_RAST_ATTR_Z       36
 #define VP_RAST_ATTR_R       48
 #define VP_RAST_ATTR_G       60
@@ -132,6 +136,13 @@ struct vp_tr {
    LLVMValueRef   vraw;         /* i32 sequential global id: VS output slot. For a
                                  * direct draw vraw == vid; for an indexed draw
                                  * vid = index_buf[vraw]. */
+   /* Instancing (is_vs only). The VS runs instance_count × verts_per_instance
+    * threads; instance = gid / vpi (0-based, gl_InstanceID) and first_instance =
+    * gl_BaseInstance. gl_InstanceIndex = instance + first_instance (NIR lowers it
+    * to load_instance_id + load_base_instance). Both null on the non-instanced
+    * fast path (verts_per_instance == 0). */
+   LLVMValueRef   instance;       /* i32 0-based instance id (gl_InstanceID) */
+   LLVMValueRef   first_instance; /* i32 base instance (gl_BaseInstance) */
    LLVMValueRef   out_base;     /* iptr output-buffer device address */
    unsigned       out_stride;   /* bytes per output vertex record */
    LLVMValueRef   attr_table;   /* iptr addr of the {base,stride}[] table */
@@ -141,13 +152,19 @@ struct vp_tr {
    LLVMValueRef   fs_out_base;  /* iptr output-colour area */
    struct vp_var  vars[VP_MAXV];
    unsigned       nvars;
-   /* gfx_v2 §5 per-unit SW routing (FS only). fs_texstate is fs_main's 3rd
+   /* Per-unit SW routing (FS only). fs_texstate is fs_main's 3rd
     * param: a resident gfx_sw_texstate_t[] (per sampler stage), used by
     * emit_vx_tex when sw_tex; null pointer when texturing is HW. */
    bool           sw_tex;
    bool           sw_om;
    bool           sw_raster;  /* FS is the one-thread-per-tile SW-raster kernel */
    LLVMValueRef   fs_texstate; /* ptr param (gfx_sw_texstate_t* table) */
+   /* Number of colour attachments the FS writes (1 = single RT, the
+    * byte-identical fast path). Colour output k occupies out slot k*16 in the
+    * FS output area; the wrapper packs slots 0..num_color-1 into a src_colors[]
+    * array and calls gfx_om_fragment_mrt_sw when num_color > 1. */
+   unsigned       fs_num_color;
+   unsigned       fs_out_words;  /* i32 words in the FS output area (incl. scratch) */
    bool           ok;
 };
 
@@ -719,6 +736,18 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_vertex_id_zero_base:
       ssa_set(t, in->def.index, 0, t->vid);
       break;
+   /* Instancing. gl_InstanceIndex lowers (nir_lower_system_values) to
+    * load_instance_id + load_base_instance; the VS prologue resolves the
+    * 0-based instance id and the base-instance from arg slots 3/4. On the
+    * non-instanced fast path instance == 0 and first_instance == 0. */
+   case nir_intrinsic_load_instance_id:
+      ssa_set(t, in->def.index, 0,
+              t->instance ? t->instance : LLVMConstInt(t->i32, 0, false));
+      break;
+   case nir_intrinsic_load_base_instance:
+      ssa_set(t, in->def.index, 0,
+              t->first_instance ? t->first_instance : LLVMConstInt(t->i32, 0, false));
+      break;
    /* vertex-attribute fetch (lowered-IO NIR path): read each component
     * from the bound vertex buffer at attr base + component offset. */
    case nir_intrinsic_load_input: {
@@ -734,12 +763,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       break;
    }
    case nir_intrinsic_load_const_buf_base_addr_lvp: {
-      /* SSBO/UBO base address = arg_block[index] (array of i64). A
-       * fragment shader has no arg block -- the only descriptor it
-       * touches in gfx-v1 is the combined image-sampler, which is
-       * bound to TEX stage 0 by DCRs and addressed by stage, not by
-       * a handle. So the value only ever feeds a vx_tex handle source
-       * (which emit_tex ignores); a placeholder keeps it well-formed. */
+      /* Base device address of constant buffer `index` = arg[index]. For the
+       * FS arg is the resident descriptor table: index 1 is the set-0
+       * descriptor blob, which feeds the UBO/SSBO descriptor dereference; a
+       * combined-image-sampler's value only feeds a vx_tex handle source
+       * (emit_tex ignores it). A shader with no table (compute VS placeholder)
+       * keeps it well-formed with 0. */
       if (!t->arg) {
          ssa_set(t, in->def.index, 0, LLVMConstInt(t->i64, 0, false));
          break;
@@ -767,7 +796,11 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_ssbo:
    case nir_intrinsic_load_ubo: {
       LLVMValueRef base;
-      if (in->intrinsic == nir_intrinsic_load_ubo) {
+      if (in->intrinsic == nir_intrinsic_load_ubo &&
+          (!t->is_fs || nir_src_is_const(in->src[0]))) {
+         /* Constant-buffer index form: base = arg[index] read directly. Push
+          * constants (load_ubo(0, off)) take this path in the FS too (src[0] is
+          * the constant 0); the compute AS descriptor read is unchanged. */
          if (t->arg) {
             LLVMValueRef idx = intr_src(t, in, 0);
             LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
@@ -776,6 +809,11 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             base = LLVMConstInt(t->i64, 0, false);
          }
       } else {
+         /* Descriptor-address form: src[0] is a descriptor's device address —
+          * load_ssbo, and the lavapipe FS UBO, whose NIR is
+          * load_ubo(load_const_buf_base_addr_lvp(set)+binding, off). The buffer's
+          * data base is the descriptor's lp_jit_buffer.ptr (its first 8 bytes),
+          * which vp_raster relocates host->device before upload. */
          LLVMValueRef desc = intr_src(t, in, 0);              /* descriptor addr */
          LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
          base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase"); /* lp_jit_buffer.ptr */
@@ -812,6 +850,104 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             LLVMConstInt(t->i64, c * esz, false), "");
          if (v)
             LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+      }
+      break;
+   }
+   /* SSBO atomics: read-modify-write at the SSBO byte address, lowered onto the
+    * device's RISC-V A-extension. The address is *(desc)+off exactly as
+    * store_ssbo (operand layout: src[0]=descriptor addr, src[1]=byte offset,
+    * src[2]=data; the _swap form adds src[2]=compare, src[3]=new value). The
+    * device dcache is the atomic ordering point.
+    *
+    *   ssbo_atomic      -> atomicrmw  (add/xchg/and/or/xor/{i,u}min/{i,u}max)
+    *                       => amoadd.w / amoswap.w / amoand.w / amoor.w /
+    *                          amoxor.w / amomin[u].w / amomax[u].w
+    *   ssbo_atomic_swap -> cmpxchg    => LR.W/SC.W retry loop
+    *
+    * 32-bit integer only — the lane ABI is 32-bit and the device AMOs are .w.
+    * Float atomics (fadd/fmin/fmax/fcmpxchg) and 64-bit are rejected
+    * (fail-compile) since there is no device AMO for them. */
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap: {
+      if (in->def.bit_size != 32) {
+         mesa_logw("vortexpipe: %u-bit SSBO atomic unsupported (32-bit only)",
+                   in->def.bit_size);
+         t->ok = false;
+         break;
+      }
+      nir_atomic_op aop = nir_intrinsic_atomic_op(in);
+      LLVMValueRef desc = intr_src(t, in, 0);
+      LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
+      LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase");
+      LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 1), t->i64, "");
+      LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
+      LLVMValueRef p    = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
+      if (in->intrinsic == nir_intrinsic_ssbo_atomic_swap) {
+         /* compare-and-swap: src[2]=compare, src[3]=new. cmpxchg returns
+          * {oldval, i1 success}; the intrinsic wants the old value. */
+         if (aop != nir_atomic_op_cmpxchg) {
+            mesa_logw("vortexpipe: SSBO atomic_swap op %d unsupported", aop);
+            t->ok = false;
+            break;
+         }
+         LLVMValueRef cmp = intr_src(t, in, 2);
+         LLVMValueRef nv  = intr_src(t, in, 3);
+         LLVMValueRef r = LLVMBuildAtomicCmpXchg(t->b, p, cmp, nv,
+            LLVMAtomicOrderingSequentiallyConsistent,
+            LLVMAtomicOrderingSequentiallyConsistent, /*singleThread*/ false);
+         ssa_set(t, in->def.index, 0,
+                 LLVMBuildExtractValue(t->b, r, 0, "amocas"));
+         break;
+      }
+      LLVMAtomicRMWBinOp op;
+      bool supported = true;
+      switch (aop) {
+      case nir_atomic_op_iadd: op = LLVMAtomicRMWBinOpAdd;  break;
+      case nir_atomic_op_xchg: op = LLVMAtomicRMWBinOpXchg; break;
+      case nir_atomic_op_iand: op = LLVMAtomicRMWBinOpAnd;  break;
+      case nir_atomic_op_ior:  op = LLVMAtomicRMWBinOpOr;   break;
+      case nir_atomic_op_ixor: op = LLVMAtomicRMWBinOpXor;  break;
+      case nir_atomic_op_imin: op = LLVMAtomicRMWBinOpMin;  break;
+      case nir_atomic_op_imax: op = LLVMAtomicRMWBinOpMax;  break;
+      case nir_atomic_op_umin: op = LLVMAtomicRMWBinOpUMin; break;
+      case nir_atomic_op_umax: op = LLVMAtomicRMWBinOpUMax; break;
+      default:                 op = LLVMAtomicRMWBinOpAdd;
+                               supported = false;           break;
+      }
+      if (!supported) {
+         /* float atomics (fadd/fmin/fmax), inc/dec_wrap: no device AMO */
+         mesa_logw("vortexpipe: SSBO atomic op %d unsupported (int32 only)",
+                   aop);
+         t->ok = false;
+         break;
+      }
+      LLVMValueRef val = intr_src(t, in, 2);
+      LLVMValueRef r = LLVMBuildAtomicRMW(t->b, op, p, val,
+         LLVMAtomicOrderingSequentiallyConsistent, /*singleThread*/ false);
+      ssa_set(t, in->def.index, 0, r);
+      break;
+   }
+   /* Push constants: lavapipe usually lowers these to load_ubo(0, off), but
+    * a load_push_constant survives on some paths. Read table[0] (the push-
+    * constant constant-buffer base) + off directly, mirroring load_ubo(0). */
+   case nir_intrinsic_load_push_constant: {
+      LLVMValueRef base;
+      if (t->arg) {
+         LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+         LLVMValueRef gep  = LLVMBuildGEP2(t->b, t->i64, t->arg, &zero, 1, "");
+         base = LLVMBuildLoad2(t->b, t->i64, gep, "pushbase");
+      } else {
+         base = LLVMConstInt(t->i64, 0, false);
+      }
+      LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 0), t->i64, "");
+      LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
+      LLVMTypeRef  lt   = ity(t, in->def.bit_size);
+      unsigned     esz  = in->def.bit_size / 8u;
+      for (unsigned c = 0; c < in->def.num_components; c++) {
+         LLVMValueRef a = LLVMBuildAdd(t->b, addr,
+            LLVMConstInt(t->i64, c * esz, false), "");
+         LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "push"));
       }
       break;
    }
@@ -1003,7 +1139,7 @@ static LLVMValueRef
 emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
             LLVMValueRef lod)
 {
-   /* §5 software sampler: call gfx_tex_sample_sw(&texstate[0], u, v, lod) on the
+   /* Software sampler: call gfx_tex_sample_sw(&texstate[0], u, v, lod) on the
     * resident descriptor table (fs_main's 3rd param) instead of the FF TEX unit.
     * Same fixed-point u/v/lod convention; returns the packed A8R8G8B8 texel. */
    if (t->sw_tex) {
@@ -1082,7 +1218,7 @@ emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
 
 /* vx_rt_trace: rd = handle <- trace(rs1 = lane-packed config; f0..f7 = ray).
  * config = wgather(0, scene, 0, flags|cull): lane1=scene, lane2=payload(0),
- * lane3=flags|cull (the RtuUnit reads rs1 lanes 1/2/3). The eight ray floats
+ * lane3=flags|cull (the RTU reads rs1 lanes 1/2/3). The eight ray floats
  * are bound to f0..f7 — read by HW convention, like the tensor unit's fragment
  * window; the encoding itself only names rd/rs1, so the window operands ride
  * the operand list unreferenced. SSA values are i32 bit-patterns, so the ray
@@ -1407,18 +1543,47 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
       t->nvars++;
       off += 16;
    }
-   off = 0;
+   /* Output slots are keyed by render-target index: a colour output at
+    * FRAG_RESULT_DATA0+k lands at out slot k*16, so the wrapper can pack colours
+    * 0..num_color-1 deterministically regardless of declaration order. Non-colour
+    * outputs (gl_FragDepth/stencil — unsupported on gfx-v1, depth comes from the
+    * plane) get a scratch slot past the colour area so their stores never corrupt
+    * a colour and are never read back. */
+   unsigned num_color = 0, scratch = 0;
    nir_foreach_shader_out_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      unsigned loc = var->data.location;
+      int rt;
+      if (loc == FRAG_RESULT_COLOR) {
+         rt = 0;                              /* broadcast colour -> RT0 */
+      } else if (loc >= FRAG_RESULT_DATA0) {
+         rt = (int)(loc - FRAG_RESULT_DATA0); /* explicit MRT index */
+      } else {
+         rt = -1;                             /* depth/stencil: scratch slot */
+      }
+      unsigned slot;
+      if (rt < 0) {
+         slot = GFX_OM_MAX_RT + scratch;      /* scratch area past the colours */
+         scratch++;
+      } else {
+         if ((unsigned)rt >= GFX_OM_MAX_RT) { /* bound the RT index */
+            mesa_loge("vortexpipe: FS colour output RT%d exceeds VX_OM_MAX_RT=%u",
+                      rt, GFX_OM_MAX_RT);
+            t->ok = false; return;
+         }
+         slot = (unsigned)rt;
+         if ((unsigned)rt + 1 > num_color) num_color = (unsigned)rt + 1;
+      }
       t->vars[t->nvars].var     = var;
       t->vars[t->nvars].alloca  = NULL;
-      t->vars[t->nvars].out_off = (int)off;
+      t->vars[t->nvars].out_off = (int)(slot * 16);
       t->nvars++;
-      off += 16;
    }
+   t->fs_num_color = num_color ? num_color : 1;
+   t->fs_out_words = (GFX_OM_MAX_RT + scratch) * 4;
 }
 
-/* ---- fragment-kernel wrapper (Phase 4 Step 2) ----------------------- *
+/* ---- fragment-kernel wrapper ----------------------- *
  * A fragment shader runs on Vortex as a rasterizer-driven kernel: every
  * thread polls vx_rast() for quads, the wrapper interpolates the
  * varyings from the bcoord CSRs + the primitive buffer, calls the
@@ -1452,7 +1617,7 @@ emit_store_i32(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef val)
 
 /* vx_frag_payload(word): read one staged frag_payload_t word for this lane from
  * the gfx window. RASTER dispatch v2 is PUSH: the raster work distributor seeds
- * the per-lane payload into the gfx register window at warp launch (FWD-5),
+ * the per-lane payload into the gfx register window at warp launch,
  * indexing the window's WARP dimension by the fragment warp's block_idx — NOT the
  * minted warp-id. So the FS must read it back with GETWS (custom-1 funct3=4; slot
  * in funct7[6:2], rs1 = block_idx, count=1 via rs2=x1), exactly like the native
@@ -1660,6 +1825,8 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
                 LLVMValueRef prim, LLVMValueRef in_scr, LLVMValueRef out_scr,
                 LLVMValueRef in_addr, LLVMValueRef out_addr,
                 LLVMValueRef texstate_ptr, LLVMValueRef omstate_ptr,
+                LLVMValueRef desc_ptr, LLVMValueRef mrt_ptr,
+                LLVMValueRef mrt_colors_addr,
                 LLVMValueRef pos_mask, const struct vp_bc_src *bc)
 {
    LLVMValueRef mask = LLVMBuildAnd(t->b, pos_mask,
@@ -1706,23 +1873,31 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
        * varyings (colour and/or texcoord, by declaration). */
       emit_fs_fill_varyings(t, prim, in_addr, dxq, dyq);
 
-      /* run the programmable fragment shader (3rd arg = §5 SW texstate table) */
-      LLVMValueRef cargs[3] = { in_scr, out_scr, texstate_ptr };
-      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 3, "");
+      /* run the programmable fragment shader (3rd arg = SW texstate table,
+       * 4th = resident FS descriptor table). */
+      LLVMValueRef cargs[4] = { in_scr, out_scr, texstate_ptr, desc_ptr };
+      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 4, "");
 
-      /* pack the FS output (4 floats) into an R8G8B8A8 pixel. */
-      LLVMValueRef rgba = LLVMConstInt(t->i32, 0, false);
-      for (unsigned c = 0; c < 4; c++) {
-         LLVMValueRef fc = LLVMBuildBitCast(t->b,
-            emit_load_i32(t, addk(t, out_addr, c * 4)), t->f32, "");
-         LLVMValueRef bc8 = LLVMBuildShl(t->b, emit_to_byte(t, fc),
-            LLVMConstInt(t->i32, c * 8, false), "");
-         rgba = LLVMBuildOr(t->b, rgba, bc8, "");
+      /* pack a render target's FS output (4 floats at out_addr + rt*16) into an
+       * R8G8B8A8 pixel. */
+      unsigned num_color = t->fs_num_color ? t->fs_num_color : 1;
+      LLVMValueRef rgba_rt[GFX_OM_MAX_RT];
+      for (unsigned rt = 0; rt < num_color && rt < GFX_OM_MAX_RT; rt++) {
+         LLVMValueRef rgba = LLVMConstInt(t->i32, 0, false);
+         for (unsigned c = 0; c < 4; c++) {
+            LLVMValueRef fc = LLVMBuildBitCast(t->b,
+               emit_load_i32(t, addk(t, out_addr, rt * 16 + c * 4)), t->f32, "");
+            LLVMValueRef bc8 = LLVMBuildShl(t->b, emit_to_byte(t, fc),
+               LLVMConstInt(t->i32, c * 8, false), "");
+            rgba = LLVMBuildOr(t->b, rgba, bc8, "");
+         }
+         rgba_rt[rt] = rgba;
       }
+      LLVMValueRef rgba = rgba_rt[0];   /* RT0 (single-RT / FF paths) */
 
       /* fragment depth: the fixed-function screen-space plane MAC over
        * rast_attribs.z {A',B',C'} (Q7.24), bit-identical to the raster
-       * early-Z (VX_raster_earlyz / earlyz_plane_depth) and the native FS's
+       * early-Z and the native FS's
        * PLANE_Z: zbits = trunc32(A'*px + B'*py + C'), saturated to the OM's
        * 24-bit depth range. px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
       LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
@@ -1749,8 +1924,29 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
             LLVMBuildICmp(t->b, LLVMIntSGT, z32, zmask, ""), zmask, z32, ""),
          "depth");
 
-      if (t->sw_om) {
-         /* §5 SW output-merger: merge this sub-pixel via gfx_om_fragment_sw(
+      if (t->sw_om && num_color > 1) {
+         /* >1 colour attachment merges via gfx_om_fragment_mrt_sw(
+          * omstate, rt[], num_color, covered, px, py, face, colours[], depth) —
+          * one shared depth op then a per-attachment blend + colour write. Pack
+          * this sub-pixel's per-RT colours into the reused src_colors[] slot and
+          * submit. MRT is only valid on the SW-OM path. */
+         for (unsigned rt = 0; rt < num_color && rt < GFX_OM_MAX_RT; rt++)
+            emit_store_i32(t, addk(t, mrt_colors_addr, rt * 4), rgba_rt[rt]);
+         LLVMTypeRef params[9] = { t->ptr, t->ptr, t->i32, t->i32, t->i32,
+                                   t->i32, t->i32, t->ptr, t->i32 };
+         LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                            params, 9, false);
+         LLVMValueRef ofn = LLVMGetNamedFunction(t->mod, "gfx_om_fragment_mrt_sw");
+         if (!ofn)
+            ofn = LLVMAddFunction(t->mod, "gfx_om_fragment_mrt_sw", fty);
+         LLVMValueRef colors_ptr = LLVMBuildIntToPtr(t->b, mrt_colors_addr,
+                                                     t->ptr, "colors");
+         LLVMValueRef a[9] = { omstate_ptr, mrt_ptr,
+                               LLVMConstInt(t->i32, num_color, false),
+                               cov, pxc, pyc, face, colors_ptr, depth_i };
+         LLVMBuildCall2(t->b, fty, ofn, a, 9, "");
+      } else if (t->sw_om) {
+         /* SW output-merger: merge this sub-pixel via gfx_om_fragment_sw(
           * omstate, covered, px, py, face, colour, depth) over the LSU (no
           * window staging, no vx_om4). The callee applies the coverage bit —
           * keeping this wrapper straight-line. */
@@ -1782,7 +1978,7 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
  * translated fragment body `fs_main`. RASTER dispatch v2 is PUSH: the raster work
  * distributor launches one 1-warp fragment CTA per covered-quad wave and seeds
  * that wave's per-lane frag_payload_t into the warp's gfx register window at
- * launch (FWD-5). The FS therefore runs once, reads its pre-seeded payload back
+ * launch. The FS therefore runs once, reads its pre-seeded payload back
  * with GETW, shades its covered sub-pixels, and returns — no poll loop, no fetch
  * op, no begin op. arg block: [0]=primitive buffer, [1]=texstate, [2]=omstate. */
 static LLVMValueRef
@@ -1801,7 +1997,7 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
     * DCRs, so the kernel only needs the primitive buffer (arg[0]). */
    LLVMPositionBuilderAtEnd(t->b, entry);
    LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
-   /* §5 SW sampler: arg[1] is the resident gfx_sw_texstate_t[] device address
+   /* SW sampler: arg[1] is the resident gfx_sw_texstate_t[] device address
     * (the host fills it when texturing is routed to software); null on the HW
     * path. Passed to fs_main as its 3rd param. */
    LLVMValueRef texstate_ptr;
@@ -1811,7 +2007,7 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
    } else {
       texstate_ptr = LLVMConstNull(t->ptr);
    }
-   /* §5 SW output-merger: arg[2] is the resident gfx_sw_omstate_t device address
+   /* SW output-merger: arg[2] is the resident gfx_sw_omstate_t device address
     * (host-filled when OM is routed to software). The wrapper merges each covered
     * sub-pixel via gfx_om_fragment_sw over the LSU instead of staging + vx_om4. */
    LLVMValueRef omstate_ptr = LLVMConstNull(t->ptr);
@@ -1819,12 +2015,29 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
       LLVMValueRef os_addr = emit_arg_i32(t, arg, 2);
       omstate_ptr = LLVMBuildIntToPtr(t->b, os_addr, t->ptr, "omstate");
    }
+   /* arg[GFX_FS_ARG_DESC] is the resident FS descriptor-table device address
+    * (always supplied by vp_raster; zero-filled when the FS is descriptor-free). */
+   LLVMValueRef desc_ptr = LLVMBuildIntToPtr(t->b,
+      emit_arg_i32(t, arg, GFX_FS_ARG_DESC), t->ptr, "desc");
+   /* arg[GFX_FS_ARG_MRT] is the resident gfx_sw_omcolor_t[] device
+    * address (per-attachment blend/write-mask). Read only for a >1-RT FS on the
+    * SW-OM path; a single-RT draw leaves it null. */
+   LLVMValueRef mrt_ptr = LLVMConstNull(t->ptr);
+   LLVMValueRef mrt_colors_addr = LLVMConstNull(t->iptr);
+   unsigned nrt = t->fs_num_color ? t->fs_num_color : 1;
    LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16),
                                           "fs_in");
-   LLVMValueRef out_scr = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4),
-                                          "fs_out");
+   LLVMValueRef out_scr = LLVMBuildAlloca(t->b,
+      LLVMArrayType(t->i32, t->fs_out_words ? t->fs_out_words : 4), "fs_out");
    LLVMValueRef in_addr  = LLVMBuildPtrToInt(t->b, in_scr,  t->iptr, "");
    LLVMValueRef out_addr = LLVMBuildPtrToInt(t->b, out_scr, t->iptr, "");
+   if (t->sw_om && nrt > 1) {
+      mrt_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, GFX_FS_ARG_MRT),
+                                  t->ptr, "mrt");
+      LLVMValueRef col_scr = LLVMBuildAlloca(t->b,
+         LLVMArrayType(t->i32, nrt), "fs_colors");
+      mrt_colors_addr = LLVMBuildPtrToInt(t->b, col_scr, t->iptr, "");
+   }
 
    /* read this lane's pre-seeded quad payload from the window (GETW), then shade
     * its covered sub-pixels. emit_shade_quad masks per-sub-pixel on cov_mask, so
@@ -1840,13 +2053,14 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
     * (the window carries only pos_mask + pid; P2 dropped the bcoord payload). */
    struct vp_bc_src bc = { .from_window = true, .quad_addr = NULL };
    emit_shade_quad(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
-                   in_addr, out_addr, texstate_ptr, omstate_ptr, pos_mask, &bc);
+                   in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
+                   mrt_ptr, mrt_colors_addr, pos_mask, &bc);
 
    LLVMBuildRetVoid(t->b);
    return fn;
 }
 
-/* gfx_v2 §5 SW-raster FS wrapper (one WARP per screen tile; lanes cooperate).
+/* SW-raster FS wrapper (one WARP per screen tile; lanes cooperate).
  * When RASTER is routed to software the FS is NOT the frag-window poll loop. Each
  * WARP owns one 8x8 screen tile; its lanes share the tile and split the covered
  * quads (lane L shades quads L, L+NT, L+2NT, …). All lanes walk every primitive
@@ -1898,15 +2112,36 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMValueRef omstate_ptr = LLVMConstNull(t->ptr);
    if (t->sw_om)
       omstate_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 2), t->ptr, "omstate");
+   /* Resident FS descriptor table (arg[GFX_FS_ARG_DESC]). */
+   LLVMValueRef desc_ptr = LLVMBuildIntToPtr(t->b,
+      emit_arg_i32(t, arg, GFX_FS_ARG_DESC), t->ptr, "desc");
    /* arg-block counts are i64 device words; narrow to i32 for the loop math. */
-   LLVMValueRef num_prims = emit_to_i32(t, emit_arg_i32(t, arg, 3));
+   /* arg[3] is the front-end meta buffer address; meta[0] is the kept-prim count
+    * P (after clip + face cull), known only on-device. Load it so the walk covers
+    * exactly the dense primbuf — a fully-culled draw yields P==0 (no stale walk). */
+   LLVMValueRef meta_ptr  = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 3),
+                                              t->ptr, "meta");
+   LLVMValueRef num_prims = LLVMBuildLoad2(t->b, t->i32, meta_ptr, "num_prims");
    LLVMValueRef nx        = emit_to_i32(t, emit_arg_i32(t, arg, 4));
    LLVMValueRef num_tiles = emit_to_i32(t, emit_arg_i32(t, arg, 5));
    LLVMValueRef scis_w    = emit_to_i32(t, emit_arg_i32(t, arg, 7));
    LLVMValueRef scis_h    = emit_to_i32(t, emit_arg_i32(t, arg, 8));
 
+   /* Per-attachment colour state (arg[GFX_FS_ARG_MRT]) + a src_colors[]
+    * scratch, read only for a >1-RT FS on the SW-OM path. */
+   LLVMValueRef mrt_ptr = LLVMConstNull(t->ptr);
+   LLVMValueRef mrt_colors_addr = LLVMConstNull(t->iptr);
+   unsigned nrt = t->fs_num_color ? t->fs_num_color : 1;
    LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16), "fs_in");
-   LLVMValueRef out_scr = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4), "fs_out");
+   LLVMValueRef out_scr = LLVMBuildAlloca(t->b,
+      LLVMArrayType(t->i32, t->fs_out_words ? t->fs_out_words : 4), "fs_out");
+   if (t->sw_om && nrt > 1) {
+      mrt_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, GFX_FS_ARG_MRT),
+                                  t->ptr, "mrt");
+      LLVMValueRef col_scr = LLVMBuildAlloca(t->b,
+         LLVMArrayType(t->i32, nrt), "fs_colors");
+      mrt_colors_addr = LLVMBuildPtrToInt(t->b, col_scr, t->iptr, "");
+   }
    LLVMValueRef quadbuf = LLVMBuildAlloca(t->b,
       LLVMArrayType(t->i32, VP_SW_RAST_MAX_QUADS * VP_RAST_QUAD_WORDS), "quads");
    LLVMValueRef pid_slot  = LLVMBuildAlloca(t->b, t->i32, "pid");
@@ -1990,7 +2225,8 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMValueRef pos_mask = emit_load_i32(t, quad_addr);
    struct vp_bc_src bc = { .from_window = false, .quad_addr = quad_addr };
    emit_shade_quad(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
-                   in_addr, out_addr, texstate_ptr, omstate_ptr, pos_mask, &bc);
+                   in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
+                   mrt_ptr, mrt_colors_addr, pos_mask, &bc);
    /* builder is now at emit_shade_quad's trailing fall-through block. */
    LLVMBuildBr(t->b, qinc);
 
@@ -2032,7 +2268,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    t.ok    = true;
    t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
    t.is_fs = (nir->info.stage == MESA_SHADER_FRAGMENT);
-   /* §5 per-unit SW routing (FS only). */
+   /* Per-unit SW routing (FS only). */
    t.sw_tex    = (t.is_fs && routing && routing->sw_tex);
    t.sw_om     = (t.is_fs && routing && routing->sw_om);
    t.sw_raster = (t.is_fs && routing && routing->sw_raster);
@@ -2057,12 +2293,15 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    LLVMValueRef fn;
    LLVMTypeRef  fs_main_ty = NULL;
    if (t.is_fs) {
-      /* fs_main(varyings_in, colour_out, texstate_table). The 3rd param carries
-       * the resident gfx_sw_texstate_t[] for the §5 SW sampler; it is null on the
-       * all-HW path (emit_vx_tex ignores it then). */
-      LLVMTypeRef p3[3] = { t.ptr, t.ptr, t.ptr };
+      /* fs_main(varyings_in, colour_out, texstate_table, desc_table). The 3rd
+       * param carries the resident gfx_sw_texstate_t[] for the SW sampler
+       * (null on the all-HW path); the 4th is the resident FS descriptor
+       * table (i64[] of constant-buffer base addresses) that load_ubo /
+       * load_push_constant / load_ssbo read (null when the FS is descriptor-free,
+       * in which case those intrinsics are never emitted). */
+      LLVMTypeRef p4[4] = { t.ptr, t.ptr, t.ptr, t.ptr };
       fs_main_ty = LLVMFunctionType(LLVMVoidTypeInContext(t.ctx),
-                                    p3, 3, false);
+                                    p4, 4, false);
       fn = LLVMAddFunction(t.mod, "fs_main", fs_main_ty);
       LLVMSetLinkage(fn, LLVMInternalLinkage);
    } else {
@@ -2124,8 +2363,35 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       LLVMValueRef ib64  = LLVMBuildLoad2(t.b, t.i64, ibp, "idxbuf64");
       LLVMValueRef hasix = LLVMBuildICmp(t.b, LLVMIntNE, ib64,
                                          LLVMConstInt(t.i64, 0, false), "hasidx");
-      LLVMValueRef raw_vid = t.vid;
-      t.vraw = raw_vid;            /* sequential global id -> VS output slot */
+      /* Instancing: arg slot 3 = verts-per-instance (0 => non-instanced fast
+       * path, byte-identical to the pre-instancing ABI), slot 4 = base instance
+       * (gl_BaseInstance). Thread gid maps to instance = gid / vpi and the
+       * in-instance vertex vert = gid % vpi. The VS output slot stays the
+       * sequential gid so expand_k reads the records densely; only the vid that
+       * drives gl_VertexIndex / attribute fetch and the per-instance index-buffer
+       * lookup use vert. */
+      LLVMValueRef gid   = t.vid;                       /* sequential global id */
+      LLVMValueRef three = LLVMConstInt(t.i32, 3, false);
+      LLVMValueRef four  = LLVMConstInt(t.i32, 4, false);
+      LLVMValueRef vpip  = LLVMBuildGEP2(t.b, t.i64, t.arg, &three, 1, "");
+      LLVMValueRef vpi64 = LLVMBuildLoad2(t.b, t.i64, vpip, "vpi64");
+      LLVMValueRef vpi   = LLVMBuildTrunc(t.b, vpi64, t.i32, "vpi");
+      LLVMValueRef fip   = LLVMBuildGEP2(t.b, t.i64, t.arg, &four, 1, "");
+      LLVMValueRef fi64  = LLVMBuildLoad2(t.b, t.i64, fip, "firstinst64");
+      t.first_instance   = LLVMBuildTrunc(t.b, fi64, t.i32, "firstinst");
+      LLVMValueRef vpi_is0   = LLVMBuildICmp(t.b, LLVMIntEQ, vpi,
+                                             LLVMConstInt(t.i32, 0, false), "vpi0");
+      /* guard the div/rem against a zero divisor on the non-instanced fast path */
+      LLVMValueRef vpi_safe  = LLVMBuildSelect(t.b, vpi_is0,
+                                               LLVMConstInt(t.i32, 1, false), vpi, "vpisafe");
+      LLVMValueRef inst_q    = LLVMBuildUDiv(t.b, gid, vpi_safe, "instq");
+      LLVMValueRef vert_r    = LLVMBuildURem(t.b, gid, vpi_safe, "vertr");
+      t.instance = LLVMBuildSelect(t.b, vpi_is0,
+                                   LLVMConstInt(t.i32, 0, false), inst_q, "instance");
+      LLVMValueRef logical_vert = LLVMBuildSelect(t.b, vpi_is0, gid, vert_r, "logvert");
+
+      LLVMValueRef raw_vid = logical_vert; /* in-instance vertex -> vid / index lookup */
+      t.vraw = gid;                        /* sequential global id -> VS output slot */
       LLVMBasicBlockRef from_bb = LLVMGetInsertBlock(t.b);
       LLVMBasicBlockRef idx_bb  = LLVMAppendBasicBlockInContext(t.ctx, fn, "vid_idx");
       LLVMBasicBlockRef cont_bb = LLVMAppendBasicBlockInContext(t.ctx, fn, "vid_cont");
@@ -2156,7 +2422,14 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
                                         t.iptr, "fsin");
       t.fs_out_base = LLVMBuildPtrToInt(t.b, LLVMGetParam(fn, 1),
                                         t.iptr, "fsout");
-      t.fs_texstate = LLVMGetParam(fn, 2);   /* gfx_sw_texstate_t* (§5 SW tex) */
+      t.fs_texstate = LLVMGetParam(fn, 2);   /* gfx_sw_texstate_t* (SW tex) */
+      /* The resident FS descriptor table (i64[] of constant-buffer base
+       * addresses) is fs_main's 4th param. Route it through t.arg so the shared
+       * load_ubo / load_ssbo / load_const_buf_base_addr_lvp / load_push_constant
+       * lowering reads table[index] exactly as the compute path reads its arg
+       * block. Null-safe: a descriptor-free FS never emits those intrinsics. */
+      t.arg = LLVMGetParam(fn, 3);
+      LLVMSetValueName2(t.arg, "desc", 4);
    }
 
    /* Compute-shader prologue: the workgroup's shared-memory base, read
@@ -2236,7 +2509,7 @@ vp_free_ir(char *ir)
       LLVMDisposeMessage(ir);
 }
 
-/* ---- descriptor scan (Phase 7.5) ----------------------------------- *
+/* ---- descriptor scan ----------------------------------- *
  *
  * A compute kernel reaches its set-0 resources through the descriptor
  * buffer bound at constant-buffer index 1. vp_launch_grid must copy
@@ -2251,17 +2524,23 @@ vp_free_ir(char *ir)
  * where desc_addr is load_const_buf_base_addr_lvp(1) optionally plus a
  * constant byte offset. */
 
-/* Resolve an SSBO descriptor-address SSA value to its byte offset in
- * the set-0 descriptor buffer: load_const_buf_base_addr_lvp(1) is
- * offset 0, that plus a constant is the constant. -1 if unrecognized. */
+/* Resolve an SSBO/UBO descriptor-address SSA value to its byte offset within its
+ * descriptor buffer: load_const_buf_base_addr_lvp(idx) is offset 0, that plus a
+ * constant is the constant. Also returns (via *cbuf_index) the constant-buffer
+ * index the base came from — index N+1 is descriptor set N's blob, so a
+ * descriptor in set >= 1 is relocated inside the right blob, not always set 0.
+ * -1 if unrecognized. */
 static int
-vp_desc_addr_offset(nir_def *def)
+vp_desc_addr_offset(nir_def *def, unsigned *cbuf_index)
 {
    nir_instr *p = def->parent_instr;
    if (p->type == nir_instr_type_intrinsic) {
       nir_intrinsic_instr *i = nir_instr_as_intrinsic(p);
-      if (i->intrinsic == nir_intrinsic_load_const_buf_base_addr_lvp)
+      if (i->intrinsic == nir_intrinsic_load_const_buf_base_addr_lvp) {
+         if (cbuf_index && nir_src_is_const(i->src[0]))
+            *cbuf_index = (unsigned)nir_src_as_uint(i->src[0]);
          return 0;
+      }
    } else if (p->type == nir_instr_type_alu) {
       nir_alu_instr *a = nir_instr_as_alu(p);
       if (a->op == nir_op_iadd) {
@@ -2270,8 +2549,12 @@ vp_desc_addr_offset(nir_def *def)
             if (o->type == nir_instr_type_intrinsic &&
                 nir_instr_as_intrinsic(o)->intrinsic ==
                    nir_intrinsic_load_const_buf_base_addr_lvp &&
-                nir_src_is_const(a->src[!s].src))
+                nir_src_is_const(a->src[!s].src)) {
+               nir_intrinsic_instr *b = nir_instr_as_intrinsic(o);
+               if (cbuf_index && nir_src_is_const(b->src[0]))
+                  *cbuf_index = (unsigned)nir_src_as_uint(b->src[0]);
                return (int)nir_src_as_uint(a->src[!s].src);
+            }
          }
       }
    }
@@ -2291,32 +2574,60 @@ vp_scan_descriptors(struct nir_shader *nir,
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
             int off = -1;
             enum vp_desc_kind kind = VP_DESC_BUFFER;
+            unsigned elem_bytes = 1;            /* SSBO: num_elements is bytes */
+            unsigned cbuf_index = 1;            /* default set-0 blob (index 1) */
             switch (in->intrinsic) {
             case nir_intrinsic_load_ssbo:
-               off = vp_desc_addr_offset(in->src[0].ssa);
+               off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                break;
             case nir_intrinsic_store_ssbo:
-               off = vp_desc_addr_offset(in->src[1].ssa);
+               off = vp_desc_addr_offset(in->src[1].ssa, &cbuf_index);
+               break;
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+               /* atomic RMW targets the same SSBO descriptor (src[0]); its
+                * data pointer must be relocated like a load/store_ssbo. */
+               off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                break;
             case nir_intrinsic_load_ubo:
-               /* lavapipe lowers an acceleration-structure read to
-                * load_ubo(cbuf_index, byte_offset). */
-               if (nir_src_is_const(in->src[1]))
-                  off = (int)nir_src_as_uint(in->src[1]);
-               kind = VP_DESC_AS;
+               if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+                  /* A fragment UBO is a buffer descriptor reached via
+                   * load_ubo(load_const_buf_base_addr_lvp(set+1)+binding, off) —
+                   * relocate its lp_jit_buffer.ptr like an SSBO. A constant src[0]
+                   * is a push-constant read (bound directly, no descriptor). A UBO
+                   * descriptor stores num_elements in dwords (sizeof(float)). */
+                  if (nir_src_is_const(in->src[0]))
+                     continue;
+                  off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
+                  elem_bytes = 4;
+               } else {
+                  /* compute: lavapipe lowers an acceleration-structure read to
+                   * load_ubo(cbuf_index, byte_offset). */
+                  if (nir_src_is_const(in->src[1]))
+                     off = (int)nir_src_as_uint(in->src[1]);
+                  if (nir_src_is_const(in->src[0]))
+                     cbuf_index = (unsigned)nir_src_as_uint(in->src[0]);
+                  kind = VP_DESC_AS;
+                  elem_bytes = 0;
+               }
                break;
             default:
                continue;
             }
             if (off < 0)
                continue;
+            /* Distinct by (cbuf_index, offset): the same byte offset in two sets
+             * is two different descriptors. */
             bool dup = false;
             for (unsigned k = 0; k < n; k++)
-               if (out[k].offset == (unsigned)off) { dup = true; break; }
+               if (out[k].offset == (unsigned)off &&
+                   out[k].cbuf_index == cbuf_index) { dup = true; break; }
             if (dup || n >= VP_MAX_DESCS)
                continue;
-            out[n].offset = (unsigned)off;
-            out[n].kind   = kind;
+            out[n].offset     = (unsigned)off;
+            out[n].cbuf_index = cbuf_index;
+            out[n].kind       = kind;
+            out[n].elem_bytes = elem_bytes;
             n++;
          }
       }

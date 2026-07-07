@@ -6,11 +6,9 @@
  *
  * vp_context_create() wraps llvmpipe's context: it records the
  * llvmpipe originals and installs vortexpipe overrides for the
- * compute hooks. For Phase 2 increment #1 the overrides simply
- * forward to llvmpipe -- they establish the interception point.
- * Subsequent increments fill them in:
- *   - create_compute_state : NIR -> SPIR-V -> .vxbin   (#2, #3)
- *   - launch_grid          : vx_enqueue_launch          (#4)
+ * compute hooks:
+ *   - create_compute_state : NIR -> SPIR-V -> .vxbin
+ *   - launch_grid          : vx_enqueue_launch
  */
 
 #include <stdarg.h>
@@ -23,6 +21,7 @@
 #include "vp_compile.h"
 #include "vp_launch.h"
 #include "vp_raster.h"
+#include "gfx_frontend_abi.h" /* SETUP_CULL_* device face-cull modes */
 
 #include "pipe/p_state.h"     /* full struct pipe_compute_state */
 #include "util/format/u_formats.h"  /* PIPE_FORMAT_* */
@@ -267,6 +266,14 @@ vp_set_constant_buffer(struct pipe_context *pipe, enum pipe_shader_type shader,
       vp->cbuf[index]     = cb ? cb->buffer : NULL;
       vp->cbuf_off[index] = cb ? cb->buffer_offset : 0u;
    }
+   /* Capture the fragment stage's constant buffers so the draw path can
+    * upload them + build the resident FS descriptor table (push constants at
+    * index 0, descriptor set-0 blob at index 1, UBOs at their bound index). */
+   if (shader == PIPE_SHADER_FRAGMENT && index < 8) {
+      vp->fs_cbuf[index]     = cb ? cb->buffer : NULL;
+      vp->fs_cbuf_off[index] = cb ? cb->buffer_offset : 0u;
+      vp->fs_cbuf_sz[index]  = cb ? cb->buffer_size : 0u;
+   }
    vp->lp_set_constant_buffer(pipe, shader, index, take_ownership, cb);
 }
 
@@ -280,7 +287,7 @@ vp_set_shader_buffers(struct pipe_context *pipe, enum pipe_shader_type shader,
    vp->lp_set_shader_buffers(pipe, shader, start, count, bufs, writable_mask);
 }
 
-/* ---- graphics: vertex-shader hooks (Phase 3) ------------------------ */
+/* ---- graphics: vertex-shader hooks ------------------------ */
 
 /* create_vs_state returns a struct vp_cso* (llvmpipe's cso + the
  * compiled Vortex vertex-shader kernel); bind/delete unwrap it. */
@@ -319,7 +326,7 @@ vp_create_vs_state(struct pipe_context *pipe,
    return cso;
 }
 
-/* §6.6 residency: release a CSO's device-resident module (its vxbin loaded
+/* Residency: release a CSO's device-resident module (its vxbin loaded
  * onto the device). Frees the stage's fixed device address so a different
  * same-stage shader can take it. Safe to call when nothing is resident. */
 static void
@@ -357,11 +364,11 @@ vp_delete_vs_state(struct pipe_context *pipe, void *p)
    FREE(cso);
 }
 
-/* ---- graphics: fragment-shader hooks (Phase 4) --------------------- */
+/* ---- graphics: fragment-shader hooks --------------------- */
 
-/* §5 per-unit HW-vs-SW routing for a fragment shader, from device caps +
+/* Per-unit HW-vs-SW routing for a fragment shader, from device caps +
  * the VORTEXPIPE_FORCE_SW knob. A unit absent from the device routes to its
- * SIMT software path (never llvmpipe — charter pillar 4). All three units
+ * SIMT software path (never llvmpipe). All three units
  * (TEX/OM/RASTER) are wired here. SW raster implies SW OM (the one-thread-per-
  * tile kernel merges over the LSU; it has no FF frag window to feed vx_om4). */
 static struct vp_sw_routing
@@ -382,6 +389,25 @@ vp_fs_routing(struct pipe_context *pipe)
    return r;
 }
 
+/* Count the fragment shader's colour outputs (max render-target index
+ * + 1). >1 means the draw targets multiple render targets, which the SW OM MRT
+ * fallback handles (the FF vx_om4 unit is single-RT). */
+static unsigned
+vp_fs_num_color_outputs(struct nir_shader *nir)
+{
+   unsigned n = 0;
+   nir_foreach_shader_out_variable(var, nir) {
+      unsigned loc = var->data.location;
+      if (loc == FRAG_RESULT_COLOR) {
+         if (n < 1) n = 1;                    /* broadcast colour -> RT0 */
+      } else if (loc >= FRAG_RESULT_DATA0) {
+         unsigned rt = loc - FRAG_RESULT_DATA0;
+         if (rt + 1 > n) n = rt + 1;
+      }
+   }
+   return n ? n : 1;
+}
+
 /* The driver JIT-compiles the fragment shader at pipeline creation,
  * the same NIR -> LLVM -> .vxbin path the vertex/compute stages use
  * (a real GPU driver compiles every stage; nothing is prebuilt). */
@@ -396,9 +422,21 @@ vp_create_fs_state(struct pipe_context *pipe,
       return NULL;
    cso->lp_cso = vp->lp_create_fs_state(pipe, state);
    cso->fs_routing = vp_fs_routing(pipe);
+   cso->fs_num_color = 1;
 
    if (state->type == PIPE_SHADER_IR_NIR) {
       char *ir = NULL;
+      /* A >1-RT fragment shader must merge in software — the FF OM unit
+       * is single-attachment. Force SW OM here so the compiled kernel calls the
+       * MRT fallback AND the draw path (fs_routing.sw_om) programs it to match. */
+      cso->fs_num_color =
+         vp_fs_num_color_outputs((struct nir_shader *)state->ir.nir);
+      if (cso->fs_num_color > 1)
+         cso->fs_routing.sw_om = true;
+      /* The set-0 descriptors the FS reaches (SSBO/UBO/AS) — recorded for
+       * the descriptor-blob relocation the SSBO path needs (follow-up). */
+      vp_scan_descriptors((struct nir_shader *)state->ir.nir,
+                          cso->descs, &cso->num_descs);
       if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir, NULL,
                          &cso->fs_routing)) {
          bool uses_sw = cso->fs_routing.sw_tex || cso->fs_routing.sw_om;
@@ -442,7 +480,7 @@ vp_delete_fs_state(struct pipe_context *pipe, void *p)
    FREE(cso);
 }
 
-/* ---- graphics: texture-sampler state (Phase 6) --------------------- */
+/* ---- graphics: texture-sampler state --------------------- */
 
 /* VX TEX encodings (VX_types.h) -- filter + wrap. */
 #define VX_TEX_FILTER_POINT     0
@@ -518,9 +556,10 @@ vp_create_vertex_elements_state(struct pipe_context *pipe, unsigned num,
    if (cso && num <= VP_MAX_ATTR) {
       cso->num = num;
       for (unsigned i = 0; i < num; i++) {
-         cso->src_offset[i]   = elements[i].src_offset;
-         cso->src_stride[i]   = elements[i].src_stride;
-         cso->buffer_index[i] = elements[i].vertex_buffer_index;
+         cso->src_offset[i]      = elements[i].src_offset;
+         cso->src_stride[i]      = elements[i].src_stride;
+         cso->buffer_index[i]    = elements[i].vertex_buffer_index;
+         cso->instance_divisor[i] = elements[i].instance_divisor;
       }
       vp_reg_put(lp_cso, cso);
    } else {
@@ -567,9 +606,9 @@ vp_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
    vp->lp_set_vertex_buffers(pipe, count, buffers);
 }
 
-/* ---- graphics: framebuffer interception (Phase 4) ------------------ */
+/* ---- graphics: framebuffer interception ------------------ */
 
-/* §6.6 residency: defined below, used by set_framebuffer_state to flush the
+/* Residency: defined below, used by set_framebuffer_state to flush the
  * outgoing render pass's resident colour back before the framebuffer changes. */
 static void vp_fb_invalidate(struct pipe_context *pipe, struct vp_context *vp);
 
@@ -589,6 +628,16 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
    vp->fb_depth  = (fb && fb->zsbuf) ? fb->zsbuf->texture : NULL;
    vp->fb_width  = fb ? fb->width  : 0;
    vp->fb_height = fb ? fb->height : 0;
+   /* Capture every bound colour attachment (fb_cbufs[0] == fb_color). */
+   vp->fb_nr_cbufs = 0;
+   for (unsigned i = 0; i < GFX_OM_MAX_RT; i++)
+      vp->fb_cbufs[i] = NULL;
+   if (fb) {
+      unsigned n = fb->nr_cbufs < GFX_OM_MAX_RT ? fb->nr_cbufs : GFX_OM_MAX_RT;
+      for (unsigned i = 0; i < n; i++)
+         vp->fb_cbufs[i] = fb->cbufs[i] ? fb->cbufs[i]->texture : NULL;
+      vp->fb_nr_cbufs = n;
+   }
    vp->lp_set_framebuffer_state(pipe, fb);
 }
 
@@ -656,7 +705,7 @@ vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
 #define VX_OM_BLEND_FUNC_CONST_RGB           10
 #define VX_OM_BLEND_FUNC_ONE_MINUS_CONST_RGB 11
 
-/* ---- §6.6 framebuffer + texture residency ------------------------------ *
+/* ---- framebuffer + texture residency ------------------------------ *
  * The colour + depth attachments are kept device-resident across the draws of
  * a render pass: cleared/initialised ONCE (not per draw — so depth + colour
  * accumulate correctly across draws), rendered into in place, and copied back
@@ -705,6 +754,13 @@ vp_fb_sync_out(struct pipe_context *pipe, struct vp_context *vp)
    if (host &&
        vp_buffer_readback(vp->dev, vp->rcb, host, bytes)) {
       vp_resource_rw(pipe, vp->rfb_res, vp->rfb_w, vp->rfb_h, host, true);
+      /* Write each extra colour attachment (1..) back to its resource. */
+      for (unsigned k = 1; k < vp->rmrt_nr; k++) {
+         if (!vp->rcb_extra[k] || !vp->rmrt_res[k])
+            continue;
+         if (vp_buffer_readback(vp->dev, vp->rcb_extra[k], host, bytes))
+            vp_resource_rw(pipe, vp->rmrt_res[k], vp->rfb_w, vp->rfb_h, host, true);
+      }
    }
    free(host);
    vp->rfb_dirty = false;
@@ -718,6 +774,12 @@ vp_fb_invalidate(struct pipe_context *pipe, struct vp_context *vp)
    vp_fb_sync_out(pipe, vp);
    if (vp->rcb) { vx_buffer_release(vp->rcb); vp->rcb = NULL; }
    if (vp->rzb) { vx_buffer_release(vp->rzb); vp->rzb = NULL; }
+   /* Drop the extra colour attachments. */
+   for (unsigned k = 0; k < GFX_OM_MAX_RT; k++) {
+      if (vp->rcb_extra[k]) { vx_buffer_release(vp->rcb_extra[k]); vp->rcb_extra[k] = NULL; }
+      vp->rmrt_res[k] = NULL;
+   }
+   vp->rmrt_nr = 0;
    vp->rfb_res = NULL;
    vp->rfb_w = vp->rfb_h = 0;
 }
@@ -768,6 +830,49 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
    return true;
 }
 
+/* Ensure the resident device buffers for colour attachments 1.. exist
+ * (RT0 + depth are handled by vp_fb_ensure, which the caller runs first). Each
+ * extra attachment is initialised once per pass from its resource's cleared
+ * contents; color_dev[k] returns its device base (color_dev[0] is left for the
+ * caller to fill from vp->rcb). Returns false on allocation failure. */
+static bool
+vp_fb_ensure_mrt(struct pipe_context *pipe, struct vp_context *vp,
+                 uint32_t w, uint32_t h, unsigned num,
+                 uint64_t color_dev[GFX_OM_MAX_RT])
+{
+   if (num > GFX_OM_MAX_RT) num = GFX_OM_MAX_RT;
+   const uint32_t bytes = w * h * 4;
+
+   bool have = (vp->rmrt_nr == num);
+   for (unsigned k = 1; k < num && have; k++)
+      if (!vp->rcb_extra[k] || vp->rmrt_res[k] != vp->fb_cbufs[k])
+         have = false;
+
+   if (!have) {
+      for (unsigned k = 1; k < GFX_OM_MAX_RT; k++) {
+         if (vp->rcb_extra[k]) { vx_buffer_release(vp->rcb_extra[k]); vp->rcb_extra[k] = NULL; }
+         vp->rmrt_res[k] = NULL;
+      }
+      for (unsigned k = 1; k < num; k++) {
+         uint64_t dev = 0;
+         void *cinit = malloc(bytes);
+         bool ok = cinit && vp->fb_cbufs[k] &&
+                   vp_resource_rw(pipe, vp->fb_cbufs[k], w, h, cinit, false);
+         if (ok)
+            ok = vp_dev_upload(vp->dev, cinit, bytes, &vp->rcb_extra[k], &dev);
+         free(cinit);
+         if (!ok) { vp->rmrt_nr = 0; return false; }
+         vp->rmrt_res[k] = vp->fb_cbufs[k];
+      }
+      vp->rmrt_nr = num;
+   }
+
+   for (unsigned k = 1; k < num; k++)
+      if (vx_buffer_address(vp->rcb_extra[k], &color_dev[k]) != VX_SUCCESS)
+         return false;
+   return true;
+}
+
 /* Ensure the bound texture is uploaded + resident, keyed by its resource. The
  * mip-0 image is read back to a tight A8R8G8B8 host buffer and uploaded once;
  * a re-bind of the same resource reuses it. Returns the device address. */
@@ -804,7 +909,7 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
    return true;
 }
 
-/* ---- graphics: output-merger state (Phase 5) ----------------------- */
+/* ---- graphics: output-merger state ----------------------- */
 
 static uint32_t
 vp_vx_depth_func(unsigned pf)
@@ -929,6 +1034,28 @@ vp_create_blend_state(struct pipe_context *pipe,
             (VX_OM_BLEND_FUNC_ZERO << 24) | (VX_OM_BLEND_FUNC_ZERO << 16) |
             (VX_OM_BLEND_FUNC_ONE  << 8)  | (VX_OM_BLEND_FUNC_ONE  << 0);
       }
+      /* Per-attachment blend/write-mask. With independent blend off,
+       * every attachment uses RT0's equation (Vulkan default); with it on, each
+       * carries its own. Slot 0 always equals the scalar fields above. */
+      for (unsigned i = 0; i < GFX_OM_MAX_RT; i++) {
+         const struct pipe_rt_blend_state *r =
+            s->independent_blend_enable ? &s->rt[i] : &s->rt[0];
+         cso->rt_colormask[i] = r->colormask;
+         if (r->blend_enable) {
+            uint32_t m = vp_vx_blend_mode(r->rgb_func);
+            cso->rt_blend_mode[i] = (m << 16) | (m << 0);
+            cso->rt_blend_func[i] =
+               (vp_vx_blend_factor(r->alpha_dst_factor) << 24) |
+               (vp_vx_blend_factor(r->rgb_dst_factor)   << 16) |
+               (vp_vx_blend_factor(r->alpha_src_factor) << 8)  |
+               (vp_vx_blend_factor(r->rgb_src_factor)   << 0);
+         } else {
+            cso->rt_blend_mode[i] = (VX_OM_BLEND_MODE_ADD << 16) | VX_OM_BLEND_MODE_ADD;
+            cso->rt_blend_func[i] =
+               (VX_OM_BLEND_FUNC_ZERO << 24) | (VX_OM_BLEND_FUNC_ZERO << 16) |
+               (VX_OM_BLEND_FUNC_ONE  << 8)  | (VX_OM_BLEND_FUNC_ONE  << 0);
+         }
+      }
       vp_reg_put(lp_cso, cso);
    }
    return lp_cso;
@@ -958,6 +1085,108 @@ vp_delete_blend_state(struct pipe_context *pipe, void *p)
       FREE(cso);
    }
    vp->lp_delete_blend_state(pipe, p);
+}
+
+/* ---- graphics: rasterizer state (face cull) ------------------------ *
+ * The device front end culls by the signed-area sign of each triangle
+ * in screen space (gfx_setup.h EdgeEquation), so vortexpipe captures the
+ * face-cull mode + front-face winding here and hands the pair to the
+ * draw as a device SETUP_CULL_* mode. Registered under the llvmpipe cso
+ * like the depth/blend csos, so blitter csos made before our hooks armed
+ * pass straight through (cur_rast == NULL -> two-sided default). */
+static void *
+vp_create_rasterizer_state(struct pipe_context *pipe,
+                           const struct pipe_rasterizer_state *s)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   void *lp_cso = vp->lp_create_rasterizer_state(pipe, s);
+
+   struct vp_rast_cso *cso = CALLOC_STRUCT(vp_rast_cso);
+   if (cso) {
+      cso->cull_face = s->cull_face;
+      cso->front_ccw = s->front_ccw;
+      vp_reg_put(lp_cso, cso);
+   }
+   return lp_cso;
+}
+
+static void
+vp_bind_rasterizer_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->cur_rast = p ? vp_reg_get(p) : NULL;   /* NULL for blitter csos */
+   vp->lp_bind_rasterizer_state(pipe, p);
+   if (vp->cur_rast)
+      vp_dbg("vortexpipe: raster cull_face=%u front_ccw=%d",
+             vp->cur_rast->cull_face, vp->cur_rast->front_ccw);
+}
+
+static void
+vp_delete_rasterizer_state(struct pipe_context *pipe, void *p)
+{
+   struct vp_context  *vp  = vp_reg_get(pipe);
+   struct vp_rast_cso *cso = p ? vp_reg_get(p) : NULL;
+   if (cso) {
+      /* cur_rast is a raw non-owning pointer. Gallium unbinds a state before
+       * deleting it, so cur_rast should never still reference cso here; clear it
+       * defensively (and log) so a stale binding can never dangle into a freed
+       * cso on the draw path. */
+      if (vp->cur_rast == cso) {
+         vp_dbg("vortexpipe: deleting still-bound rasterizer cso %p", (void *)cso);
+         vp->cur_rast = NULL;
+      }
+      vp_reg_del(p);
+      FREE(cso);
+   }
+   vp->lp_delete_rasterizer_state(pipe, p);
+}
+
+/* ---- graphics: viewport state ------------------------------------- *
+ * The device front end applies the viewport transform itself (perspective
+ * divide + scale/bias in gfx_setup.h ClipToScreen/ClipToHDC), so vortexpipe
+ * must carry the app's bound VkViewport through — otherwise the front end's
+ * hardwired full-fb y-down transform ignores a negative-height (y-flip) or
+ * offset/scaled viewport and mirrors / mis-places the triangle, which also
+ * flips the signed-area sign the face cull reads. Gallium already reduces the
+ * VkViewport to window-space scale/translate here; capture slot 0 (gfx-v1 is
+ * single-viewport) and forward it at draw time. */
+static void
+vp_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
+                       unsigned num_viewports,
+                       const struct pipe_viewport_state *vps)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   if (vps && start_slot == 0 && num_viewports >= 1) {
+      vp->vp_scale_x = vps[0].scale[0];
+      vp->vp_trans_x = vps[0].translate[0];
+      vp->vp_scale_y = vps[0].scale[1];
+      vp->vp_trans_y = vps[0].translate[1];
+      vp->vp_valid   = true;
+      vp_dbg("vortexpipe: viewport scale=(%g,%g) translate=(%g,%g)",
+             vp->vp_scale_x, vp->vp_scale_y, vp->vp_trans_x, vp->vp_trans_y);
+   }
+   vp->lp_set_viewport_states(pipe, start_slot, num_viewports, vps);
+}
+
+/* Translate the bound Gallium rasterizer state to the device SETUP_CULL_*
+ * face-cull mode. The device culls on the signed-area sign in screen
+ * space, where a triangle's winding matches the Vulkan framebuffer area
+ * sign: vortexpipe runs the VS output (clip-space gl_Position) through the
+ * app's captured viewport transform (vp_set_viewport_states -> the device
+ * setup's scale/bias), so the front-end det sign equals the Vulkan area sign
+ * — including a y-flip, which the negative sy sign-flips correctly. det>0 is
+ * the front (positive-area) winding, det<0 the back; front_ccw selects which
+ * of the two Vulkan calls "front".
+ * PIPE_FACE_FRONT_AND_BACK (cull everything) is handled by the caller. */
+static uint32_t
+vp_cull_mode(const struct vp_rast_cso *r)
+{
+   if (!r || r->cull_face == PIPE_FACE_NONE)
+      return SETUP_CULL_NONE;
+   bool cull_back = (r->cull_face == PIPE_FACE_BACK);
+   if (!r->front_ccw)
+      cull_back = !cull_back;   /* CW front face swaps the device winding sense */
+   return cull_back ? SETUP_CULL_BACK : SETUP_CULL_FRONT;
 }
 
 /* A passthrough vertex shader: copies N input attributes straight to
@@ -1025,7 +1254,7 @@ vp_get_velems(struct vp_context *vp, struct pipe_context *pipe,
    return vp->velems;
 }
 
-/* Phase 3 fallback: draw the Vortex-transformed vertices through a
+/* Fallback: draw the Vortex-transformed vertices through a
  * passthrough VS so llvmpipe does clip / raster / fragment / OM. */
 static bool
 vp_draw_passthrough(struct vp_context *vp, struct pipe_context *pipe,
@@ -1060,6 +1289,7 @@ vp_draw_passthrough(struct vp_context *vp, struct pipe_context *pipe,
 static bool
 vp_gather_vertex_input(struct pipe_context *pipe, struct vp_context *vp,
                        const struct pipe_draw_start_count_bias *draws,
+                       bool indexed,
                        struct vp_vertex_input *vin,
                        struct pipe_transfer **xfer)
 {
@@ -1084,11 +1314,16 @@ vp_gather_vertex_input(struct pipe_context *pipe, struct vp_context *vp,
    vin->base_offset = vb->buffer_offset;
    vin->num_attrs   = ve->num;
    for (unsigned i = 0; i < ve->num; i++) {
-      /* the velems index is the VS input driver_location; fold the
-       * draw's first-vertex offset into the attribute base. */
+      /* the velems index is the VS input driver_location. Fold the draw's
+       * first-vertex offset into the attribute base ONLY for a non-indexed draw,
+       * where the device VS's vid is the 0-based draw position. For an INDEXED
+       * draw the vid is the index value itself (which already addresses the
+       * absolute vertex) and draws[0].start offsets the INDEX buffer (applied in
+       * vp_gather_index_u32) — folding it here too would double-offset the
+       * attribute fetch whenever start != 0. */
       vin->attr_loc[i]    = i;
       vin->attr_offset[i] = ve->src_offset[i]
-                          + draws[0].start * ve->src_stride[i];
+                          + (indexed ? 0u : draws[0].start * ve->src_stride[i]);
       vin->attr_stride[i] = ve->src_stride[i];
    }
    vp_dbg("vortexpipe: vertex-input: %u attrs, vbuf %u bytes",
@@ -1141,6 +1376,86 @@ vp_gather_index_u32(struct pipe_context *pipe, struct vp_context *vp,
    return ok;
 }
 
+/* Topology translation: expand a triangle strip/fan into a flat u32
+ * triangle-LIST index array (source vertex indices in list order) and upload it
+ * to the device, so the strip/fan renders through the existing indexed
+ * triangle-list device path (the front end is list-native). Handles both
+ * indexed sources (indices come from the draw's index buffer) and non-indexed
+ * sources (identity: source vertex = strip position). `*out_tris` is the emitted
+ * triangle count; the device draw runs with count = 3*(*out_tris). Returns the
+ * device address + owning buffer (caller releases). False -> drop to llvmpipe. */
+static bool
+vp_gather_topology_u32(struct pipe_context *pipe, struct vp_context *vp,
+                       const struct pipe_draw_info *info,
+                       const struct pipe_draw_start_count_bias *draws,
+                       uint64_t *out_dev, vx_buffer_h *out_buf, uint32_t *out_tris)
+{
+   const unsigned count = draws[0].count;
+   if (count < 3) { *out_tris = 0; return false; }
+   const unsigned tris = count - 2;
+
+   const bool indexed = info->index_size == 2 || info->index_size == 4;
+   const int32_t bias = draws[0].index_bias;   /* base vertex */
+
+   /* Map a strip position -> source vertex index (post-bias). */
+   struct pipe_transfer *xfer = NULL;
+   const uint8_t *isrc = NULL;
+   if (indexed) {
+      if (info->has_user_indices) {
+         isrc = (const uint8_t *)info->index.user;
+      } else if (info->index.resource) {
+         isrc = (const uint8_t *)pipe_buffer_map(pipe, info->index.resource,
+                                                 PIPE_MAP_READ, &xfer);
+      }
+      if (!isrc) return false;
+      isrc += (size_t)draws[0].start * info->index_size;
+   }
+   /* Non-indexed: the device VS fetches attributes at base+vid*stride where the
+    * base already folds draws[0].start (vp_gather_vertex_input), so the vid is
+    * the 0-based strip position. Indexed: vid is the source index value + base
+    * vertex, matching the indexed triangle-list path. */
+   #define VP_SRC_VERT(pos)                                                    \
+      (indexed ? (info->index_size == 4                                        \
+                     ? ((const uint32_t *)isrc)[pos] + (uint32_t)bias          \
+                     : (uint32_t)((const uint16_t *)isrc)[pos] + (uint32_t)bias)\
+               : (uint32_t)(pos))
+
+   uint32_t *u32 = (uint32_t *)malloc((size_t)tris * 3u * 4u);
+   if (!u32) {
+      if (xfer) pipe_buffer_unmap(pipe, xfer);
+      return false;
+   }
+
+   uint32_t w = 0;
+   if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+      for (unsigned i = 0; i < tris; i++) {
+         /* alternate winding so every triangle keeps the strip's facing */
+         if (i & 1u) {
+            u32[w++] = VP_SRC_VERT(i + 1);
+            u32[w++] = VP_SRC_VERT(i);
+            u32[w++] = VP_SRC_VERT(i + 2);
+         } else {
+            u32[w++] = VP_SRC_VERT(i);
+            u32[w++] = VP_SRC_VERT(i + 1);
+            u32[w++] = VP_SRC_VERT(i + 2);
+         }
+      }
+   } else { /* MESA_PRIM_TRIANGLE_FAN */
+      for (unsigned i = 0; i < tris; i++) {
+         u32[w++] = VP_SRC_VERT(0);
+         u32[w++] = VP_SRC_VERT(i + 1);
+         u32[w++] = VP_SRC_VERT(i + 2);
+      }
+   }
+   #undef VP_SRC_VERT
+
+   bool ok = vp_dev_upload(vp->dev, u32, (size_t)tris * 3u * 4u, out_buf, out_dev);
+   free(u32);
+   if (xfer) pipe_buffer_unmap(pipe, xfer);
+   if (ok) *out_tris = tris;
+   return ok;
+}
+
 static void
 vp_draw_vbo(struct pipe_context *pipe,
             const struct pipe_draw_info *info,
@@ -1157,33 +1472,63 @@ vp_draw_vbo(struct pipe_context *pipe,
     * translated VS. Indexed draws are supported on the hardware path: the
     * index buffer is uploaded (widened to u32) and resolved per-vertex in the
     * VS (arg slot 2), so the i-th VS thread renders index_buf[i]. Everything
-    * else falls back wholly to llvmpipe (§4.5). */
+    * else falls back wholly to llvmpipe. */
    bool indexed = info->index_size == 2 || info->index_size == 4;
+   /* Triangle strips/fans are translated on the host into a triangle-LIST
+    * index array (vp_gather_topology_u32) and run through the list-native front
+    * end. Lines/points still fall back to llvmpipe (SW-raster work). */
+   bool tristrip = info->mode == MESA_PRIM_TRIANGLE_STRIP ||
+                   info->mode == MESA_PRIM_TRIANGLE_FAN;
+   /* Instancing: a multi-instance draw runs on the device (the VS resolves
+    * gl_InstanceIndex and the whole pipeline runs over instance_count ×
+    * verts-per-instance vertices). Instance-RATE vertex attributes (a non-zero
+    * divisor) are not fetched on device yet, so a draw that binds one falls back
+    * to llvmpipe. Single-instance draws never inspect the divisor (fast path). */
+   bool instance_rate_attr = false;
+   if (info->instance_count > 1 && vp->cur_velems) {
+      for (unsigned i = 0; i < vp->cur_velems->num; i++)
+         if (vp->cur_velems->instance_divisor[i] != 0) { instance_rate_attr = true; break; }
+   }
    bool simple =
       vp->dev && vs && vs->vxbin && vs->vs_layout.stride &&
       !indirect && num_draws == 1 &&
       (info->index_size == 0 || indexed) &&
-      !info->primitive_restart && info->instance_count == 1 &&
+      !info->primitive_restart && info->instance_count >= 1 &&
+      !instance_rate_attr &&
+      (info->mode == MESA_PRIM_TRIANGLES || tristrip) &&
       draws[0].count > 0;
 
    if (simple) {
       uint32_t count  = draws[0].count;
       uint32_t stride = vs->vs_layout.stride;
+      /* the device draw is indexed whenever it consumes an index buffer: a
+       * genuinely indexed source, or a strip/fan we translate to an index list. */
+      bool dev_indexed = indexed || tristrip;
 
       /* Gather the vertex-buffer geometry if the VS fetches inputs;
        * if it needs them and we can't supply them, fall back wholly. */
       struct vp_vertex_input vin = { 0 };
       struct pipe_transfer  *vxfer = NULL;
       bool vin_ok = !vs->vs_layout.needs_vertex_input ||
-                    vp_gather_vertex_input(pipe, vp, draws, &vin, &vxfer);
+                    vp_gather_vertex_input(pipe, vp, draws, indexed, &vin, &vxfer);
 
       /* Indexed draw: upload the index buffer (widened to u32) so the VS can
-       * resolve the per-vertex index on device. If it can't be gathered, drop
-       * the whole indexed draw to llvmpipe. */
+       * resolve the per-vertex index on device. Strips/fans are translated to a
+       * triangle-LIST index array here (count becomes 3*tris). If the buffer
+       * can't be gathered, drop the whole draw to llvmpipe. */
       uint64_t    index_dev = 0;
       vx_buffer_h ibuf      = NULL;
-      bool index_ok = !indexed ||
-                      vp_gather_index_u32(pipe, vp, info, draws, &index_dev, &ibuf);
+      bool index_ok;
+      if (tristrip) {
+         uint32_t tris = 0;
+         index_ok = vp_gather_topology_u32(pipe, vp, info, draws,
+                                           &index_dev, &ibuf, &tris);
+         if (index_ok)
+            count = tris * 3u;
+      } else {
+         index_ok = !indexed ||
+                    vp_gather_index_u32(pipe, vp, info, draws, &index_dev, &ibuf);
+      }
       if (!index_ok) {
          if (vxfer) pipe_buffer_unmap(pipe, vxfer);
          goto llvmpipe;
@@ -1198,7 +1543,7 @@ vp_draw_vbo(struct pipe_context *pipe,
       if (sw_raster < 0)
          sw_raster = getenv("VORTEXPIPE_SW_RASTER") != NULL;
       struct vp_screen *vps = vp_reg_get(pipe->screen);
-      /* §5: a unit absent from the device runs in software (the FS was compiled
+      /* A unit absent from the device runs in software (the FS was compiled
        * for it) rather than dropping the whole draw to llvmpipe. RASTER, OM and
        * TEX may each be HW or SW; the device path is taken as long as every unit
        * the draw needs is satisfied HW-or-SW. */
@@ -1217,8 +1562,59 @@ vp_draw_vbo(struct pipe_context *pipe,
                    "compiled for SW texturing — skipping hardware RASTER+OM path");
          gfx_hw = false;
       }
+      /* NPOT textures cannot be addressed by the FF TEX unit (power-of-two
+       * only); they are sampled by the SW multiply-addressing path, which needs
+       * an FS compiled for sw_tex (FF vx_tex4 iff POT, else SW). A
+       * bound NPOT texture on a HW-TEX FS therefore drops to llvmpipe; on a
+       * sw_tex FS the device path samples it in software. */
+      if (gfx_hw && tex_needed && !fs_sw_tex && vp->cur_tex) {
+         uint32_t tw = vp->cur_tex->width0, th = vp->cur_tex->height0;
+         bool pot = tw && th && !(tw & (tw - 1)) && !(th & (th - 1));
+         if (!pot) {
+            mesa_logw("vortexpipe: draw_vbo: NPOT texture %ux%u needs the SW "
+                      "sampler (FS compiled for HW TEX) — skipping hardware path",
+                      tw, th);
+            gfx_hw = false;
+         }
+      }
+      /* Viewport transform for the device front end. Gallium already reduced
+       * the app's VkViewport to window-space scale/translate (captured in
+       * set_viewport_states); forward slot 0 so the device setup maps
+       * clip->screen exactly as the app intends. A y-flip (scale_y<0) then
+       * flips the signed-area face-cull sign correctly. Unset => the default
+       * full-framebuffer y-down transform.
+       *
+       * The device bbox-clamp + scissor are still full-framebuffer, so only a
+       * viewport whose rect equals the full framebuffer [0,W]x[0,H] (in either
+       * Y direction — the y-flip case) renders correctly; an offset / partial /
+       * scaled viewport would raster outside its intended rect. Those fall out
+       * of the HW path and take the VS-on-Vortex + llvmpipe fallback (which
+       * applies the viewport itself) — or, under MESA_VORTEX_STRICT, fail
+       * rather than mis-render. Follow-up: plumb a viewport-derived scissor
+       * + bbox clamp so offset/partial viewports run on the device too. */
+      float vp_sx = 0.5f * (float)vp->fb_width,  vp_tx = 0.5f * (float)vp->fb_width;
+      float vp_sy = 0.5f * (float)vp->fb_height, vp_ty = 0.5f * (float)vp->fb_height;
+      bool vp_full_fb = true;
+      if (vp->vp_valid) {
+         vp_sx = vp->vp_scale_x; vp_tx = vp->vp_trans_x;
+         vp_sy = vp->vp_scale_y; vp_ty = vp->vp_trans_y;
+         const float W = (float)vp->fb_width, H = (float)vp->fb_height;
+         const float eps = 0.5f;
+         float asx = vp_sx < 0 ? -vp_sx : vp_sx, asy = vp_sy < 0 ? -vp_sy : vp_sy;
+         float dtx = vp_tx - 0.5f * W, dty = vp_ty - 0.5f * H;
+         dtx = dtx < 0 ? -dtx : dtx; dty = dty < 0 ? -dty : dty;
+         /* rect = bias ± |scale|; full-fb iff it spans exactly [0,W]x[0,H]. */
+         vp_full_fb = (asx > 0.5f * W - eps) && (asx < 0.5f * W + eps) && dtx < eps
+                   && (asy > 0.5f * H - eps) && (asy < 0.5f * H + eps) && dty < eps;
+         if (!vp_full_fb)
+            mesa_logw("vortexpipe: draw_vbo: non-full-framebuffer viewport "
+                      "(scale=(%g,%g) translate=(%g,%g), fb=%ux%u) unsupported "
+                      "on the device front end (W3) — using the llvmpipe path",
+                      vp_sx, vp_sy, vp_tx, vp_ty, vp->fb_width, vp->fb_height);
+      }
+
       bool hw_path = vin_ok && !sw_raster && gfx_hw && fs && fs->vxbin &&
-                     vp->fb_color && vp->fb_width && vp->fb_height;
+                     vp->fb_color && vp->fb_width && vp->fb_height && vp_full_fb;
 
       /* Vortex hardware raster + OM path: the VS is folded into the draw —
        * vp_raster_draw runs it as stage 0, so the whole VS→setup→bin→FF→FS
@@ -1226,6 +1622,18 @@ vp_draw_vbo(struct pipe_context *pipe,
        * separate host-blocking VS launch). */
       if (hw_path) {
          uint32_t w = vp->fb_width, h = vp->fb_height;
+
+         /* Face cull. PIPE_FACE_FRONT_AND_BACK culls every triangle, so the
+          * draw produces nothing — skip the device dispatch (the colour
+          * buffer stays at the render-pass clear) rather than emit a device
+          * "cull all" mode the front end lacks. */
+         uint32_t cull_mode = vp_cull_mode(vp->cur_rast);
+         if (vp->cur_rast && vp->cur_rast->cull_face == PIPE_FACE_FRONT_AND_BACK) {
+            vp_dbg("vortexpipe: draw_vbo -> cull FRONT_AND_BACK, nothing drawn");
+            if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+            if (ibuf) vx_buffer_release(ibuf);
+            return;
+         }
 
          /* gather the OM state from the bound depth/blend csos */
          struct vp_om_params om = { 0 };
@@ -1249,14 +1657,17 @@ vp_draw_vbo(struct pipe_context *pipe,
             om.colormask  = 0xf;
          }
 
-         /* gather the bound texture for TEX stage 0, if any (power-of-two 2D). */
+         /* gather the bound texture for TEX stage 0, if any. POT textures use
+          * the FF vx_tex4 unit; NPOT textures reach this point only on an FS
+          * compiled for sw_tex (gated above), where the SW sampler addresses
+          * them via width/height. Either way carry the real integer dims. */
          struct vp_tex_params tex = { 0 };
          bool tex_used = false;
          uint32_t tw = 0, th = 0;
          if (vp->cur_tex) {
             tw = vp->cur_tex->width0;
             th = vp->cur_tex->height0;
-            if (tw && th && !(tw & (tw - 1)) && !(th & (th - 1))) {
+            if (tw && th) {
                tex.width  = tw;
                tex.height = th;
                tex.filter = vp->cur_sampler ? vp->cur_sampler->filter
@@ -1266,9 +1677,6 @@ vp_draw_vbo(struct pipe_context *pipe,
                tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
                                             : VX_TEX_WRAP_CLAMP;
                tex_used = true;
-            } else {
-               mesa_logw("vortexpipe: draw_vbo: non-power-of-two "
-                         "texture %ux%u unsupported (gfx-v1)", tw, th);
             }
          }
 
@@ -1279,18 +1687,80 @@ vp_draw_vbo(struct pipe_context *pipe,
          bool drew = vp_fb_ensure(pipe, vp, w, h, &om, &color_dev, &depth_dev);
          if (drew && tex_used)
             drew = vp_tex_ensure(pipe, vp, vp->cur_tex, tw, th, &tex_dev);
+
+         /* A draw whose FS writes >1 colour output AND targets >1 bound
+          * attachment renders each attachment into its own resident buffer and
+          * merges through gfx_om_fragment_mrt_sw (SW OM). num_color is the min of
+          * what the shader writes and what the framebuffer binds. */
+         struct vp_mrt_params mrt;
+         memset(&mrt, 0, sizeof mrt);
+         unsigned num_color = fs ? fs->fs_num_color : 1;
+         if (num_color > GFX_OM_MAX_RT) num_color = GFX_OM_MAX_RT;
+         /* The FS kernel's MRT branch is compiled for exactly its colour-output
+          * count; if the framebuffer binds fewer attachments the device kernel
+          * would dereference an unbound RT. Vulkan discards the surplus outputs,
+          * so run this draw on llvmpipe rather than launch a mismatched kernel. */
+         if (num_color > 1 && (unsigned)vp->fb_nr_cbufs < num_color) {
+            if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+            if (ibuf)  vx_buffer_release(ibuf);
+            goto llvmpipe;
+         }
+         bool use_mrt = drew && num_color > 1;
+         if (use_mrt) {
+            mrt.num_color    = num_color;
+            mrt.color_dev[0] = color_dev;   /* RT0 shares the resident colour buf */
+            drew = vp_fb_ensure_mrt(pipe, vp, w, h, num_color, mrt.color_dev);
+            for (unsigned k = 0; k < num_color; k++) {
+               mrt.pitch[k] = w * 4;
+               if (vp->cur_blend) {
+                  mrt.blend_mode[k] = vp->cur_blend->rt_blend_mode[k];
+                  mrt.blend_func[k] = vp->cur_blend->rt_blend_func[k];
+                  mrt.colormask[k]  = vp->cur_blend->rt_colormask[k];
+               } else {
+                  mrt.blend_mode[k] = (VX_OM_BLEND_MODE_ADD << 16) | VX_OM_BLEND_MODE_ADD;
+                  mrt.blend_func[k] = (VX_OM_BLEND_FUNC_ZERO << 24)
+                                    | (VX_OM_BLEND_FUNC_ZERO << 16)
+                                    | (VX_OM_BLEND_FUNC_ONE  << 8)
+                                    | (VX_OM_BLEND_FUNC_ONE  << 0);
+                  mrt.colormask[k]  = 0xf;
+               }
+            }
+         }
+         /* Gather the fragment stage's bound constant buffers (push
+          * constants at index 0, descriptor set-0 blob at 1, UBOs at their
+          * bound index) so vp_raster_draw can upload them + build the resident
+          * FS descriptor table. Mapped only across the synchronous draw. */
+         struct vp_fs_consts fs_consts;
+         memset(&fs_consts, 0, sizeof(fs_consts));
+         fs_consts.descs     = fs->descs;
+         fs_consts.num_descs = fs->num_descs;
+         struct pipe_transfer *cbxfer[GFX_FS_DESC_SLOTS] = { NULL };
+         for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++) {
+            if (!vp->fs_cbuf[i] || !vp->fs_cbuf_sz[i])
+               continue;
+            void *m = pipe_buffer_map(pipe, vp->fs_cbuf[i], PIPE_MAP_READ,
+                                      &cbxfer[i]);
+            if (!m) { cbxfer[i] = NULL; continue; }
+            fs_consts.data[i] = (const uint8_t *)m + vp->fs_cbuf_off[i];
+            fs_consts.size[i] = vp->fs_cbuf_sz[i];
+         }
          if (drew)
             drew = vp_raster_draw(vp->dev, vp->raster_pool,
                                   vs->vxbin, vs->vxbin_size,
                                   &vs->vx_module, &vs->vx_kernel,
                                   fs->vxbin, fs->vxbin_size,
                                   &fs->vx_module, &fs->vx_kernel,
-                                  count, &vs->vs_layout,
+                                  count, info->instance_count, info->start_instance,
+                                  &vs->vs_layout,
                                   vs->vs_layout.needs_vertex_input ? &vin : NULL,
                                   index_dev,
                                   color_dev, depth_dev, w, h, &om,
                                   tex_used ? tex_dev : 0, tex_used ? &tex : NULL,
-                                  fs_sw_tex, fs_sw_om, fs_sw_raster);
+                                  cull_mode, fs_sw_tex, fs_sw_om, fs_sw_raster,
+                                  vp_sx, vp_tx, vp_sy, vp_ty,
+                                  &fs_consts, use_mrt ? &mrt : NULL);
+         for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++)
+            if (cbxfer[i]) pipe_buffer_unmap(pipe, cbxfer[i]);
          if (drew) {
             vp->rfb_dirty = true;   /* device colour ahead of the resource */
             vp_dbg("vortexpipe: draw_vbo -> Vortex VS+RASTER+OM (one OP_DRAW) "
@@ -1312,8 +1782,9 @@ vp_draw_vbo(struct pipe_context *pipe,
        * back to a host vertex buffer and rasterize on llvmpipe (unsupported
        * state / no hardware raster). Indexed draws skip this path — the
        * standalone VS launch does not resolve the index buffer — and drop
-       * straight to the llvmpipe indexed draw. */
-      if (vin_ok && !indexed) {
+       * straight to the llvmpipe indexed draw. Instanced draws also skip it (the
+       * standalone launch runs one instance only); llvmpipe handles instancing. */
+      if (vin_ok && !dev_indexed && info->instance_count == 1) {
          vx_buffer_h vsbuf  = NULL;
          uint64_t    vsaddr = 0;
          if (vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
@@ -1371,14 +1842,14 @@ vp_context_destroy(struct pipe_context *pipe)
    struct vp_context *vp = vp_reg_get(pipe);
    void (*lp_destroy)(struct pipe_context *) = vp->lp_context_destroy;
 
-   /* release the cached Phase 3 draw-integration objects (need a
+   /* release the cached draw-integration objects (need a
     * live pipe) */
    if (vp->passthrough_vs)
       vp->lp_delete_vs_state(pipe, vp->passthrough_vs);
    if (vp->velems)
       pipe->delete_vertex_elements_state(pipe, vp->velems);
 
-   /* §6.6 residency: flush + release the resident framebuffer + texture. */
+   /* Residency: flush + release the resident framebuffer + texture. */
    vp_fb_invalidate(pipe, vp);
    if (vp->rtex_buf) { vx_buffer_release(vp->rtex_buf); vp->rtex_buf = NULL; }
 
@@ -1430,6 +1901,10 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_create_blend_state   = pipe->create_blend_state;
    vp->lp_bind_blend_state     = pipe->bind_blend_state;
    vp->lp_delete_blend_state   = pipe->delete_blend_state;
+   vp->lp_create_rasterizer_state = pipe->create_rasterizer_state;
+   vp->lp_bind_rasterizer_state   = pipe->bind_rasterizer_state;
+   vp->lp_delete_rasterizer_state = pipe->delete_rasterizer_state;
+   vp->lp_set_viewport_states  = pipe->set_viewport_states;
    vp->lp_create_texture_handle = pipe->create_texture_handle;
    vp->lp_create_vertex_elements_state = pipe->create_vertex_elements_state;
    vp->lp_bind_vertex_elements_state   = pipe->bind_vertex_elements_state;
@@ -1460,6 +1935,10 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->create_blend_state   = vp_create_blend_state;
    pipe->bind_blend_state     = vp_bind_blend_state;
    pipe->delete_blend_state   = vp_delete_blend_state;
+   pipe->create_rasterizer_state = vp_create_rasterizer_state;
+   pipe->bind_rasterizer_state   = vp_bind_rasterizer_state;
+   pipe->delete_rasterizer_state = vp_delete_rasterizer_state;
+   pipe->set_viewport_states   = vp_set_viewport_states;
    pipe->create_texture_handle = vp_create_texture_handle;
    pipe->create_vertex_elements_state = vp_create_vertex_elements_state;
    pipe->bind_vertex_elements_state   = vp_bind_vertex_elements_state;

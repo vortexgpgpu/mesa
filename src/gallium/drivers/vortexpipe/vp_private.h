@@ -24,6 +24,7 @@
 
 #include "vortex2.h"
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
+#include "gfx_fs_desc_abi.h"     /* GFX_OM_MAX_RT */
 
 /* Per-screen vortexpipe state, keyed by the llvmpipe pipe_screen *. */
 struct vp_screen {
@@ -44,9 +45,8 @@ struct vp_screen {
     *
     * hw_max_block_size = hw_num_threads * hw_num_warps. KMU's block_size
     * DCR is sized to address one CTA's threads (CTA_TID_WIDTH+1 bits);
-    * larger values truncate, producing empty-tmask warps that crash the
-    * RTL with a `invalid request mask` LSU assertion. SimX silently
-    * sub-dispatches and so isn't a useful oracle here.
+    * larger values truncate, producing empty-tmask warps that the
+    * device rejects (an invalid-request-mask fault).
     *
     * has_tex / has_raster / has_om gate vp_raster_draw and the texture
     * upload path on the ISA extensions actually present. A device built
@@ -78,20 +78,23 @@ struct vp_cso {
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
    struct vp_desc descs[VP_MAX_DESCS];  /* set-0 descriptors the kernel uses */
    unsigned        num_descs;
-   /* §6.6 residency: the vxbin loaded onto the device once and reused across
+   /* Residency: the vxbin loaded onto the device once and reused across
     * draws (compile-once + upload-resident-once — no per-draw module reload,
     * no /tmp round-trip). Lazily loaded by vp_raster_draw, released on delete.
     * Same-stage CSOs share one device address, so binding a different VS/FS
     * evicts the previously-resident one (vp_bind_vs_state / vp_bind_fs_state). */
    vx_module_h vx_module;
    vx_kernel_h vx_kernel;
-   /* §5 per-unit SW routing baked into a fragment shader at compile time (from
+   /* Per-unit SW routing baked into a fragment shader at compile time (from
     * device caps + VORTEXPIPE_FORCE_SW). The draw path reads this to build +
     * pass the resident SW descriptors the FS was compiled to expect. */
    struct vp_sw_routing fs_routing;
+   /* Number of colour outputs the fragment shader writes (RT count).
+    * >1 forces the SW-OM MRT path. 0/1 = single RT. */
+   unsigned fs_num_color;
 };
 
-/* Captured + VX-encoded output-merger state (Phase 5). create_*_state
+/* Captured + VX-encoded output-merger state. create_*_state
  * translates the Gallium depth/blend state to the Vortex OM encoding
  * once and registers it (keyed by the llvmpipe cso, via vp_reg);
  * create returns llvmpipe's cso unchanged so csos made before
@@ -105,12 +108,28 @@ struct vp_dsa_cso {
 
 struct vp_blend_cso {
    bool     blend_enable;
-   uint32_t blend_mode;        /* VX_DCR_OM_BLEND_MODE packed word */
-   uint32_t blend_func;        /* VX_DCR_OM_BLEND_FUNC packed word */
-   uint32_t colormask;         /* VX_DCR_OM_CBUF_WRITEMASK (RGBA bits) */
+   uint32_t blend_mode;        /* VX_DCR_OM_BLEND_MODE packed word (RT0) */
+   uint32_t blend_func;        /* VX_DCR_OM_BLEND_FUNC packed word (RT0) */
+   uint32_t colormask;         /* VX_DCR_OM_CBUF_WRITEMASK (RGBA bits, RT0) */
+   /* Per-attachment blend/write-mask. Slot 0 mirrors the scalar fields
+    * above (single-RT path unchanged); slots 1.. carry the independent-blend
+    * state (or a copy of RT0 when independent blend is off). */
+   uint32_t rt_blend_mode[GFX_OM_MAX_RT];
+   uint32_t rt_blend_func[GFX_OM_MAX_RT];
+   uint32_t rt_colormask[GFX_OM_MAX_RT];
 };
 
-/* Captured texture-sampler state (Phase 6), VX TEX-encoded. lavapipe
+/* Captured rasterizer state: the face-cull inputs the device front end
+ * needs. cull_face is the Gallium PIPE_FACE_* mask and front_ccw the
+ * front-face winding; vp_draw_vbo turns the pair into the device
+ * SETUP_CULL_* mode (see vp_cull_mode). Only these two fields are used —
+ * everything else in pipe_rasterizer_state stays with llvmpipe. */
+struct vp_rast_cso {
+   unsigned cull_face;         /* PIPE_FACE_{NONE,FRONT,BACK,FRONT_AND_BACK} */
+   bool     front_ccw;         /* front face is counter-clockwise */
+};
+
+/* Captured texture-sampler state, VX TEX-encoded. lavapipe
  * routes both image views and samplers through create_texture_handle,
  * so vortexpipe captures the sampler's filter/wrap there. */
 struct vp_sampler_cso {
@@ -131,18 +150,29 @@ struct vp_velems_cso {
    uint32_t src_offset[VP_MAX_ATTR];   /* attribute byte offset in a vertex */
    uint32_t src_stride[VP_MAX_ATTR];   /* bytes between consecutive vertices */
    uint8_t  buffer_index[VP_MAX_ATTR]; /* which bound vertex buffer */
+   /* Instance-rate divisor per attribute (0 = per-vertex). The device VS
+    * fetches attributes per-vertex only; an instanced draw that binds an
+    * instance-rate attribute falls back to llvmpipe (gl_InstanceIndex-driven
+    * instancing IS on-device). */
+   uint32_t instance_divisor[VP_MAX_ATTR];
 };
 
 /* Per-context vortexpipe state, keyed by the llvmpipe pipe_context *. */
 struct vp_context {
    vx_device_h dev;                       /* borrowed from vp_screen */
    struct vp_cso *cur_cso;                /* bound compute state */
-   struct vp_cso *cur_vs;                 /* bound vertex shader (Phase 3) */
-   struct vp_cso *cur_fs;                 /* bound fragment shader (Phase 4) */
+   struct vp_cso *cur_vs;                 /* bound vertex shader */
+   struct vp_cso *cur_fs;                 /* bound fragment shader */
    /* compute constant buffers, by index -- lavapipe binds the
     * descriptor buffer for descriptor set N at index N+1. */
    struct pipe_resource *cbuf[8];
    unsigned              cbuf_off[8];
+   /* Fragment-stage constant buffers, by index (0 = push constants,
+    * 1 = descriptor set-0 blob, …). The draw path uploads each bound one
+    * to device memory + builds the resident FS descriptor table. */
+   struct pipe_resource *fs_cbuf[8];
+   unsigned              fs_cbuf_off[8];
+   unsigned              fs_cbuf_sz[8];
    void *(*lp_create_compute_state)(struct pipe_context *,
                                     const struct pipe_compute_state *);
    void  (*lp_bind_compute_state)(struct pipe_context *, void *);
@@ -156,7 +186,7 @@ struct vp_context {
                                   enum pipe_shader_type, unsigned, unsigned,
                                   const struct pipe_shader_buffer *,
                                   unsigned);
-   /* graphics (Phase 3): vertex-shader state + the draw entry. */
+   /* graphics: vertex-shader state + the draw entry. */
    void *(*lp_create_vs_state)(struct pipe_context *,
                                const struct pipe_shader_state *);
    void  (*lp_bind_vs_state)(struct pipe_context *, void *);
@@ -171,20 +201,25 @@ struct vp_context {
                                const struct pipe_shader_state *);
    void  (*lp_bind_fs_state)(struct pipe_context *, void *);
    void  (*lp_delete_fs_state)(struct pipe_context *, void *);
-   /* Phase 3 draw integration: a cached passthrough VS + vertex-
+   /* Draw integration: a cached passthrough VS + vertex-
     * elements state that feed the Vortex-transformed vertices into
     * llvmpipe's rasterizer (see vp_draw_vbo). */
    void *passthrough_vs;
    void *velems;
-   /* Phase 4/5: the bound render targets (set_framebuffer_state). */
+   /* The bound render targets (set_framebuffer_state). */
    void (*lp_set_framebuffer_state)(struct pipe_context *,
                                     const struct pipe_framebuffer_state *);
    struct pipe_resource *fb_color;
    struct pipe_resource *fb_depth;       /* depth/stencil attachment, or NULL */
    unsigned              fb_width, fb_height;
-   /* §6.6: persistent front-end working set, reused across the frame's draws. */
+   /* All bound colour attachments (fb_color == fb_cbufs[0]). A draw to
+    * >1 attachment renders each into its own resident device buffer and writes
+    * each back at sync. */
+   struct pipe_resource *fb_cbufs[GFX_OM_MAX_RT];
+   unsigned              fb_nr_cbufs;
+   /* Persistent front-end working set, reused across the frame's draws. */
    struct vp_raster_pool *raster_pool;
-   /* §6.6 framebuffer residency: the colour + depth attachments kept
+   /* Framebuffer residency: the colour + depth attachments kept
     * device-resident across the draws of a render pass. rcb/rzb shadow
     * fb_color (rfb_res) at rfb_w x rfb_h: cleared/initialised ONCE per pass
     * (not per draw — preserving depth + colour across draws), then synced back
@@ -194,13 +229,18 @@ struct vp_context {
    struct pipe_resource *rfb_res;
    unsigned              rfb_w, rfb_h;
    bool                  rfb_dirty;
+   /* Extra resident colour buffers for attachments 1.. (RT0 uses rcb).
+    * rmrt_res[k] is the framebuffer resource each is synced back to. */
+   vx_buffer_h           rcb_extra[GFX_OM_MAX_RT];
+   struct pipe_resource *rmrt_res[GFX_OM_MAX_RT];
+   unsigned              rmrt_nr;
    void (*lp_flush)(struct pipe_context *, struct pipe_fence_handle **, unsigned);
-   /* §6.6 texture residency: the converted + uploaded TEX-stage-0 texels kept
+   /* Texture residency: the converted + uploaded TEX-stage-0 texels kept
     * device-resident across draws, keyed by the bound sampler resource. */
    vx_buffer_h           rtex_buf;
    struct pipe_resource *rtex_res;
    unsigned              rtex_w, rtex_h;
-   /* Phase 5: output-merger state (depth-stencil-alpha + blend). */
+   /* Output-merger state (depth-stencil-alpha + blend). */
    struct vp_dsa_cso   *cur_dsa;
    struct vp_blend_cso *cur_blend;
    void *(*lp_create_dsa_state)(struct pipe_context *,
@@ -211,7 +251,28 @@ struct vp_context {
                                   const struct pipe_blend_state *);
    void  (*lp_bind_blend_state)(struct pipe_context *, void *);
    void  (*lp_delete_blend_state)(struct pipe_context *, void *);
-   /* Phase 6: texture + sampler, captured from create_texture_handle.
+   /* Rasterizer state: face cull + front-face winding for the device
+    * front end (see vp_rast_cso). Captured at create time (the winding /
+    * cull mask are only in pipe_rasterizer_state there); everything else
+    * passes through to llvmpipe unchanged. */
+   struct vp_rast_cso *cur_rast;
+   void *(*lp_create_rasterizer_state)(struct pipe_context *,
+                                       const struct pipe_rasterizer_state *);
+   void  (*lp_bind_rasterizer_state)(struct pipe_context *, void *);
+   void  (*lp_delete_rasterizer_state)(struct pipe_context *, void *);
+   /* Viewport transform (screen = ndc*scale + bias) captured from the app's
+    * bound VkViewport. The device front end otherwise hardwires a full-fb
+    * y-down viewport, so a y-flip (negative-height) or offset/scaled viewport
+    * would mirror / mis-place the screen-space triangle and flip the signed-area
+    * face-cull sense. vp_draw_vbo forwards this to the device setup; only slot 0
+    * is tracked (gfx-v1 is single-viewport). vp_valid is false until the app
+    * sets one, in which case the default full-fb transform is used. */
+   bool  vp_valid;
+   float vp_scale_x, vp_trans_x;
+   float vp_scale_y, vp_trans_y;
+   void  (*lp_set_viewport_states)(struct pipe_context *, unsigned, unsigned,
+                                   const struct pipe_viewport_state *);
+   /* Texture + sampler, captured from create_texture_handle.
     * lavapipe routes an image view (texture, state==NULL) and a
     * sampler (state, view==NULL) through that one entry point; gfx-v1
     * binds the latest of each to TEX stage 0. cur_sampler points at

@@ -754,6 +754,59 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
       .computeDerivativeGroupQuads = true,
       .computeDerivativeGroupLinear = true,
    };
+
+   /*
+    * Device-capability honesty (vortexpipe / Vortex device path only).
+    *
+    * lavapipe inherits llvmpipe's advertised feature set, but llvmpipe
+    * implements a number of optional Vulkan features purely in CPU
+    * software that the Vortex on-device graphics pipeline does NOT
+    * implement. vp_raster is a fixed VS -> raster -> FS SIMT pipeline: it
+    * has no geometry/tessellation/mesh/task stages, no transform feedback,
+    * and a single fixed-function viewport. Advertising those as supported
+    * is dishonest -- an app (or the eventual dEQP-VK CTS run) that enables
+    * one would silently drop to an llvmpipe CPU fallback rather than run on
+    * Vortex, defeating the point of the device.
+    *
+    * Gate the honest-off overrides on the underlying screen actually being
+    * the vortexpipe screen, so a plain-llvmpipe lavapipe device (Vortex not
+    * selected, or no Vortex device opened -- see vp_screen_get_name, which
+    * then reports llvmpipe's own name) keeps its genuine full software caps.
+    * Detection is by device-name prefix to avoid a frontend->driver header
+    * or link dependency; only vortexpipe stamps the "vortexpipe" prefix.
+    *
+    * Left deliberately AS-IS (unimplemented-on-device but a working llvmpipe
+    * software fallback exists, or unverified) and flagged for later review:
+    * rayQuery / ray-tracing-pipeline (RTU + SW fallback), plain `multiview`
+    * layered rendering, and pipelineStatisticsQuery. The unimplemented
+    * extensions themselves (VK_EXT_mesh_shader, _transform_feedback,
+    * tessellation/geometry) are still advertised; extension-list pruning is
+    * a larger, separate change and is deferred.
+    */
+   {
+      const char *dev_name =
+         pdevice->pscreen->get_name(pdevice->pscreen);
+      if (dev_name && !strncmp(dev_name, "vortexpipe", 10)) {
+         /* No geometry or tessellation stages in the vp_raster pipeline. */
+         features->geometryShader              = false;
+         features->tessellationShader          = false;
+         features->multiviewGeometryShader     = false;
+         features->multiviewTessellationShader = false;
+         /* No mesh / task pipeline on device. */
+         features->taskShader                  = false;
+         features->meshShader                  = false;
+         features->meshShaderQueries           = false;
+         features->multiviewMeshShader         = false;
+         /* Fixed-function raster: single viewport, no wide-line or
+          * large-point rasterization. */
+         features->multiViewport               = false;
+         features->wideLines                   = false;
+         features->largePoints                 = false;
+         /* No on-device transform feedback / geometry streams. */
+         features->transformFeedback           = false;
+         features->geometryStreams             = false;
+      }
+   }
 }
 
 extern unsigned lp_native_vector_width;
