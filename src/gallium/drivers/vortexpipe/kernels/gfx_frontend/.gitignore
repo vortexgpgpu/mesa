@@ -1,3 +1,3 @@
-gfx_frontend.elf
-gfx_frontend.vxbin
+gfx_frontend*.elf
+gfx_frontend*.vxbin
 *.o

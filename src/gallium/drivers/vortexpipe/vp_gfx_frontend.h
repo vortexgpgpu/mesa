@@ -12,15 +12,17 @@
 #ifndef VP_GFX_FRONTEND_H
 #define VP_GFX_FRONTEND_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* The embedded gfx_v2 front-end kernel image (.vxbin), exposing the
- * "setup_k" and "binning_k" entries. *size_out receives its byte length. */
-const void *vp_gfx_frontend_vxbin(size_t *size_out);
+/* The embedded gfx_v2 front-end kernel image (.vxbin) for the requested
+ * device XLEN (is64 = riscv64 image), exposing the "setup_k" and
+ * "binning_k" entries. *size_out receives its byte length. */
+const void *vp_gfx_frontend_vxbin(bool is64, size_t *size_out);
 
 #ifdef __cplusplus
 }

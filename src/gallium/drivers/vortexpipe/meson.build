@@ -41,52 +41,62 @@ vp_vortex_build = get_option('vortex-build')
 if vp_vortex_build == ''
   vp_vortex_build = vp_vortex_home / 'build'
 endif
+vp_vortex_build64 = get_option('vortex-build64')
+if vp_vortex_build64 == ''
+  vp_vortex_build64 = vp_vortex_home / 'build64'
+endif
 
 # make builds the .vxbin out-of-tree into the custom_target's @OUTDIR@;
 # xxd.py then embeds it as a C byte array (-b: binary, no trailing nul).
-gfx_frontend_vxbin = custom_target(
-  'gfx_frontend.vxbin',
-  output  : 'gfx_frontend.vxbin',
-  command : [
-    find_program('make'),
-    '-C', meson.current_source_dir() / 'kernels' / 'gfx_frontend',
-    # absolute: make runs with -C (its CWD differs from ninja's), so a
-    # build-root-relative @OUTDIR@ would not resolve. current_build_dir()
-    # is this target's output directory (where meson expects the .vxbin).
-    'OUTDIR=' + meson.current_build_dir(),
-    'VORTEX_HOME=' + vp_vortex_home,
-    # VORTEX_BUILD is the Vortex out-of-tree build dir holding libvortex2.a
-    # (sw/kernel/) and the generated config headers (sw/, hw/) the front-end
-    # kernel links/includes. The Makefile defaults it to <VORTEX_HOME>/build,
-    # which is wrong for a CI tree configured under a differently named build
-    # dir (build32/build64/build32_amo); forward the real one so the kernel
-    # links the matching libvortex2.a.
-    'VORTEX_BUILD=' + vp_vortex_build,
-    'VORTEX_TOOLDIR=' + get_option('vortex-tooldir'),
-    'all',
-  ],
-  # Rebuild the blob when the SDK kernel sources (sw/gfx, sw/common) or the
-  # build recipe change — meson does not see make's own prerequisites. Headers
-  # follow the 06-10 consolidation: the fused stage logic is gfx_frontend_k.h;
-  # the shared ABI/setup math live in sw/common (gfx_frontend_abi.h + gfx_setup.h).
-  depend_files : files(
-      'kernels/gfx_frontend/gfx_frontend_kernel.cpp',
-      'kernels/gfx_frontend/Makefile',
-    ) + [
-      vp_vortex_home / 'sw' / 'gfx' / 'gfx_frontend_k.h',
-      vp_vortex_home / 'sw' / 'common' / 'gfx_frontend_abi.h',
-      vp_vortex_home / 'sw' / 'common' / 'gfx_setup.h',
-      vp_vortex_home / 'sw' / 'common' / 'vx_gfx_abi.h',
+# One embedded front-end image per device XLEN: the blob is machine code
+# linked against the XLEN-matched libvortex2.a, and the driver picks the
+# image matching the device at load time (vp_gfx_frontend_vxbin).
+gfx_frontend_vxbin_h = []
+foreach vp_xlen : [['32', vp_vortex_build], ['64', vp_vortex_build64]]
+  gfx_frontend_vxbin = custom_target(
+    'gfx_frontend' + vp_xlen[0] + '.vxbin',
+    output  : 'gfx_frontend' + vp_xlen[0] + '.vxbin',
+    command : [
+      find_program('make'),
+      '-C', meson.current_source_dir() / 'kernels' / 'gfx_frontend',
+      # absolute: make runs with -C (its CWD differs from ninja's), so a
+      # build-root-relative @OUTDIR@ would not resolve. current_build_dir()
+      # is this target's output directory (where meson expects the .vxbin).
+      'OUTDIR=' + meson.current_build_dir(),
+      'XLEN=' + vp_xlen[0],
+      'VORTEX_HOME=' + vp_vortex_home,
+      # VORTEX_BUILD is the Vortex out-of-tree build dir holding libvortex2.a
+      # (sw/kernel/) and the generated config headers (sw/, hw/) the front-end
+      # kernel links/includes — one per XLEN, so each image links the matching
+      # libvortex2.a.
+      'VORTEX_BUILD=' + vp_xlen[1],
+      'VORTEX_TOOLDIR=' + get_option('vortex-tooldir'),
+      'all',
     ],
-  console : true,
-)
+    # Rebuild the blob when the SDK kernel sources (sw/gfx, sw/common) or the
+    # build recipe change — meson does not see make's own prerequisites. Headers
+    # follow the 06-10 consolidation: the fused stage logic is gfx_frontend_k.h;
+    # the shared ABI/setup math live in sw/common (gfx_frontend_abi.h + gfx_setup.h).
+    depend_files : files(
+        'kernels/gfx_frontend/gfx_frontend_kernel.cpp',
+        'kernels/gfx_frontend/Makefile',
+      ) + [
+        vp_vortex_home / 'sw' / 'gfx' / 'gfx_frontend_k.h',
+        vp_vortex_home / 'sw' / 'common' / 'gfx_frontend_abi.h',
+        vp_vortex_home / 'sw' / 'common' / 'gfx_setup.h',
+        vp_vortex_home / 'sw' / 'common' / 'vx_gfx_abi.h',
+      ],
+    console : true,
+  )
 
-gfx_frontend_vxbin_h = custom_target(
-  'gfx_frontend_vxbin.h',
-  input   : [files_xxd, gfx_frontend_vxbin],
-  output  : 'gfx_frontend_vxbin.h',
-  command : [prog_python, '@INPUT@', '@OUTPUT@', '-b', '-n', 'gfx_frontend_vxbin'],
-)
+  gfx_frontend_vxbin_h += custom_target(
+    'gfx_frontend_vxbin' + vp_xlen[0] + '.h',
+    input   : [files_xxd, gfx_frontend_vxbin],
+    output  : 'gfx_frontend_vxbin' + vp_xlen[0] + '.h',
+    command : [prog_python, '@INPUT@', '@OUTPUT@', '-b',
+               '-n', 'gfx_frontend_vxbin' + vp_xlen[0]],
+  )
+endforeach
 
 files_vortexpipe = files(
   'vp_public.h',

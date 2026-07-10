@@ -10,7 +10,8 @@
 #   VORTEX_HOME    Vortex source tree   (sw/kernel/{scripts,include})
 #   VORTEX_BUILD   Vortex build tree    (sw/kernel/libvortex2.a); default $(VORTEX_HOME)/build
 #   VORTEX_TOOLDIR llvm-vortex + GNU toolchain + libc/libcrt
-# XLEN is 32 (the Vortex graphics target).
+# XLEN selects the target ISA (32 -> rv32imaf/ilp32f, 64 -> rv64imafd/lp64d);
+# the driver embeds one image per XLEN and loads the device-matched one.
 
 XLEN          ?= 32
 VORTEX_HOME   ?= $(HOME)/dev/vortex_v3/prism_v3
@@ -23,8 +24,13 @@ OUTDIR        ?= .
 
 TARGET   := riscv$(XLEN)-unknown-elf
 GNU_DIR  := riscv$(XLEN)-gnu-toolchain
+ifeq ($(XLEN),64)
+MARCH    := rv64imafd
+MABI     := lp64d
+else
 MARCH    := rv32imaf
 MABI     := ilp32f
+endif
 LINKER   := link$(XLEN).ld
 LIBC     := libc$(XLEN)
 LIBCRT   := libcrt$(XLEN)
@@ -62,19 +68,19 @@ VX_LDFLAGS := -Wl,-Bstatic,--gc-sections,-T,$(VORTEX_HOME)/sw/kernel/scripts/$(L
   -L$(VORTEX_TOOLDIR)/$(LIBC)/lib -lm -lc \
   $(VORTEX_TOOLDIR)/$(LIBCRT)/lib/baremetal/$(CRT_A)
 
-all: $(OUTDIR)/gfx_frontend.vxbin
+all: $(OUTDIR)/gfx_frontend$(XLEN).vxbin
 
 # Kernel sources are owned by the Vortex SDK (sw/gfx + sw/common), not copied
 # here — this driver compiles them, the SDK is the single source of truth.
 GFX_HDRS := $(wildcard $(VORTEX_HOME)/sw/gfx/*.h) $(VORTEX_HOME)/sw/common/gfx_frontend_abi.h
 
-$(OUTDIR)/gfx_frontend.elf: gfx_frontend_kernel.cpp $(GFX_HDRS) Makefile
+$(OUTDIR)/gfx_frontend$(XLEN).elf: gfx_frontend_kernel.cpp $(GFX_HDRS) Makefile
 	$(CLANG) $(VX_CFLAGS) gfx_frontend_kernel.cpp $(VX_LDFLAGS) -o $@
 
-$(OUTDIR)/gfx_frontend.vxbin: $(OUTDIR)/gfx_frontend.elf
+$(OUTDIR)/gfx_frontend$(XLEN).vxbin: $(OUTDIR)/gfx_frontend$(XLEN).elf
 	OBJCOPY=$(OBJCOPY) python3 $(VORTEX_HOME)/sw/kernel/scripts/vxbin.py $< $@
 
 clean:
-	rm -f $(OUTDIR)/gfx_frontend.elf $(OUTDIR)/gfx_frontend.vxbin
+	rm -f $(OUTDIR)/gfx_frontend*.elf $(OUTDIR)/gfx_frontend*.vxbin
 
 .PHONY: all clean

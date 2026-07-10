@@ -27,7 +27,7 @@ platform SDK. Mirrors how `vp_compile.c` consumes the SDK for NIR shaders.
 ## Build
 
 ```
-make            # -> gfx_frontend.vxbin (XLEN=32)
+make            # -> gfx_frontend32.vxbin (XLEN=32; XLEN=64 -> gfx_frontend64.vxbin)
 ```
 
 Honors the same env as the driver: `VORTEX_HOME` (SDK source: `sw/gfx`,

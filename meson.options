@@ -139,6 +139,16 @@ option(
 )
 
 option(
+  'vortex-build64',
+  type : 'string',
+  value : '',
+  description : 'Path to the XLEN=64 Vortex out-of-tree build dir holding ' +
+                'the 64-bit libvortex2.a and generated config headers. Used ' +
+                'to build the 64-bit gfx_v2 front-end kernel image embedded ' +
+                'alongside the 32-bit one. Defaults to <vortex-home>/build64.',
+)
+
+option(
   'gallium-vdpau',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},
