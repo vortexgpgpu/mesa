@@ -330,7 +330,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
       if (pool->fe_module == NULL) {
          size_t fe_size = 0;
-         const void *fe_bytes = vp_gfx_frontend_vxbin(&fe_size);
+         const void *fe_bytes = vp_gfx_frontend_vxbin(vp_xlen_is_64(), &fe_size);
          VP_CHECK(vx_module_load_bytes(dev, fe_bytes, fe_size, &pool->fe_module),
                   "vx_module_load_bytes(frontend)");
          VP_CHECK(vx_module_get_kernel(pool->fe_module, "expand_k", &pool->k_expand),
@@ -549,7 +549,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
             omstate.stencil_zfail[f]     = VX_OM_STENCIL_OP_KEEP;
             omstate.stencil_fail[f]      = VX_OM_STENCIL_OP_KEEP;
             omstate.stencil_ref[f]       = 0;
-            omstate.stencil_mask[f]      = VX_OM_STENCIL_MASK;
+            omstate.stencil_mask[f]      = OM_STENCIL_MASK;
             omstate.stencil_writemask[f] = 0;
          }
          omstate.blend_mode_rgb = om->blend_mode & 0xffff;
