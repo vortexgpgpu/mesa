@@ -419,8 +419,17 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
        * texstate/omstate descriptors (arg[1]/[2]); SW raster adds the tile-walk
        * counts (arg[3..8]); and the resident FS descriptor table
        * (arg[GFX_FS_ARG_DESC]). The HW path reaches colour/depth via the OM DCRs. */
-      uint64_t argblk[GFX_FS_ARG_MRT + 1] = { 0 };
+      uint64_t argblk[GFX_FS_ARG_APERTURE + 1] = { 0 };
       argblk[0] = prim_dev;
+
+      /* OM aperture geometry: pad the render target to a power of two on each axis
+       * so a fragment export's address is a shift, not a multiply. record_shift 3 =
+       * an 8-byte {colour, depth} record. vp_log2u rounds up. */
+      const uint32_t ap_xbits = vp_log2u(width);
+      const uint32_t ap_ybits = vp_log2u(height);
+      const uint32_t ap_shift = 3u;
+      argblk[GFX_FS_ARG_APERTURE] =
+         GFX_FS_APERTURE_PACK(ap_xbits, ap_ybits, ap_shift);
 
       /* Build the resident FS descriptor table — one device buffer per bound
        * fragment constant buffer (push constants, UBOs, and the descriptor set
@@ -830,6 +839,16 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_OM_BLEND_FUNC,        om->blend_func);
       DCRW(VX_DCR_OM_BLEND_CONST,       0);
       DCRW(VX_DCR_OM_LOGIC_OP,          0);
+
+      /* OM aperture: a fragment export is a store into a virtual address range
+       * that the cluster's OM ingress peels off the L1->L2 trunk. The address is
+       * shift-only (the pitch is padded to a power of two), so the ingress decodes
+       * it by bit-slicing rather than dividing. Both sides must agree, so the same
+       * geometry is programmed here and handed to the FS in its arg block. */
+      DCRW(VX_DCR_OM_APERTURE_XBITS,        ap_xbits);
+      DCRW(VX_DCR_OM_APERTURE_YBITS,        ap_ybits);
+      DCRW(VX_DCR_OM_APERTURE_RECORD_SHIFT, ap_shift);
+      DCRW(VX_DCR_OM_APERTURE_DEPTH_ONLY,   0);
       }
 
       /* TEX unit (stage 0): the texels are residency-cached at tex_dev

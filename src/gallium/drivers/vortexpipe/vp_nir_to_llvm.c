@@ -23,7 +23,8 @@
 #include "vp_nir_to_llvm.h"
 #include "vp_compile.h"      /* vp_xlen_is_64 */
 #include "vp_private.h"      /* vp_dbg */
-#include "gfx_fs_desc_abi.h" /* GFX_FS_ARG_DESC, GFX_FS_DESC_SLOTS */
+#include "gfx_fs_desc_abi.h" /* GFX_FS_ARG_DESC, GFX_FS_ARG_APERTURE */
+#include "VX_types.h"        /* VX_MEM_OM_BASE_ADDR */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,6 +160,12 @@ struct vp_tr {
    bool           sw_om;
    bool           sw_raster;  /* FS is the one-thread-per-tile SW-raster kernel */
    LLVMValueRef   fs_texstate; /* ptr param (gfx_sw_texstate_t* table) */
+
+   /* OM aperture geometry, unpacked from the FS arg block (per-draw, so it cannot
+    * be a JIT constant). A fragment export's address is formed by shifting. */
+   LLVMValueRef   om_ap_xbits;
+   LLVMValueRef   om_ap_ybits;
+   LLVMValueRef   om_ap_shift;
    /* Number of colour attachments the FS writes (1 = single RT, the
     * byte-identical fast path). Colour output k occupies out slot k*16 in the
     * FS output area; the wrapper packs slots 0..num_color-1 into a src_colors[]
@@ -1131,10 +1138,8 @@ emit_vx_gfx_get_after(struct vp_tr *t, unsigned slot, LLVMValueRef handle)
    return LLVMBuildCall2(t->b, fnty, ia, a, 1, "texw");
 }
 
-/* vx_tex4_single: sample TEX stage 0 on the gfx window (custom-1 funct3=5,
- * R-type; funct7={out_slot<<2|stage<<1|mode}, mode=0 single, stage=0). Stage
- * u,v into the window, issue the sample (rd=sync handle, rs1=lod, rs2=in_slot),
- * read the texel back handle-chained. Returns the packed A8R8G8B8 texel. */
+/* vx_tex: sample TEX stage 0 (custom-1 funct3=5, R4-type). u/v/lod ride
+ * rs1/rs2/rs3 and the packed A8R8G8B8 texel returns in rd. */
 static LLVMValueRef
 emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
             LLVMValueRef lod)
@@ -1152,20 +1157,18 @@ emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
       return LLVMBuildCall2(t->b, fty, fn, a, 4, "texsw");
    }
 
-   emit_vx_gfx_set(t, VP_TEX_IN_SLOT,     u);
-   emit_vx_gfx_set(t, VP_TEX_IN_SLOT + 1, v);
-   char s[48];
-   snprintf(s, sizeof s, ".insn r 43, 5, %u, $0, $1, $2", VP_TEX_OUT_SLOT << 2);
-   LLVMTypeRef args[2] = { t->i32, t->i32 };
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 2, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r,r", 6,
+   /* vx_tex: rs1=u, rs2=v, rs3=lod, rd=texel, funct2=stage(0). The TEX unit takes
+    * its operands in registers -- no window staging, no handle chaining. */
+   const char *s = ".insn r4 43, 5, 0, $0, $1, $2, $3";
+   LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 3, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r,r,r", 8,
                                       /*HasSideEffects*/ true,
                                       /*IsAlignStack*/ false,
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
-   LLVMValueRef a[2] = { lod, LLVMConstInt(t->i32, VP_TEX_IN_SLOT, false) };
-   LLVMValueRef handle = LLVMBuildCall2(t->b, fnty, ia, a, 2, "texh");
-   return emit_vx_gfx_get_after(t, VP_TEX_OUT_SLOT, handle);
+   LLVMValueRef a[3] = { u, v, lod };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 3, "texel");
 }
 
 /* ── RTU (ray-tracing unit) ops — ISA v2 window ABI ──────────────────
@@ -1615,53 +1618,55 @@ emit_store_i32(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef val)
       LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
 }
 
-/* vx_frag_payload(word): read one staged frag_payload_t word for this lane from
- * the gfx window. RASTER dispatch v2 is PUSH: the raster work distributor seeds
- * the per-lane payload into the gfx register window at warp launch,
- * indexing the window's WARP dimension by the fragment warp's block_idx — NOT the
- * minted warp-id. So the FS must read it back with GETWS (custom-1 funct3=4; slot
- * in funct7[6:2], rs1 = block_idx, count=1 via rs2=x1), exactly like the native
- * vx_frag_load / vx_gfx_get_slot in sw/kernel/include. A plain GETW (funct3=6,
- * executing-warp indexed) reads the wrong slot whenever warp-id != block_idx.
- * block_idx comes from CSR VX_CSR_CTA_BLOCK_ID_X. Returns the raw 32-bit slot. */
+/* This lane's fragment stamp. The raster engine packs it into the launch message
+ * and the core lands it in the warp's launch registers before the warp is
+ * activated, so reading it is a CSR read -- no window op, no memory traffic.
+ *   word 0 = pos_mask (cov_mask[3:0] | pos_x<<4 | pos_y<<18 | face<<31)
+ *   word 1 = pid
+ */
 static LLVMValueRef
 emit_vx_frag_payload(struct vp_tr *t, unsigned word)
 {
-   LLVMValueRef bidx = emit_csr_read(t, VX_CSR_CTA_BLOCK_ID_X, "frag_bid");
-   char s[48];
-   unsigned f7 = (VP_FRAG_SLOT_BASE + word) << 2;   /* GETWS: slot<<2, funct3=4 */
-   snprintf(s, sizeof s, ".insn r 43, 4, %u, $0, $1, x1", f7);
-   const char *c = "=r,r";
-   LLVMTypeRef arg = t->i32;
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, &arg, 1, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
-                                      /*HasSideEffects*/ true,
-                                      /*IsAlignStack*/ false,
-                                      LLVMInlineAsmDialectATT,
-                                      /*CanThrow*/ false);
-   LLVMValueRef a[1] = { bidx };
-   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "fragw");
+   return emit_csr_read(t, word ? VX_CSR_FRAG_PID : VX_CSR_FRAG_POSMASK,
+                        word ? "frag_pid" : "frag_posmask");
 }
 
-/* vx_om4: submit a 2x2 quad to the output-merger unit (custom-1 funct3=2,
- * R-type, rd=x0 fire-and-forget). rs1=desc (cov_mask[3:0]|qx@[4+:14]|qy@[18+:13]
- * |face@31 — the frag payload's pos_mask, face 0), rs2=base (gfx-window slot of
- * colour[0..3]@base, depth[0..3]@base+4). The OM does depth/stencil/blend per
- * covered sub-pixel and writes the colour + depth buffers. */
+/* vx_om_export: emit one fragment as a STORE into the OM aperture (custom-1
+ * funct3=3, R4-type, rd=x0). rs1=aperture address, rs2=colour, rs3=depth;
+ * funct2 = {has_depth, has_colour} = 3 (both). The cluster's OM steer peels the
+ * store off the L1->L2 trunk and the OM ingress turns it back into a fragment,
+ * so the LSU never learns that OM exists. */
 static void
-emit_vx_om4(struct vp_tr *t, LLVMValueRef desc, unsigned base)
+emit_vx_om_export(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef colour,
+                  LLVMValueRef depth)
 {
-   const char *s = ".insn r 43, 2, 0, x0, $0, $1";
-   LLVMTypeRef args[2] = { t->i32, t->i32 };
+   const char *s = ".insn r4 43, 3, 3, x0, $0, $1, $2";
+   LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
-                                       args, 2, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,r", 3,
+                                       args, 3, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,r,r", 6,
                                       /*HasSideEffects*/ true,
                                       /*IsAlignStack*/ false,
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
-   LLVMValueRef a[2] = { desc, LLVMConstInt(t->i32, base, false) };
-   LLVMBuildCall2(t->b, fnty, ia, a, 2, "");
+   LLVMValueRef a[3] = { addr, colour, depth };
+   LLVMBuildCall2(t->b, fnty, ia, a, 3, "");
+}
+
+/* Aperture address of one pixel:
+ *   base + ((face << (xbits+ybits)) | (y << xbits) | x) << record_shift
+ * xbits/ybits/record_shift are unpacked from the FS arg block (per-draw). */
+static LLVMValueRef
+emit_om_aperture_addr(struct vp_tr *t, LLVMValueRef xbits, LLVMValueRef ybits,
+                      LLVMValueRef shift, LLVMValueRef x, LLVMValueRef y,
+                      LLVMValueRef face)
+{
+   LLVMValueRef idx = LLVMBuildOr(t->b,
+      LLVMBuildShl(t->b, face, LLVMBuildAdd(t->b, xbits, ybits, ""), ""),
+      LLVMBuildOr(t->b, LLVMBuildShl(t->b, y, xbits, ""), x, ""), "");
+   return LLVMBuildAdd(t->b,
+      LLVMConstInt(t->i32, (uint32_t)VX_MEM_OM_BASE_ADDR, false),
+      LLVMBuildShl(t->b, idx, shift, ""), "");
 }
 
 /* reinterpret a raw fixed-point i32 as float: (float)raw / 2^frac */
@@ -1819,6 +1824,26 @@ emit_bc(struct vp_tr *t, const struct vp_bc_src *bc, LLVMValueRef prim,
  * forbidden here: each SIMT lane holds a different quad, so a coverage branch
  * diverges between lanes.
  * Shared by both raster wrappers; `bc` selects the edge-value source. */
+/* Unpack the OM aperture geometry from the FS arg block (GFX_FS_ARG_APERTURE):
+ * bits [7:0]=xbits, [15:8]=ybits, [23:16]=record_shift. Only the FF OM path uses
+ * it; the SW OM path merges through gfx_om_fragment_sw and never forms an
+ * aperture address. */
+static void
+emit_om_aperture_load(struct vp_tr *t, LLVMValueRef arg)
+{
+   if (t->sw_om) {
+      t->om_ap_xbits = t->om_ap_ybits = t->om_ap_shift = NULL;
+      return;
+   }
+   LLVMValueRef w = emit_arg_i32(t, arg, GFX_FS_ARG_APERTURE);
+   LLVMValueRef m8 = LLVMConstInt(t->i32, 0xffu, false);
+   t->om_ap_xbits = LLVMBuildAnd(t->b, w, m8, "ap_xbits");
+   t->om_ap_ybits = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, w, LLVMConstInt(t->i32, 8, false), ""), m8, "ap_ybits");
+   t->om_ap_shift = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, w, LLVMConstInt(t->i32, 16, false), ""), m8, "ap_shift");
+}
+
 static void
 emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
                 LLVMValueRef fs_main, LLVMTypeRef fs_main_ty,
@@ -1960,18 +1985,28 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
          LLVMValueRef a[7] = { omstate_ptr, cov, pxc, pyc, face, rgba, depth_i };
          LLVMBuildCall2(t->b, fty, ofn, a, 7, "");
       } else {
-         /* stage this sub-pixel's colour + depth into the OM quad window
-          * (colour[i]@base+i, depth[i]@base+4+i). The single vx_om4 after the
-          * loop submits the whole quad; cov_mask gates valid slots. */
-         emit_vx_gfx_set(t, VP_OM_SLOT_BASE + i, rgba);
-         emit_vx_gfx_set(t, VP_OM_SLOT_BASE + 4 + i, depth_i);
+         /* FF output-merger: export this sub-pixel as a store into the OM
+          * aperture. Uncovered corners must be skipped -- unlike the old quad
+          * submit there is no coverage mask downstream, and the ingress turns
+          * every aperture store into a fragment. The branch diverges across
+          * lanes (each lane holds a different quad); the thread mask handles it. */
+         LLVMBasicBlockRef bb_do   = LLVMAppendBasicBlockInContext(t->ctx, fn, "om_do");
+         LLVMBasicBlockRef bb_skip = LLVMAppendBasicBlockInContext(t->ctx, fn, "om_skip");
+         LLVMBuildCondBr(t->b,
+            LLVMBuildICmp(t->b, LLVMIntNE, cov,
+                          LLVMConstInt(t->i32, 0, false), ""),
+            bb_do, bb_skip);
+
+         LLVMPositionBuilderAtEnd(t->b, bb_do);
+         emit_vx_om_export(t,
+            emit_om_aperture_addr(t, t->om_ap_xbits, t->om_ap_ybits,
+                                  t->om_ap_shift, pxc, pyc, face),
+            rgba, depth_i);
+         LLVMBuildBr(t->b, bb_skip);
+
+         LLVMPositionBuilderAtEnd(t->b, bb_skip);
       }
    }
-   /* submit the whole quad in one op: desc = pos_mask (cov_mask|qx|qy, face 0),
-    * colour/depth already staged in the window. (SW OM already merged each
-    * sub-pixel above — no FF submit.) */
-   if (!t->sw_om)
-      emit_vx_om4(t, pos_mask, VP_OM_SLOT_BASE);
 }
 
 /* Build kernel_main: the straight-line run-once wrapper that drives the
@@ -2015,6 +2050,7 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
       LLVMValueRef os_addr = emit_arg_i32(t, arg, 2);
       omstate_ptr = LLVMBuildIntToPtr(t->b, os_addr, t->ptr, "omstate");
    }
+   emit_om_aperture_load(t, arg);
    /* arg[GFX_FS_ARG_DESC] is the resident FS descriptor-table device address
     * (always supplied by vp_raster; zero-filled when the FS is descriptor-free). */
    LLVMValueRef desc_ptr = LLVMBuildIntToPtr(t->b,
@@ -2112,6 +2148,7 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMValueRef omstate_ptr = LLVMConstNull(t->ptr);
    if (t->sw_om)
       omstate_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 2), t->ptr, "omstate");
+   emit_om_aperture_load(t, arg);
    /* Resident FS descriptor table (arg[GFX_FS_ARG_DESC]). */
    LLVMValueRef desc_ptr = LLVMBuildIntToPtr(t->b,
       emit_arg_i32(t, arg, GFX_FS_ARG_DESC), t->ptr, "desc");
