@@ -61,7 +61,15 @@
 #define VX_CSR_RASTER_BCOORD_Z0 0x7C9
 #define VX_CSR_RASTER_PID       0x7CD
 #define VX_RASTER_DIM_BITS      15     /* pos_mask x/y field width + 1 */
-/* frag_payload_t in the gfx window: word [0]=pos_mask, [1]=pid.
+/* A quad is 2x2 pixels, so a quad group is four adjacent lanes: lane L holds
+ * corner L&3. Mirrors VX_FRAG_QUAD_LANES in the kernel ABI (sw/common/vx_gfx_abi.h).
+ * The quad SHFL that carries a derivative permutes within this group. */
+#define VX_FRAG_QUAD_LANES      4
+/* Segment operands that scope a SHFL to a quad group: lane l's group is
+ * [l & ~3, (l & ~3) | 3]. Mirrors VX_QUAD_CVAL / VX_QUAD_MASK in vx_intrinsics.h. */
+#define VP_QUAD_SHFL_CVAL       3
+#define VP_QUAD_SHFL_MASK       0x3c
+/* frag_payload_t in the gfx window: word [0]=pos, [1]=pid.
  * The base sits outside the RTU object-ray range [8..13] at [19..20] so a
  * fragment shader can hold this record and an in-flight RTU query at once. Must
  * stay equal to the kernel ABI VX_GFX_FRAG_SLOT_BASE (VX_types.toml [gfx_window]). */
@@ -158,8 +166,15 @@ struct vp_tr {
     * emit_vx_tex when sw_tex; null pointer when texturing is HW. */
    bool           sw_tex;
    bool           sw_om;
-   bool           sw_raster;  /* FS is the one-thread-per-tile SW-raster kernel */
+   bool           sw_raster;  /* FS is the one-warp-per-tile SW-raster kernel */
    LLVMValueRef   fs_texstate; /* ptr param (gfx_sw_texstate_t* table) */
+   /* fs_main's 5th param: an i32 the body clears on discard/demote. A discarded
+    * lane keeps running -- it is still a helper for its quad neighbours' derivatives
+    * -- so the flag withholds its export rather than its execution. Its side effects
+    * must still be withheld, though: a discarded invocation may not commit stores,
+    * so an FS store retargets to fs_sink, a dead per-thread scratch word. */
+   LLVMValueRef   fs_live;
+   LLVMValueRef   fs_sink;   /* i64 addr of the scratch a discarded store lands in */
 
    /* OM aperture geometry, unpacked from the FS arg block (per-draw, so it cannot
     * be a JIT constant). A fragment export's address is formed by shifting. */
@@ -336,6 +351,28 @@ static LLVMTypeRef
 fty(struct vp_tr *t, unsigned bits) { return bits == 64 ? t->f64 : t->f32; }
 static LLVMTypeRef
 ity(struct vp_tr *t, unsigned bits) { return bits == 64 ? t->i64 : t->i32; }
+
+/* quad-derivative helper (defined with the other Vortex intrinsics, below). */
+static LLVMValueRef emit_quad_deriv(struct vp_tr *t, LLVMValueRef value,
+                                    unsigned dir);
+
+/* The address a store should actually use. A discarded fragment invocation keeps
+ * running so its quad neighbours can still shuffle from it, but it may not commit
+ * side effects -- so its stores are steered into a dead per-thread word instead.
+ * Outside a fragment shader there is nothing to discard and the address stands. */
+static LLVMValueRef
+emit_store_addr(struct vp_tr *t, LLVMValueRef addr)
+{
+   if (!t->is_fs || !t->fs_live || !t->fs_sink)
+      return addr;
+   LLVMValueRef live = LLVMBuildLoad2(t->b, t->i32, t->fs_live, "live.v");
+   LLVMValueRef ok = LLVMBuildICmp(t->b, LLVMIntNE, live,
+                                   LLVMConstInt(t->i32, 0, false), "");
+   /* the sink is pointer-sized; a store address may be wider (ssbo bases are i64) */
+   LLVMValueRef sink = LLVMBuildZExtOrBitCast(t->b, t->fs_sink,
+                                              LLVMTypeOf(addr), "sink");
+   return LLVMBuildSelect(t->b, ok, addr, sink, "store_addr");
+}
 
 static void
 emit_alu(struct vp_tr *t, nir_alu_instr *alu)
@@ -846,7 +883,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase");
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 2),
                                         t->i64, "");
-      LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
+      LLVMValueRef addr = emit_store_addr(t, LLVMBuildAdd(t->b, base, off, ""));
       unsigned mask = nir_intrinsic_write_mask(in);
       unsigned nc   = nir_src_num_components(in->src[0]);
       unsigned esz  = nir_src_bit_size(in->src[0]) / 8u;
@@ -973,7 +1010,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       break;
    }
    case nir_intrinsic_store_global: {
-      LLVMValueRef addr = intr_src(t, in, 1);
+      LLVMValueRef addr = emit_store_addr(t, intr_src(t, in, 1));
       unsigned mask = nir_intrinsic_write_mask(in);
       unsigned nc   = nir_src_num_components(in->src[0]);
       unsigned esz  = nir_src_bit_size(in->src[0]) / 8u;
@@ -1093,6 +1130,46 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_vortex_rt_cb_ret:
       emit_vx_rt_cb_ret(t, ssa_get(t, in->src[0].ssa->index, 0));
       break;
+
+   /* Screen-space derivatives: the difference against this lane's quad neighbour
+    * (dir 1 = horizontal, 2 = vertical). One lane is one pixel and a quad is four
+    * adjacent lanes, so this is a single SHFL -- fine and coarse are the same
+    * permute on Vortex. */
+   case nir_intrinsic_ddx:
+   case nir_intrinsic_ddx_fine:
+   case nir_intrinsic_ddx_coarse:
+      for (unsigned c = 0; c < in->def.num_components; c++)
+         ssa_set(t, in->def.index, c,
+                 emit_quad_deriv(t, ssa_get(t, in->src[0].ssa->index, c), 1));
+      break;
+   case nir_intrinsic_ddy:
+   case nir_intrinsic_ddy_fine:
+   case nir_intrinsic_ddy_coarse:
+      for (unsigned c = 0; c < in->def.num_components; c++)
+         ssa_set(t, in->def.index, c,
+                 emit_quad_deriv(t, ssa_get(t, in->src[0].ssa->index, c), 2));
+      break;
+
+   /* discard / demote: clear this lane's live flag. The lane keeps executing --
+    * a covered neighbour in its quad may still shuffle a value out of it for a
+    * derivative -- and the wrapper ANDs the flag into coverage, so the export is
+    * what gets withheld, not the shader. */
+   case nir_intrinsic_demote:
+   case nir_intrinsic_terminate:
+      LLVMBuildStore(t->b, LLVMConstInt(t->i32, 0, false), t->fs_live);
+      break;
+   case nir_intrinsic_demote_if:
+   case nir_intrinsic_terminate_if: {
+      LLVMValueRef cond = ssa_get(t, in->src[0].ssa->index, 0);
+      if (LLVMTypeOf(cond) != LLVMInt1TypeInContext(t->ctx))
+         cond = LLVMBuildICmp(t->b, LLVMIntNE, cond,
+                              LLVMConstInt(LLVMTypeOf(cond), 0, false), "");
+      LLVMValueRef cur = LLVMBuildLoad2(t->b, t->i32, t->fs_live, "live.v");
+      LLVMBuildStore(t->b,
+         LLVMBuildSelect(t->b, cond, LLVMConstInt(t->i32, 0, false), cur, "live"),
+         t->fs_live);
+      break;
+   }
    default:
       mesa_logw("vortexpipe: vp_nir_to_llvm: unhandled intrinsic '%s'",
                 nir_intrinsic_infos[in->intrinsic].name);
@@ -1618,17 +1695,66 @@ emit_store_i32(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef val)
       LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
 }
 
-/* This lane's fragment stamp. The raster engine packs it into the launch message
+/* This lane's fragment payload. The raster engine packs it into the launch message
  * and the core lands it in the warp's launch registers before the warp is
  * activated, so reading it is a CSR read -- no window op, no memory traffic.
- *   word 0 = pos_mask (cov_mask[3:0] | pos_x<<4 | pos_y<<18 | face<<31)
+ *   word 0 = pos (x[15:0] | y[30:16] | covered[31])
  *   word 1 = pid
  */
 static LLVMValueRef
 emit_vx_frag_payload(struct vp_tr *t, unsigned word)
 {
    return emit_csr_read(t, word ? VX_CSR_FRAG_PID : VX_CSR_FRAG_POSMASK,
-                        word ? "frag_pid" : "frag_posmask");
+                        word ? "frag_pid" : "frag_pos");
+}
+
+/* vx_shfl_bfly scoped to a quad: lane l exchanges with lane l^dir (dir 1 =
+ * horizontal neighbour, 2 = vertical). custom-0 funct3=6 funct2=1; rs2 packs the
+ * segment operands that confine the permute to four adjacent lanes.
+ *
+ * A shuffle whose source lane is INACTIVE returns the reader's own value, so the
+ * difference collapses to zero rather than faulting -- which is why the four lanes
+ * of a quad must all run the shader, helper lanes included. */
+static LLVMValueRef
+emit_vx_quad_swap(struct vp_tr *t, LLVMValueRef value, unsigned dir)
+{
+   const uint32_t bc = (VP_QUAD_SHFL_MASK << 12) | (VP_QUAD_SHFL_CVAL << 6) | dir;
+   const char *s = ".insn r 11, 6, 1, $0, $1, $2";
+   const char *c = "=r,r,r";
+   LLVMTypeRef args[2] = { t->i32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 2, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, (char *)s, strlen(s), (char *)c,
+                                      strlen(c), /*HasSideEffects*/ false, false,
+                                      LLVMInlineAsmDialectATT, false);
+   LLVMValueRef a[2] = { value, LLVMConstInt(t->i32, bc, false) };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 2, "quad_swap");
+}
+
+/* Screen-space derivative of a float: the difference against this lane's quad
+ * neighbour. Vortex has one derivative precision, so fine/coarse both land here.
+ *
+ * The exchange is a SYMMETRIC xor-swap, so a bare (neighbour - self) would hand the
+ * two lanes of a pair opposite signs. The derivative must point the same way for the
+ * whole quad -- increasing x for ddx, increasing y for ddy -- so the lane that holds
+ * the FAR pixel of the pair (sub & dir) subtracts the other way.
+ * (|d| is unaffected, which is why an fwidth()-only shader would never notice.) */
+static LLVMValueRef
+emit_quad_deriv(struct vp_tr *t, LLVMValueRef value, unsigned dir)
+{
+   LLVMValueRef self = LLVMBuildBitCast(t->b, value, t->i32, "");
+   LLVMValueRef nb   = emit_vx_quad_swap(t, self, dir);
+   LLVMValueRef fs   = LLVMBuildBitCast(t->b, self, t->f32, "");
+   LLVMValueRef fn_  = LLVMBuildBitCast(t->b, nb,   t->f32, "");
+
+   LLVMValueRef lane = emit_csr_read(t, VX_CSR_CTA_THREAD_ID_X, "lane");
+   LLVMValueRef far  = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, lane, LLVMConstInt(t->i32, dir, false), ""),
+      LLVMConstInt(t->i32, 0, false), "far");
+
+   LLVMValueRef fwd = LLVMBuildFSub(t->b, fn_, fs, "");   /* near lane: nb - self */
+   LLVMValueRef rev = LLVMBuildFSub(t->b, fs, fn_, "");   /* far lane:  self - nb */
+   return LLVMBuildBitCast(t->b,
+      LLVMBuildSelect(t->b, far, rev, fwd, "deriv"), t->i32, "");
 }
 
 /* vx_om_export: emit one fragment as a STORE into the OM aperture (custom-1
@@ -1785,45 +1911,39 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
 struct vp_bc_src {
    bool         from_window;  /* HW: recompute from the primitive's edge planes */
    LLVMValueRef quad_addr;    /* SW: iptr address of the gfx_rast_quad_t */
+   LLVMValueRef sub;          /* SW: this lane's corner within that quad (0..3) */
 };
 
-/* Edge value F[axis] at corner `i` of the quad, as a float (fixed_t<16> raw).
+/* Edge value F[axis] at this lane's pixel, as a float (fixed_t<16> raw).
  * HW path: recompute F = ex*px + ey*py + ez from the primitive's edge plane
- * {x,y,z} (Q16.16 at `prim` + axis*12), with the sub-pixel coord px=(qx<<1)|(i&1),
- * py=(qy<<1)|(i>>1) — a 32-bit integer MAC bit-identical to the raster HW bcoord
- * and the native FS (vx_graphics.h). SW path ignores prim/qx/qy. */
+ * {x,y,z} (Q16.16 at `prim` + axis*12) — a 32-bit integer MAC bit-identical to the
+ * raster HW bcoord and the native FS (vx_graphics.h). SW path reads the corner the
+ * walk already computed, and ignores prim/px/py. */
 static LLVMValueRef
 emit_bc(struct vp_tr *t, const struct vp_bc_src *bc, LLVMValueRef prim,
-        LLVMValueRef qx, LLVMValueRef qy, unsigned axis, unsigned i)
+        LLVMValueRef px, LLVMValueRef py, unsigned axis)
 {
    LLVMValueRef raw;
    if (bc->from_window) {
       LLVMValueRef ex = emit_load_i32(t, addk(t, prim, axis * 12 + 0));
       LLVMValueRef ey = emit_load_i32(t, addk(t, prim, axis * 12 + 4));
       LLVMValueRef ez = emit_load_i32(t, addk(t, prim, axis * 12 + 8));
-      LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
-      LLVMValueRef px = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
-         LLVMConstInt(t->i32, i & 1, false), "px");
-      LLVMValueRef py = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
-         LLVMConstInt(t->i32, i >> 1, false), "py");
       raw = LLVMBuildAdd(t->b,
          LLVMBuildAdd(t->b, LLVMBuildMul(t->b, ex, px, ""),
                             LLVMBuildMul(t->b, ey, py, ""), ""), ez, "bcraw");
    } else {
-      /* gfx_rast_quad_t: pos_mask @word0, bcoords[axis*4+corner] @word 1+.. */
-      raw = emit_load_i32(t, addk(t, bc->quad_addr, (1 + axis * 4 + i) * 4));
+      /* gfx_rast_quad_t: pos_mask @word0, bcoords[axis*4+corner] @word 1+..
+       * The corner is this lane's sub, a runtime value, so index it dynamically. */
+      LLVMValueRef off = LLVMBuildShl(t->b,
+         LLVMBuildAdd(t->b, bc->sub,
+            LLVMConstInt(t->i32, 1 + axis * 4, false), ""),
+         LLVMConstInt(t->i32, 2, false), "bcoff");
+      raw = emit_load_i32(t,
+         LLVMBuildAdd(t->b, bc->quad_addr, vp_to_iptr(t, off), ""));
    }
    return emit_fixed_to_float(t, raw, 16);
 }
 
-/* Shade one covered 2x2 quad. STRAIGHT-LINE by design, like the native FS:
- * every sub-pixel of the quad is shaded unconditionally (the helper-invocation
- * model — uncovered corners compute garbage) and coverage is applied at the
- * merge: the FF vx_om4 drops uncovered slots via cov_mask, and the SW OM
- * receives the corner's coverage bit as an argument. Per-corner branches are
- * forbidden here: each SIMT lane holds a different quad, so a coverage branch
- * diverges between lanes.
- * Shared by both raster wrappers; `bc` selects the edge-value source. */
 /* Unpack the OM aperture geometry from the FS arg block (GFX_FS_ARG_APERTURE):
  * bits [7:0]=xbits, [15:8]=ybits, [23:16]=record_shift. Only the FF OM path uses
  * it; the SW OM path merges through gfx_om_fragment_sw and never forms an
@@ -1844,46 +1964,33 @@ emit_om_aperture_load(struct vp_tr *t, LLVMValueRef arg)
       LLVMBuildLShr(t->b, w, LLVMConstInt(t->i32, 16, false), ""), m8, "ap_shift");
 }
 
+/* Shade ONE pixel — this lane's. STRAIGHT-LINE by design, like the native FS: a
+ * lane the primitive misses is a helper invocation, so it runs the shader anyway
+ * (its covered neighbours in the quad may shuffle a value out of it for a
+ * derivative) and `cov` — never the thread mask — is what withholds its export.
+ * Shared by both raster wrappers; `bc` selects the edge-value source. */
 static void
-emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
-                LLVMValueRef fs_main, LLVMTypeRef fs_main_ty,
-                LLVMValueRef prim, LLVMValueRef in_scr, LLVMValueRef out_scr,
-                LLVMValueRef in_addr, LLVMValueRef out_addr,
-                LLVMValueRef texstate_ptr, LLVMValueRef omstate_ptr,
-                LLVMValueRef desc_ptr, LLVMValueRef mrt_ptr,
-                LLVMValueRef mrt_colors_addr,
-                LLVMValueRef pos_mask, const struct vp_bc_src *bc)
+emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
+                 LLVMValueRef fs_main, LLVMTypeRef fs_main_ty,
+                 LLVMValueRef prim, LLVMValueRef in_scr, LLVMValueRef out_scr,
+                 LLVMValueRef in_addr, LLVMValueRef out_addr,
+                 LLVMValueRef texstate_ptr, LLVMValueRef omstate_ptr,
+                 LLVMValueRef desc_ptr, LLVMValueRef mrt_ptr,
+                 LLVMValueRef mrt_colors_addr, LLVMValueRef live,
+                 LLVMValueRef pxc, LLVMValueRef pyc, LLVMValueRef cov,
+                 const struct vp_bc_src *bc)
 {
-   LLVMValueRef mask = LLVMBuildAnd(t->b, pos_mask,
-      LLVMConstInt(t->i32, 0xf, false), "mask");
+   /* A colour attachment is 2D, so there is no cube face to select. */
+   LLVMValueRef face = LLVMConstInt(t->i32, 0, false);
 
-   /* decode the quad origin + face from pos_mask so each covered sub-pixel can
-    * be addressed directly (qx@[4+:DIM-1], qy@[4+DIM-1+:DIM-1], face@31).
-    * px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
-   const uint32_t dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
-   LLVMValueRef qx = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4, false), ""),
-      LLVMConstInt(t->i32, dim_mask, false), "qx");
-   LLVMValueRef qy = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4 + VX_RASTER_DIM_BITS - 1, false), ""),
-      LLVMConstInt(t->i32, dim_mask, false), "qy");
-   LLVMValueRef face = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 31, false), ""),
-      LLVMConstInt(t->i32, 1, false), "face");
-
-   (void)fn;
-   for (unsigned i = 0; i < 4; i++) {
-      LLVMValueRef cov = LLVMBuildAnd(t->b,
-         LLVMBuildLShr(t->b, mask, LLVMConstInt(t->i32, i, false), ""),
-         LLVMConstInt(t->i32, 1, false), "cov");
-
+   {
       /* barycentric gradient: dx = F0/(F0+F1+F2), dy = F1/sum, quantized to
        * Q7.24 exactly like the native FS's FloatA(recip * F0) -- the f32
        * product truncated toward zero. All downstream interpolation is then
        * integer fixed24, bit-identical to the native kernel. */
-      LLVMValueRef f0 = emit_bc(t, bc, prim, qx, qy, 0, i);
-      LLVMValueRef f1 = emit_bc(t, bc, prim, qx, qy, 1, i);
-      LLVMValueRef f2 = emit_bc(t, bc, prim, qx, qy, 2, i);
+      LLVMValueRef f0 = emit_bc(t, bc, prim, pxc, pyc, 0);
+      LLVMValueRef f1 = emit_bc(t, bc, prim, pxc, pyc, 1);
+      LLVMValueRef f2 = emit_bc(t, bc, prim, pxc, pyc, 2);
       LLVMValueRef sum = LLVMBuildFAdd(t->b,
          LLVMBuildFAdd(t->b, f0, f1, ""), f2, "");
       LLVMValueRef recip = LLVMBuildFDiv(t->b,
@@ -1899,9 +2006,17 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
       emit_fs_fill_varyings(t, prim, in_addr, dxq, dyq);
 
       /* run the programmable fragment shader (3rd arg = SW texstate table,
-       * 4th = resident FS descriptor table). */
-      LLVMValueRef cargs[4] = { in_scr, out_scr, texstate_ptr, desc_ptr };
-      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 4, "");
+       * 4th = resident FS descriptor table, 5th = the discard/demote flag). A
+       * discarded lane clears the flag but still runs, so its quad neighbours keep
+       * a value to shuffle; folding the flag into coverage is what drops its
+       * export. The slot lives in the entry block (the SW-raster wrapper shades
+       * inside a loop nest, and a non-static alloca would grow the stack per quad);
+       * only the reset is per-pixel. */
+      LLVMBuildStore(t->b, LLVMConstInt(t->i32, 1, false), live);
+      LLVMValueRef cargs[5] = { in_scr, out_scr, texstate_ptr, desc_ptr, live };
+      LLVMBuildCall2(t->b, fs_main_ty, fs_main, cargs, 5, "");
+      cov = LLVMBuildAnd(t->b, cov,
+         LLVMBuildLoad2(t->b, t->i32, live, "live.v"), "cov_live");
 
       /* pack a render target's FS output (4 floats at out_addr + rt*16) into an
        * R8G8B8A8 pixel. */
@@ -1924,12 +2039,7 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
        * rast_attribs.z {A',B',C'} (Q7.24), bit-identical to the raster
        * early-Z and the native FS's
        * PLANE_Z: zbits = trunc32(A'*px + B'*py + C'), saturated to the OM's
-       * 24-bit depth range. px=(qx<<1)|(i&1), py=(qy<<1)|(i>>1). */
-      LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
-      LLVMValueRef pxc = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
-         LLVMConstInt(t->i32, i & 1, false), "px");
-      LLVMValueRef pyc = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
-         LLVMConstInt(t->i32, i >> 1, false), "py");
+       * 24-bit depth range. */
       LLVMValueRef zpx = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z));
       LLVMValueRef zpy = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z + 4));
       LLVMValueRef zpz = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z + 8));
@@ -1953,7 +2063,7 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
          /* >1 colour attachment merges via gfx_om_fragment_mrt_sw(
           * omstate, rt[], num_color, covered, px, py, face, colours[], depth) —
           * one shared depth op then a per-attachment blend + colour write. Pack
-          * this sub-pixel's per-RT colours into the reused src_colors[] slot and
+          * this pixel's per-RT colours into the reused src_colors[] slot and
           * submit. MRT is only valid on the SW-OM path. */
          for (unsigned rt = 0; rt < num_color && rt < GFX_OM_MAX_RT; rt++)
             emit_store_i32(t, addk(t, mrt_colors_addr, rt * 4), rgba_rt[rt]);
@@ -1971,7 +2081,7 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
                                cov, pxc, pyc, face, colors_ptr, depth_i };
          LLVMBuildCall2(t->b, fty, ofn, a, 9, "");
       } else if (t->sw_om) {
-         /* SW output-merger: merge this sub-pixel via gfx_om_fragment_sw(
+         /* SW output-merger: merge this pixel via gfx_om_fragment_sw(
           * omstate, covered, px, py, face, colour, depth) over the LSU (no
           * window staging, no vx_om4). The callee applies the coverage bit —
           * keeping this wrapper straight-line. */
@@ -1985,11 +2095,12 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
          LLVMValueRef a[7] = { omstate_ptr, cov, pxc, pyc, face, rgba, depth_i };
          LLVMBuildCall2(t->b, fty, ofn, a, 7, "");
       } else {
-         /* FF output-merger: export this sub-pixel as a store into the OM
-          * aperture. Uncovered corners must be skipped -- unlike the old quad
-          * submit there is no coverage mask downstream, and the ingress turns
-          * every aperture store into a fragment. The branch diverges across
-          * lanes (each lane holds a different quad); the thread mask handles it. */
+         /* FF output-merger: export this pixel as a store into the OM aperture.
+          * An uncovered lane must be skipped -- there is no coverage mask
+          * downstream, and the ingress turns every aperture store into a
+          * fragment. The branch diverges across lanes; the thread mask handles
+          * it, and it is placed AFTER the shader body so a helper lane still
+          * runs the shader. */
          LLVMBasicBlockRef bb_do   = LLVMAppendBasicBlockInContext(t->ctx, fn, "om_do");
          LLVMBasicBlockRef bb_skip = LLVMAppendBasicBlockInContext(t->ctx, fn, "om_skip");
          LLVMBuildCondBr(t->b,
@@ -2014,7 +2125,7 @@ emit_shade_quad(struct vp_tr *t, LLVMValueRef fn,
  * distributor launches one 1-warp fragment CTA per covered-quad wave and seeds
  * that wave's per-lane frag_payload_t into the warp's gfx register window at
  * launch. The FS therefore runs once, reads its pre-seeded payload back
- * with GETW, shades its covered sub-pixels, and returns — no poll loop, no fetch
+ * with GETW, shades that one pixel, and returns — no poll loop, no fetch
  * op, no begin op. arg block: [0]=primitive buffer, [1]=texstate, [2]=omstate. */
 static LLVMValueRef
 emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
@@ -2067,6 +2178,7 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
       LLVMArrayType(t->i32, t->fs_out_words ? t->fs_out_words : 4), "fs_out");
    LLVMValueRef in_addr  = LLVMBuildPtrToInt(t->b, in_scr,  t->iptr, "");
    LLVMValueRef out_addr = LLVMBuildPtrToInt(t->b, out_scr, t->iptr, "");
+   LLVMValueRef live     = LLVMBuildAlloca(t->b, t->i32, "fs_live");
    if (t->sw_om && nrt > 1) {
       mrt_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, GFX_FS_ARG_MRT),
                                   t->ptr, "mrt");
@@ -2075,22 +2187,30 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
       mrt_colors_addr = LLVMBuildPtrToInt(t->b, col_scr, t->iptr, "");
    }
 
-   /* read this lane's pre-seeded quad payload from the window (GETW), then shade
-    * its covered sub-pixels. emit_shade_quad masks per-sub-pixel on cov_mask, so
-    * an uncovered lane (pos_mask=0) does nothing. */
-   LLVMValueRef pos_mask = emit_vx_frag_payload(t, 0);
-   LLVMValueRef pid      = emit_vx_frag_payload(t, 1);
+   /* Read this lane's pre-seeded PIXEL payload from the window (GETW): one lane is
+    * one pixel, and the quad it belongs to is the four adjacent lanes. `covered`
+    * says whether this lane may export; an uncovered lane is a helper and still
+    * runs the shader. */
+   LLVMValueRef pos = emit_vx_frag_payload(t, 0);
+   LLVMValueRef pid = emit_vx_frag_payload(t, 1);
+   LLVMValueRef px  = LLVMBuildAnd(t->b, pos,
+      LLVMConstInt(t->i32, 0xffff, false), "px");
+   LLVMValueRef py  = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos, LLVMConstInt(t->i32, 16, false), ""),
+      LLVMConstInt(t->i32, 0x7fff, false), "py");
+   LLVMValueRef cov = LLVMBuildLShr(t->b, pos,
+      LLVMConstInt(t->i32, 31, false), "cov");
    LLVMValueRef poff = LLVMBuildMul(t->b, pid,
       LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base,
                                     vp_to_iptr(t, poff), "prim");
 
    /* HW raster: edge values are recomputed in-shader from prim[pid]'s edge planes
-    * (the window carries only pos_mask + pid; P2 dropped the bcoord payload). */
-   struct vp_bc_src bc = { .from_window = true, .quad_addr = NULL };
-   emit_shade_quad(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
-                   in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
-                   mrt_ptr, mrt_colors_addr, pos_mask, &bc);
+    * (the window carries only pos + pid; P2 dropped the bcoord payload). */
+   struct vp_bc_src bc = { .from_window = true, .quad_addr = NULL, .sub = NULL };
+   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
+                    in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
+                    mrt_ptr, mrt_colors_addr, live, px, py, cov, &bc);
 
    LLVMBuildRetVoid(t->b);
    return fn;
@@ -2099,15 +2219,17 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
 /* SW-raster FS wrapper (one WARP per screen tile; lanes cooperate).
  * When RASTER is routed to software the FS is NOT the frag-window poll loop. Each
  * WARP owns one 8x8 screen tile; its lanes share the tile and split the covered
- * quads (lane L shades quads L, L+NT, L+2NT, …). All lanes walk every primitive
- * over the SAME tile in draw order (gfx_rast_walk_tile_sw, redundant but identical
- * across the warp — uniform control flow), then split the quad list. This is the
- * CudaRaster fine-rasterizer mapping and, critically, it is SIMT-safe: the loops
- * are uniform-trip (same for every lane) and the only divergence is per-quad
- * coverage — exactly the per-fragment shape the HW frag wrapper already runs
- * correctly. (The earlier one-thread-per-tile shape gave each lane its own tile,
- * so the per-lane covered-quad counts diverged and the SIMT reconvergence dropped
- * fragments at full-warp occupancy.) The per-pixel OM ordering (one tile owned by
+ * quads. One lane is one pixel and a quad is four adjacent lanes, so lane L takes
+ * corner L&3 of quad L>>2 and the warp advances NT/4 quads at a time. All lanes walk
+ * every primitive over the SAME tile in draw order (gfx_rast_walk_tile_sw, redundant
+ * but identical across the warp — uniform control flow), then split the quad list.
+ * This is the CudaRaster fine-rasterizer mapping and, critically, it is SIMT-safe:
+ * the loops are uniform-trip (same for every lane) and the only divergence is
+ * per-quad coverage, which is uniform across a quad's four lanes — so a derivative
+ * SHFL always reads a live neighbour. (The earlier one-thread-per-tile shape gave
+ * each lane its own tile, so the per-lane covered-quad counts diverged and the SIMT
+ * reconvergence dropped fragments at full-warp occupancy.) The per-pixel OM ordering
+ * (one tile owned by
  * one warp, prims in draw order) holds because each pixel belongs to exactly one
  * tile = one warp, and a warp serializes its prims. arg block: [0]=prim base,
  * [1]=texstate, [2]=omstate, [3]=num_prims, [4]=nx (tiles/row), [5]=num_tiles,
@@ -2181,6 +2303,9 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    }
    LLVMValueRef quadbuf = LLVMBuildAlloca(t->b,
       LLVMArrayType(t->i32, VP_SW_RAST_MAX_QUADS * VP_RAST_QUAD_WORDS), "quads");
+   /* Entry-block slot: this wrapper shades inside a loop nest, and an alloca built
+    * at the shade site would grow the stack once per quad. */
+   LLVMValueRef live      = LLVMBuildAlloca(t->b, t->i32, "fs_live");
    LLVMValueRef pid_slot  = LLVMBuildAlloca(t->b, t->i32, "pid");
    LLVMValueRef base_slot = LLVMBuildAlloca(t->b, t->i32, "base");
    LLVMValueRef cnt_slot  = LLVMBuildAlloca(t->b, t->i32, "cnt");
@@ -2233,43 +2358,79 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
       scis_w, scis_h, quadbuf, LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false) };
    LLVMValueRef cnt = LLVMBuildCall2(t->b, wty, wfn, wargs, 9, "cnt");
    LLVMBuildStore(t->b, cnt, cnt_slot);
-   LLVMBuildStore(t->b, lane, base_slot);   /* this lane starts at quad #lane */
+   /* One lane is one pixel, so a quad is four ADJACENT lanes: lane L takes corner
+    * L&3 of quad L>>2, and the warp holds NT/4 quads at a time. */
+   LLVMBuildStore(t->b,
+      LLVMBuildLShr(t->b, lane, LLVMConstInt(t->i32, 2, false), ""), base_slot);
+   LLVMValueRef sub = LLVMBuildAnd(t->b, lane,
+      LLVMConstInt(t->i32, VX_FRAG_QUAD_LANES - 1, false), "sub");
+   /* NT/4 quads per warp. Clamp to >=1: a warp narrower than a quad group cannot
+    * honour the lane law anyway, and a zero stride would spin qloop forever. */
+   LLVMValueRef qstride_raw = LLVMBuildLShr(t->b, ntv,
+      LLVMConstInt(t->i32, 2, false), "");
+   LLVMValueRef qstride = LLVMBuildSelect(t->b,
+      LLVMBuildICmp(t->b, LLVMIntEQ, qstride_raw,
+         LLVMConstInt(t->i32, 0, false), ""),
+      LLVMConstInt(t->i32, 1, false), qstride_raw, "qstride");
    LLVMBuildBr(t->b, qloop);
 
-   /* qloop: split the tile's covered quads across the warp's lanes. The loop is
-    * UNIFORM — every lane steps base by NT until base >= MAX, the same trip count
-    * for all lanes (MAX is a constant) — so reconvergence is trivial. Lane L
-    * handles quads L, L+NT, L+2NT, … */
+   /* qloop: split the tile's covered quads across the warp's quad groups. The loop
+    * is UNIFORM — every lane steps base by NT/4 until base >= MAX, the same trip
+    * count for all lanes (MAX is a constant) — so reconvergence is trivial. Quad
+    * group G handles quads G, G+NT/4, G+2*NT/4, … */
    LLVMPositionBuilderAtEnd(t->b, qloop);
    LLVMValueRef base = LLVMBuildLoad2(t->b, t->i32, base_slot, "base.v");
    LLVMBuildCondBr(t->b,
       LLVMBuildICmp(t->b, LLVMIntULT, base,
          LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false), ""), qchk, pnext);
 
-   /* qchk: shade this lane's slot only if it holds a real quad (base < cnt). A
-    * per-lane divergent *if* (not a loop) — the same shape the HW frag wrapper's
-    * per-fragment coverage branch uses, which the SIMT core handles correctly. */
+   /* qchk: shade this group's slot only if it holds a real quad (base < cnt). A
+    * divergent *if* (not a loop), uniform within a quad group — so the four lanes
+    * of a quad stay in lockstep and a cross-lane derivative still reads its true
+    * neighbour. */
    LLVMPositionBuilderAtEnd(t->b, qchk);
    LLVMValueRef cntv = LLVMBuildLoad2(t->b, t->i32, cnt_slot, "cnt.v");
    LLVMBuildCondBr(t->b,
       LLVMBuildICmp(t->b, LLVMIntULT, base, cntv, ""), qbody, qinc);
 
-   /* qbody: shade quad #base from this lane's buffer. */
+   /* qbody: shade this lane's corner of quad #base. Every lane walked the same
+    * prim over the same tile, so the four lanes of a group read identical quad
+    * buffers — the split is over corners, not over data. */
    LLVMPositionBuilderAtEnd(t->b, qbody);
    LLVMValueRef qoff = LLVMBuildMul(t->b, base,
       LLVMConstInt(t->i32, VP_RAST_QUAD_WORDS * 4, false), "");
    LLVMValueRef quad_addr = LLVMBuildAdd(t->b, quad_base, vp_to_iptr(t, qoff), "quad");
    LLVMValueRef pos_mask = emit_load_i32(t, quad_addr);
-   struct vp_bc_src bc = { .from_window = false, .quad_addr = quad_addr };
-   emit_shade_quad(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
-                   in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
-                   mrt_ptr, mrt_colors_addr, pos_mask, &bc);
-   /* builder is now at emit_shade_quad's trailing fall-through block. */
+
+   /* pos_mask: mask@[3:0], qx@[4+:DIM-1], qy@[4+DIM-1+:DIM-1]. This lane's pixel is
+    * px=(qx<<1)|(sub&1), py=(qy<<1)|(sub>>1), covered = mask[sub]. */
+   const uint32_t dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
+   LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+   LLVMValueRef qx = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, LLVMConstInt(t->i32, 4, false), ""),
+      LLVMConstInt(t->i32, dim_mask, false), "qx");
+   LLVMValueRef qy = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask,
+         LLVMConstInt(t->i32, 4 + VX_RASTER_DIM_BITS - 1, false), ""),
+      LLVMConstInt(t->i32, dim_mask, false), "qy");
+   LLVMValueRef px = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qx, one, ""),
+      LLVMBuildAnd(t->b, sub, one, ""), "px");
+   LLVMValueRef py = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
+      LLVMBuildLShr(t->b, sub, one, ""), "py");
+   LLVMValueRef cov = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, pos_mask, sub, ""), one, "cov");
+
+   struct vp_bc_src bc = { .from_window = false, .quad_addr = quad_addr,
+                           .sub = sub };
+   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
+                    in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
+                    mrt_ptr, mrt_colors_addr, live, px, py, cov, &bc);
+   /* builder is now at emit_shade_pixel's trailing fall-through block. */
    LLVMBuildBr(t->b, qinc);
 
-   /* qinc: advance by NT (uniform stride) to this lane's next quad. */
+   /* qinc: advance by NT/4 (uniform stride) to this group's next quad. */
    LLVMPositionBuilderAtEnd(t->b, qinc);
-   LLVMBuildStore(t->b, LLVMBuildAdd(t->b, base, ntv, ""), base_slot);
+   LLVMBuildStore(t->b, LLVMBuildAdd(t->b, base, qstride, ""), base_slot);
    LLVMBuildBr(t->b, qloop);
 
    /* pnext: advance to the next primitive. */
@@ -2330,17 +2491,19 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    LLVMValueRef fn;
    LLVMTypeRef  fs_main_ty = NULL;
    if (t.is_fs) {
-      /* fs_main(varyings_in, colour_out, texstate_table, desc_table). The 3rd
+      /* fs_main(varyings_in, colour_out, texstate_table, desc_table, live). The 3rd
        * param carries the resident gfx_sw_texstate_t[] for the SW sampler
        * (null on the all-HW path); the 4th is the resident FS descriptor
        * table (i64[] of constant-buffer base addresses) that load_ubo /
        * load_push_constant / load_ssbo read (null when the FS is descriptor-free,
-       * in which case those intrinsics are never emitted). */
-      LLVMTypeRef p4[4] = { t.ptr, t.ptr, t.ptr, t.ptr };
+       * in which case those intrinsics are never emitted); the 5th is the
+       * discard/demote flag the wrapper folds into coverage. */
+      LLVMTypeRef p5[5] = { t.ptr, t.ptr, t.ptr, t.ptr, t.ptr };
       fs_main_ty = LLVMFunctionType(LLVMVoidTypeInContext(t.ctx),
-                                    p4, 4, false);
+                                    p5, 5, false);
       fn = LLVMAddFunction(t.mod, "fs_main", fs_main_ty);
       LLVMSetLinkage(fn, LLVMInternalLinkage);
+      t.fs_live = LLVMGetParam(fn, 4);
    } else {
       LLVMTypeRef p1[1] = { t.ptr };
       LLVMTypeRef kty = LLVMFunctionType(LLVMVoidTypeInContext(t.ctx),
@@ -2353,6 +2516,15 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t.ctx, fn, "entry");
    LLVMPositionBuilderAtEnd(t.b, entry);
    t.entry = entry;
+
+   /* Where a discarded fragment's stores go to die. Sized for the widest store the
+    * translator emits (4 components x 8 bytes), so a retargeted vec4 stays inside
+    * it. Never read back. */
+   if (t.is_fs) {
+      LLVMValueRef sink = LLVMBuildAlloca(t.b, LLVMArrayType(t.i32, 8),
+                                          "discard_sink");
+      t.fs_sink = LLVMBuildPtrToInt(t.b, sink, t.iptr, "");
+   }
 
    /* Vertex-shader prologue: assign output slots, then read the
     * vertex id and the output-buffer base from %arg[0]. */

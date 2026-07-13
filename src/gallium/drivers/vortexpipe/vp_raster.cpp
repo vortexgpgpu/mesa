@@ -721,23 +721,26 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       fli.args_host = argblk; fli.args_size = sizeof(argblk);
       fli.ndim = 1;
       if (sw_raster) {
-         /* SW raster: the FS is the one-thread-per-tile kernel, not the HW
-          * frag-window poll loop. Launch one thread per 8x8 screen tile (matching
-          * the FS VP_SW_RAST_TILE_LOG); each walks every prim over its tile in
-          * draw order. The dense rast_prim_t[] is still front-end-produced; the
-          * RASTER DCRs / FF producer are skipped below. */
+         /* SW raster: the FS is the one-warp-per-tile kernel, not the HW frag-window
+          * poll loop. Launch one warp per 8x8 screen tile (matching the FS
+          * VP_SW_RAST_TILE_LOG); its lanes walk every prim over that tile in draw
+          * order. The dense rast_prim_t[] is still front-end-produced; the RASTER
+          * DCRs / FF producer are skipped below. */
          const uint32_t SW_TILE_LOG = 3;            /* 8x8 px (FS-side constant) */
          const uint32_t SW_TILE     = 1u << SW_TILE_LOG;
          const uint32_t nx_sw = (width  + SW_TILE - 1) / SW_TILE;
          const uint32_t ny_sw = (height + SW_TILE - 1) / SW_TILE;
          const uint32_t num_tiles_sw = nx_sw * ny_sw;
          /* One WARP per tile: block = NT threads (= one warp), grid = one CTA per
-          * tile. The warp's NT lanes cooperate on the tile's quads (lane L shades
-          * quads L, L+NT, …), the CudaRaster fine-rasterizer mapping. This keeps
-          * the FS kernel's loops uniform-trip across the warp (the divergence-safe
-          * shape — the earlier one-thread-per-tile mapping diverged per-lane on the
+          * tile. The warp's NT lanes cooperate on the tile's quads -- one lane is one
+          * pixel and a quad is four adjacent lanes, so lane L takes corner L&3 of
+          * quad L>>2 -- the CudaRaster fine-rasterizer mapping. This keeps the FS
+          * kernel's loops uniform-trip across the warp (the divergence-safe shape —
+          * the earlier one-thread-per-tile mapping diverged per-lane on the
           * covered-quad count and the SIMT reconvergence dropped fragments). Full
           * occupancy: every warp/core runs, lanes shade in parallel. */
+         assert(nt >= 4 && (nt % 4) == 0 &&
+                "a pixel quad occupies four adjacent lanes, so a warp must hold whole quads");
          fli.grid_dim[0]  = num_tiles_sw;     /* one warp (CTA) per screen tile */
          fli.block_dim[0] = (uint32_t)nt;     /* NT threads = exactly one warp   */
          /* Prim count = the front end's kept-prim count P (meta[0]), NOT num_tris:
