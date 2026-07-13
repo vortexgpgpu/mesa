@@ -150,6 +150,17 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
       if (caps->max_block_size[2] > hw_max) caps->max_block_size[2] = hw_max;
       if (caps->max_threads_per_block > hw_max)
          caps->max_threads_per_block = hw_max;
+
+      /* A subgroup is a Vortex warp. The inherited llvmpipe number is its own SIMD
+       * width (lp_native_vector_width / 32) and has never described this hardware;
+       * a shader that asks for the subgroup size, or whose quad ops are lowered
+       * against it, would be reasoning about the wrong machine.
+       *
+       * subgroup_sizes is a BITMASK of supported sizes (bit b => size 1<<b). A warp
+       * width is a power of two, so assigning it sets exactly the one bit that says
+       * "the only subgroup size is NT". */
+      caps->subgroup_sizes = vps->hw_num_threads;
+      caps->max_subgroups  = vps->hw_num_warps;
    }
 
    /* Tell the lavapipe frontend to leave Vulkan ray queries intact for
