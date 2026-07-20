@@ -20,6 +20,7 @@
 #include "vp_public.h"
 #include "vp_private.h"
 #include "llvmpipe/lp_public.h"
+#include "nir.h"
 #include "util/u_memory.h"
 #include "util/log.h"
 
@@ -72,6 +73,31 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
    struct vp_screen *vps = vp_reg_get(screen);
    if (vps && vps->has_rtu)
       vp_nir_lower_ray_tracing_to_rtu(nir);
+
+   /* Vortex emits one flat kernel. The ray-tracing megashader (RTU or software
+    * traversal) keeps each pipeline stage (raygen, closest-hit, miss, ...) as a
+    * separate nir_function invoked by nir_call; inline them into the entrypoint.
+    * The calls are direct and acyclic — trace-ray recursion is a resume-loop in
+    * the entrypoint, not a nested call. Not gated on the RTU: the software
+    * traversal megashader has the same structure and must also run flat. */
+   if (exec_list_length(&nir->functions) > 1) {
+      /* nir_inline_functions with driver_functions set only inlines functions
+       * flagged should_inline (or small ones); the RT stage functions are
+       * large, so force them. */
+      nir_foreach_function(func, nir) {
+         if (!func->is_entrypoint)
+            func->should_inline = true;
+      }
+      NIR_PASS(_, nir, nir_lower_returns);
+      NIR_PASS(_, nir, nir_inline_functions);
+      NIR_PASS(_, nir, nir_opt_copy_prop_vars);
+      nir_remove_non_entrypoints(nir);
+   }
+   /* The megashader keeps its shader-call stack, hit attributes and payload in
+    * scratch; promote indexable scratch to SSA/vars where possible (after
+    * inlining, so callee scratch is covered) to keep the shader on device. */
+   NIR_PASS(_, nir, nir_lower_scratch_to_var);
+
    return vps->lp_finalize_nir(screen, nir);
 }
 

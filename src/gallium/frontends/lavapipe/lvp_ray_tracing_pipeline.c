@@ -8,6 +8,12 @@
 #include "lvp_acceleration_structure.h"
 #include "nir/lvp_nir.h"
 
+/* Vortex RTU register-file slot ABI + wait-status codes (generated from
+ * VX_types.toml). Used by the hardware ray-traversal path below, which lowers
+ * VkTraceRaysKHR onto the RTU via the vortex_rt_* NIR intrinsics — the same
+ * intrinsics vortexpipe already emits for VK_KHR_ray_query. */
+#include "VX_types.h"
+
 #include "vk_pipeline.h"
 
 #include "spirv/spirv.h"
@@ -271,6 +277,11 @@ struct lvp_ray_tracing_state {
    nir_variable *hit_kind;
    nir_variable *sbt_index;
 
+   /* Hardware-traversal (RTU) path only: the RTU returns the instance custom
+    * index as a value, not the instance-node device address the software path
+    * reads it from, so stage it here and short-circuit the intrinsic. */
+   nir_variable *rtu_instance_custom_index;
+
    nir_variable *shader_record_ptr;
    nir_variable *stack_ptr;
    nir_variable *shader_call_data_offset;
@@ -330,6 +341,7 @@ lvp_ray_tracing_state_init(nir_shader *nir, struct lvp_ray_tracing_state *state)
    state->geometry_id_and_flags = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "geometry_id_and_flags");
    state->hit_kind = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "hit_kind");
    state->sbt_index = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "sbt_index");
+   state->rtu_instance_custom_index = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "rtu_instance_custom_index");
 
    state->shader_record_ptr = nir_variable_create(nir, nir_var_shader_temp, glsl_uint64_t_type(), "shader_record_ptr");
    state->stack_ptr = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "stack_ptr");
@@ -706,6 +718,69 @@ lvp_handle_triangle_intersection(nir_builder *b,
    nir_pop_if(b, NULL);
 }
 
+/* Hardware ray traversal on the Vortex RTU.
+ *
+ * Replaces the software BVH walk with one RTU trace+wait macro-op and writes
+ * the SAME closest-hit state the software path produces, so the closest-hit /
+ * miss dispatch that follows is identical. This is the RT-pipeline analogue of
+ * vortexpipe's VK_KHR_ray_query lowering (vp_nir_lower_ray_tracing_to_rtu):
+ * both resolve the whole ray in the RTU. Scope: opaque triangle geometry (the
+ * bulk of the suite); any-hit and procedural intersection remain on the
+ * software path for now. The acceleration structure is transcoded to the RTU
+ * CW-BVH format at launch (vp_launch, has_rtu) exactly as for ray queries, so
+ * `accel_struct` is the same handle the software path would walk. */
+static void
+lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
+                  nir_def *accel_struct, nir_def *flags, nir_def *cull_mask,
+                  nir_def *origin, nir_def *tmin, nir_def *dir, nir_def *tmax)
+{
+   struct lvp_ray_tracing_state *state = &compiler->state;
+
+   /* One XLEN scene register carries the TLAS pointer (low 32 bits). */
+   nir_def *scene = accel_struct->bit_size == 32 ? accel_struct : nir_u2u32(b, accel_struct);
+   /* Config word: ray_flags (low 16) | cull_mask (high 16), matching the
+    * ray-query lowering's lane-3 packing. */
+   nir_def *flags_cull =
+      nir_ior(b, nir_iand_imm(b, flags, 0xffff),
+                 nir_ishl_imm(b, nir_iand_imm(b, cull_mask, 0xff), 16));
+
+   nir_def *handle = nir_vortex_rt_wtrace(b, 32, scene, flags_cull, origin, dir, tmin, tmax);
+   nir_def *status = nir_vortex_rt_wait(b, 32, handle);
+   nir_def *is_hit = nir_ieq_imm(b, status, VX_RT_STS_DONE_HIT);
+
+   nir_def *t     = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_T);
+   nir_def *bary_u = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_BARY_U);
+   nir_def *bary_v = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_BARY_V);
+   nir_def *prim  = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_PRIMITIVE_ID);
+   nir_def *geom  = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_GEOMETRY_INDEX);
+   nir_def *cust  = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_INSTANCE_CUSTOM);
+
+   /* tmax holds the committed hit distance on a hit; keep the ray's tmax on a
+    * miss (the miss shader reads gl_RayTmaxEXT). */
+   nir_store_var(b, state->tmax, nir_bcsel(b, is_hit, t, tmax), 0x1);
+   nir_store_var(b, state->primitive_id, prim, 0x1);
+   nir_store_var(b, state->geometry_id_and_flags, geom, 0x1);
+   nir_store_var(b, state->rtu_instance_custom_index, cust, 0x1);
+   /* The RTU does not report triangle facing, so opaque-triangle hits are
+    * always reported front-facing (gl_HitKindEXT 0xFE; back-face would be 0xFF). */
+   nir_store_var(b, state->hit_kind, nir_imm_int(b, 0xFE), 0x1);
+   nir_store_var(b, state->traversal.hit, is_hit, 0x1);
+
+   /* Barycentrics live in scratch at the traversal stack pointer — the exact
+    * slot the software triangle handler uses, so the closest-hit's
+    * hitAttributeEXT read is unchanged. */
+   nir_def *bary_offset = nir_load_var(b, state->stack_ptr);
+   nir_store_scratch(b, nir_vec2(b, bary_u, bary_v), bary_offset);
+
+   /* SBT record = sbt_offset + sbt_stride * geometry_index. Per-instance
+    * shaderBindingTableRecordOffset (uniform for the single-hit-group opaque
+    * scenes targeted here) is not yet plumbed from the RTU. */
+   nir_def *sbt_index =
+      nir_iadd(b, nir_load_var(b, state->sbt_offset),
+               nir_imul(b, nir_load_var(b, state->sbt_stride), geom));
+   nir_store_var(b, state->sbt_index, sbt_index, 0x1);
+}
+
 static void
 lvp_trace_ray(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
               nir_intrinsic_instr *instr)
@@ -744,48 +819,55 @@ lvp_trace_ray(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler
    nir_store_var(b, state->dir, dir, 0x7);
    nir_store_var(b, state->tmax, tmax, 0x1);
 
-   nir_store_var(b, state->traversal.bvh_base, accel_struct, 0x1);
-   nir_store_var(b, state->traversal.origin, origin, 0x7);
-   nir_store_var(b, state->traversal.dir, dir, 0x7);
-   nir_store_var(b, state->traversal.inv_dir, nir_frcp(b, dir), 0x7);
-   nir_store_var(b, state->traversal.current_node, nir_imm_int(b, LVP_BVH_ROOT_NODE), 0x1);
-   nir_store_var(b, state->traversal.stack_base, nir_imm_int(b, -1), 0x1);
-   nir_store_var(b, state->traversal.stack_ptr, nir_imm_int(b, 0), 0x1);
-
    nir_store_var(b, state->traversal.hit, nir_imm_false(b), 0x1);
 
-   struct lvp_ray_traversal_vars vars = {
-      .tmax = nir_build_deref_var(b, state->tmax),
-      .origin = nir_build_deref_var(b, state->traversal.origin),
-      .dir = nir_build_deref_var(b, state->traversal.dir),
-      .inv_dir = nir_build_deref_var(b, state->traversal.inv_dir),
-      .bvh_base = nir_build_deref_var(b, state->traversal.bvh_base),
-      .current_node = nir_build_deref_var(b, state->traversal.current_node),
-      .stack_base = nir_build_deref_var(b, state->traversal.stack_base),
-      .stack_ptr = nir_build_deref_var(b, state->traversal.stack_ptr),
-      .stack = nir_build_deref_var(b, state->traversal.stack),
-      .instance_addr = nir_build_deref_var(b, state->traversal.instance_addr),
-      .sbt_offset_and_flags = nir_build_deref_var(b, state->traversal.sbt_offset_and_flags),
-   };
+   if (compiler->pipeline->device->pscreen->caps.driver_ray_queries) {
+      /* Vortex RTU present: resolve the ray in hardware. */
+      nir_push_if(b, nir_ine_imm(b, accel_struct, 0));
+      lvp_trace_ray_rtu(b, compiler, accel_struct, flags, cull_mask, origin, tmin, dir, tmax);
+      nir_pop_if(b, NULL);
+   } else {
+      nir_store_var(b, state->traversal.bvh_base, accel_struct, 0x1);
+      nir_store_var(b, state->traversal.origin, origin, 0x7);
+      nir_store_var(b, state->traversal.dir, dir, 0x7);
+      nir_store_var(b, state->traversal.inv_dir, nir_frcp(b, dir), 0x7);
+      nir_store_var(b, state->traversal.current_node, nir_imm_int(b, LVP_BVH_ROOT_NODE), 0x1);
+      nir_store_var(b, state->traversal.stack_base, nir_imm_int(b, -1), 0x1);
+      nir_store_var(b, state->traversal.stack_ptr, nir_imm_int(b, 0), 0x1);
 
-   struct lvp_ray_traversal_args args = {
-      .root_bvh_base = accel_struct,
-      .flags = flags,
-      .cull_mask = nir_ishl_imm(b, cull_mask, 24),
-      .origin = origin,
-      .tmin = tmin,
-      .dir = dir,
-      .vars = vars,
-      .aabb_cb = (compiler->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR) ?
-                 NULL : lvp_handle_aabb_intersection,
-      .triangle_cb = (compiler->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR) ?
-                     NULL : lvp_handle_triangle_intersection,
-      .data = compiler,
-   };
+      struct lvp_ray_traversal_vars vars = {
+         .tmax = nir_build_deref_var(b, state->tmax),
+         .origin = nir_build_deref_var(b, state->traversal.origin),
+         .dir = nir_build_deref_var(b, state->traversal.dir),
+         .inv_dir = nir_build_deref_var(b, state->traversal.inv_dir),
+         .bvh_base = nir_build_deref_var(b, state->traversal.bvh_base),
+         .current_node = nir_build_deref_var(b, state->traversal.current_node),
+         .stack_base = nir_build_deref_var(b, state->traversal.stack_base),
+         .stack_ptr = nir_build_deref_var(b, state->traversal.stack_ptr),
+         .stack = nir_build_deref_var(b, state->traversal.stack),
+         .instance_addr = nir_build_deref_var(b, state->traversal.instance_addr),
+         .sbt_offset_and_flags = nir_build_deref_var(b, state->traversal.sbt_offset_and_flags),
+      };
 
-   nir_push_if(b, nir_ine_imm(b, accel_struct, 0));
-   lvp_build_ray_traversal(b, &args);
-   nir_pop_if(b, NULL);
+      struct lvp_ray_traversal_args args = {
+         .root_bvh_base = accel_struct,
+         .flags = flags,
+         .cull_mask = nir_ishl_imm(b, cull_mask, 24),
+         .origin = origin,
+         .tmin = tmin,
+         .dir = dir,
+         .vars = vars,
+         .aabb_cb = (compiler->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR) ?
+                    NULL : lvp_handle_aabb_intersection,
+         .triangle_cb = (compiler->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR) ?
+                        NULL : lvp_handle_triangle_intersection,
+         .data = compiler,
+      };
+
+      nir_push_if(b, nir_ine_imm(b, accel_struct, 0));
+      lvp_build_ray_traversal(b, &args);
+      nir_pop_if(b, NULL);
+   }
 
    nir_push_if(b, nir_load_var(b, state->traversal.hit));
    {
@@ -915,6 +997,12 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       def = nir_load_var(b, state->dir);
       break;
    case nir_intrinsic_load_ray_instance_custom_index: {
+      if (compiler->pipeline->device->pscreen->caps.driver_ray_queries) {
+         /* RTU path: the custom index was staged from the RTU hit, not fetched
+          * from an instance node the software walker would have visited. */
+         def = nir_iand_imm(b, nir_load_var(b, state->rtu_instance_custom_index), 0xFFFFFF);
+         break;
+      }
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *custom_instance_and_mask = nir_build_load_global(
          b, 1, 32,

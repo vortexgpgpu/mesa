@@ -27,27 +27,11 @@
 #include "nir.h"
 #include "nir_builder.h"
 
-/* RTU register-file slots (VX_types.toml [rtu_slots]) and wait status
- * (rtu_status). Kept local so this file doesn't depend on the Vortex
- * VX_types.h header. */
-#define VX_RT_RAY_ORIGIN          0   /* slots 0..2  */
-#define VX_RT_RAY_DIRECTION       3   /* slots 3..5  */
-#define VX_RT_T_MIN               6
-#define VX_RT_T_MAX               7
-#define VX_RT_OBJECT_RAY_ORIGIN   8   /* slots 8..10 */
-#define VX_RT_OBJECT_RAY_DIRECTION 11 /* slots 11..13 */
-#define VX_RT_HIT_T               14
-#define VX_RT_HIT_BARY_U          15
-#define VX_RT_HIT_BARY_V          16
-#define VX_RT_HIT_PRIMITIVE_ID    21
-#define VX_RT_HIT_INSTANCE_ID     22
-#define VX_RT_HIT_GEOMETRY_INDEX  23
-#define VX_RT_HIT_INSTANCE_CUSTOM 24
-#define VX_RT_RAY_FLAGS           27
-#define VX_RT_CULL_MASK           28
-
-#define VX_RT_STS_DONE_HIT        0
-#define VX_RT_STS_DONE_MISS       1
+/* The RTU window slot numbers and wait status codes are ABI, owned by
+ * VX_types.toml and generated into VX_types.h. They must never be restated
+ * here: a local copy is a second source of truth that silently decays into
+ * reads of the wrong slot when the window is renumbered. */
+#include "VX_types.h"
 
 /* Committed RayQueryIntersection types (SPIR-V): None=0, Triangle=1,
  * Generated=2. */

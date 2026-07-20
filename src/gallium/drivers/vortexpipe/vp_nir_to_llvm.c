@@ -133,6 +133,11 @@ struct vp_tr {
    LLVMTypeRef    iptr;
    LLVMValueRef   arg;          /* the kernel's %arg parameter (ptr) */
    LLVMValueRef   lmem_base;    /* compute: shared-memory base (CTA LMEM) */
+   /* Per-thread scratch: nir->scratch_size bytes as one entry-block alloca,
+    * created lazily on the first load_scratch/store_scratch (indexed scratch
+    * that nir_lower_scratch_to_var could not promote to SSA vars). */
+   unsigned       scratch_size;
+   LLVMValueRef   scratch_base; /* iptr addr of the scratch alloca, or NULL */
    LLVMBasicBlockRef entry;     /* function entry block (alloca home) */
    /* SSA map: [def index][component] -> iN value (bit pattern).
     * For a deref instr, component 0 holds the iptr byte address. */
@@ -240,6 +245,178 @@ static LLVMValueRef
 intr_src(struct vp_tr *t, nir_intrinsic_instr *in, unsigned s)
 {
    return ssa_get(t, in->src[s].ssa->index, 0);
+}
+
+/* llvm.sqrt.f32 -> the RISC-V backend lowers it to the Vortex FPU fsqrt.s.
+ * Declared once per module (LLVM recognises the reserved intrinsic name). */
+static LLVMValueRef
+emit_fsqrt(struct vp_tr *t, LLVMValueRef fa)
+{
+   LLVMTypeRef  fty = LLVMFunctionType(t->f32, &t->f32, 1, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.sqrt.f32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.sqrt.f32", fty);
+   return LLVMBuildCall2(t->b, fty, fn, &fa, 1, "fsqrt");
+}
+
+/* llvm.ctlz.i32 (count leading zeros, zero-is-not-poison) -> Vortex clz. */
+static LLVMValueRef
+emit_ctlz(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef  i1   = LLVMInt1TypeInContext(t->ctx);
+   LLVMTypeRef  args[2] = { t->i32, i1 };
+   LLVMTypeRef  fty  = LLVMFunctionType(t->i32, args, 2, false);
+   LLVMValueRef fn   = LLVMGetNamedFunction(t->mod, "llvm.ctlz.i32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.ctlz.i32", fty);
+   LLVMValueRef a[2] = { v, LLVMConstInt(i1, 0, false) };
+   return LLVMBuildCall2(t->b, fty, fn, a, 2, "ctlz");
+}
+
+/* llvm.pow.f32 (x**y). Lowered by the RISC-V backend to a powf libcall. */
+static LLVMValueRef
+emit_fpow(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y)
+{
+   LLVMTypeRef  args[2] = { t->f32, t->f32 };
+   LLVMTypeRef  fty = LLVMFunctionType(t->f32, args, 2, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.pow.f32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.pow.f32", fty);
+   LLVMValueRef a[2] = { x, y };
+   return LLVMBuildCall2(t->b, fty, fn, a, 2, "fpow");
+}
+
+/* llvm.ctpop.i32 (population count / set-bit count). */
+static LLVMValueRef
+emit_ctpop(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef  fty = LLVMFunctionType(t->i32, &t->i32, 1, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.ctpop.i32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.ctpop.i32", fty);
+   return LLVMBuildCall2(t->b, fty, fn, &v, 1, "ctpop");
+}
+
+/* Coerce integer value `v` to integer type `ty` by trunc/zext (identity when
+ * already `ty`). Used to match a shift amount to its value's width — NIR allows
+ * a narrower shift amount, LLVM requires both shift operands the same type. */
+static LLVMValueRef
+vp_int_cast(struct vp_tr *t, LLVMValueRef v, LLVMTypeRef ty)
+{
+   LLVMTypeRef vt = LLVMTypeOf(v);
+   if (vt == ty)
+      return v;
+   return LLVMGetIntTypeWidth(vt) > LLVMGetIntTypeWidth(ty)
+      ? LLVMBuildTrunc(t->b, v, ty, "")
+      : LLVMBuildZExt(t->b, v, ty, "");
+}
+
+/* llvm.cttz.i32 (count trailing zeros, zero-is-not-poison). */
+static LLVMValueRef
+emit_cttz(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef  i1   = LLVMInt1TypeInContext(t->ctx);
+   LLVMTypeRef  args[2] = { t->i32, i1 };
+   LLVMTypeRef  fty  = LLVMFunctionType(t->i32, args, 2, false);
+   LLVMValueRef fn   = LLVMGetNamedFunction(t->mod, "llvm.cttz.i32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.cttz.i32", fty);
+   LLVMValueRef a[2] = { v, LLVMConstInt(i1, 0, false) };
+   return LLVMBuildCall2(t->b, fty, fn, a, 2, "cttz");
+}
+
+/* vx ballot (custom-0, funct3=3, funct7=1): rd = per-lane predicate reduced to
+ * a warp bitmask (bit i = lane i's predicate). Side-effecting so the optimizer
+ * cannot hoist it across the divergent control flow whose mask it reports. */
+static LLVMValueRef
+emit_ballot(struct vp_tr *t, LLVMValueRef pred_i32)
+{
+   char s[48];
+   int n = snprintf(s, sizeof s, ".insn r %u, 3, 1, $0, $1, x0", VP_RISCV_CUSTOM0);
+   LLVMTypeRef args[1] = { t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, (size_t)n, "=r,r", 4,
+                                      /*HasSideEffects*/ true, false,
+                                      LLVMInlineAsmDialectATT, false);
+   LLVMValueRef a[1] = { pred_i32 };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "ballot");
+}
+
+/* vx shuffle (custom-0, funct7=1): rd = value from a source lane selected by
+ * `funct3` (4=up, 5=down, 6=bfly, 7=idx) and the packed `bc` control operand
+ * (mask<<12 | cval<<6 | bval). Whole-warp scope uses cval=0x3f, mask=0 (both
+ * truncated to the lane-index width by hardware) — since NUM_ALU_LANES ==
+ * NUM_THREADS a warp is one shuffle group. Side-effecting so it is not hoisted
+ * across the divergence whose active mask decides which source lanes are live. */
+static LLVMValueRef
+emit_shfl(struct vp_tr *t, unsigned funct3, LLVMValueRef value, LLVMValueRef bc)
+{
+   char s[48];
+   int n = snprintf(s, sizeof s, ".insn r %u, %u, 1, $0, $1, $2",
+                    VP_RISCV_CUSTOM0, funct3);
+   LLVMTypeRef args[2] = { t->i32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 2, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, (size_t)n, "=r,r,r", 6,
+                                      /*HasSideEffects*/ true, false,
+                                      LLVMInlineAsmDialectATT, false);
+   LLVMValueRef a[2] = { value, bc };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 2, "shfl");
+}
+
+/* shfl_up by a constant delta: bval=delta, cval=0x3f, mask=0 -> 0xFC0|delta. */
+static LLVMValueRef
+emit_shfl_up(struct vp_tr *t, LLVMValueRef value, unsigned delta)
+{
+   return emit_shfl(t, 4, value, LLVMConstInt(t->i32, 0xFC0u | delta, false));
+}
+
+/* shfl_idx (gather): every lane reads `value` from source lane `src` (dynamic).
+ * bval=src, cval=0x3f, mask=0 -> 0xFC0 | src. */
+static LLVMValueRef
+emit_shfl_idx(struct vp_tr *t, LLVMValueRef value, LLVMValueRef src)
+{
+   LLVMValueRef bc = LLVMBuildOr(t->b, LLVMConstInt(t->i32, 0xFC0u, false),
+                                 src, "shflidx_bc");
+   return emit_shfl(t, 7, value, bc);
+}
+
+/* Combine two lane values under a subgroup reduction op (32-bit). Operands and
+ * result are i32 bit patterns; float ops bitcast around the arithmetic. Returns
+ * NULL (and clears t->ok) for an op with no device mapping. */
+static LLVMValueRef
+emit_scan_combine(struct vp_tr *t, nir_op rop, LLVMValueRef a, LLVMValueRef b)
+{
+   switch (rop) {
+   case nir_op_iadd: return LLVMBuildAdd(t->b, a, b, "");
+   case nir_op_imul: return LLVMBuildMul(t->b, a, b, "");
+   case nir_op_iand: return LLVMBuildAnd(t->b, a, b, "");
+   case nir_op_ior:  return LLVMBuildOr(t->b, a, b, "");
+   case nir_op_ixor: return LLVMBuildXor(t->b, a, b, "");
+   case nir_op_imin: return LLVMBuildSelect(t->b,
+      LLVMBuildICmp(t->b, LLVMIntSLT, a, b, ""), a, b, "");
+   case nir_op_imax: return LLVMBuildSelect(t->b,
+      LLVMBuildICmp(t->b, LLVMIntSGT, a, b, ""), a, b, "");
+   case nir_op_umin: return LLVMBuildSelect(t->b,
+      LLVMBuildICmp(t->b, LLVMIntULT, a, b, ""), a, b, "");
+   case nir_op_umax: return LLVMBuildSelect(t->b,
+      LLVMBuildICmp(t->b, LLVMIntUGT, a, b, ""), a, b, "");
+   case nir_op_fadd: case nir_op_fmul: case nir_op_fmin: case nir_op_fmax: {
+      LLVMValueRef fa = LLVMBuildBitCast(t->b, a, t->f32, "");
+      LLVMValueRef fb = LLVMBuildBitCast(t->b, b, t->f32, "");
+      LLVMValueRef fr =
+         rop == nir_op_fadd ? LLVMBuildFAdd(t->b, fa, fb, "")
+       : rop == nir_op_fmul ? LLVMBuildFMul(t->b, fa, fb, "")
+       : rop == nir_op_fmin ? LLVMBuildSelect(t->b,
+            LLVMBuildFCmp(t->b, LLVMRealOLT, fa, fb, ""), fa, fb, "")
+       :                      LLVMBuildSelect(t->b,
+            LLVMBuildFCmp(t->b, LLVMRealOGT, fa, fb, ""), fa, fb, "");
+      return LLVMBuildBitCast(t->b, fr, t->i32, "");
+   }
+   default:
+      mesa_logw("vortexpipe: subgroup scan op %d unsupported", rop);
+      t->ok = false;
+      return NULL;
+   }
 }
 
 /* read a RISC-V CSR via inline asm: `csrr <rd>, <csr>` -> i32 */
@@ -397,10 +574,12 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          r = LLVMBuildMul(t->b, alu_src(t, alu, 0, c),
                                 alu_src(t, alu, 1, c), "imul");
          break;
-      case nir_op_ishl:
-         r = LLVMBuildShl(t->b, alu_src(t, alu, 0, c),
-                                alu_src(t, alu, 1, c), "ishl");
+      case nir_op_ishl: {
+         LLVMValueRef v = alu_src(t, alu, 0, c);
+         r = LLVMBuildShl(t->b, v,
+                vp_int_cast(t, alu_src(t, alu, 1, c), LLVMTypeOf(v)), "ishl");
          break;
+      }
       case nir_op_fadd: case nir_op_fmul: {
          LLVMTypeRef ft = fty(t, alu->def.bit_size);
          LLVMValueRef a = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
@@ -430,14 +609,18 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
       case nir_op_inot:
          r = LLVMBuildNot(t->b, alu_src(t, alu, 0, c), "inot");
          break;
-      case nir_op_ishr:
-         r = LLVMBuildAShr(t->b, alu_src(t, alu, 0, c),
-                                 alu_src(t, alu, 1, c), "ishr");
+      case nir_op_ishr: {
+         LLVMValueRef v = alu_src(t, alu, 0, c);
+         r = LLVMBuildAShr(t->b, v,
+                vp_int_cast(t, alu_src(t, alu, 1, c), LLVMTypeOf(v)), "ishr");
          break;
-      case nir_op_ushr:
-         r = LLVMBuildLShr(t->b, alu_src(t, alu, 0, c),
-                                 alu_src(t, alu, 1, c), "ushr");
+      }
+      case nir_op_ushr: {
+         LLVMValueRef v = alu_src(t, alu, 0, c);
+         r = LLVMBuildLShr(t->b, v,
+                vp_int_cast(t, alu_src(t, alu, 1, c), LLVMTypeOf(v)), "ushr");
          break;
+      }
       /* integer comparisons -> a NIR bool (i1, or sign-extended i32). */
       case nir_op_ieq: case nir_op_ine:
       case nir_op_ilt: case nir_op_ige:
@@ -490,6 +673,16 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
             neg, a, "iabs");
          break;
       }
+      case nir_op_isign: {
+         LLVMValueRef v = alu_src(t, alu, 0, c);
+         LLVMValueRef z = LLVMConstInt(LLVMTypeOf(v), 0, false);
+         r = LLVMBuildSub(t->b,
+            LLVMBuildZExt(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, v, z, ""),
+                          LLVMTypeOf(v), ""),
+            LLVMBuildZExt(t->b, LLVMBuildICmp(t->b, LLVMIntSLT, v, z, ""),
+                          LLVMTypeOf(v), ""), "isign");
+         break;
+      }
       case nir_op_ineg:
          r = LLVMBuildNeg(t->b, alu_src(t, alu, 0, c), "ineg");
          break;
@@ -517,12 +710,18 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
       /* float neg / div / min / max / abs / fused-multiply-add / sign */
       case nir_op_fneg: case nir_op_fdiv:
       case nir_op_fmin: case nir_op_fmax:
-      case nir_op_fabs: case nir_op_ffma: case nir_op_fsign: {
+      case nir_op_fabs: case nir_op_ffma: case nir_op_fsign:
+      case nir_op_fsqrt: case nir_op_frsq: {
          LLVMTypeRef  ft = fty(t, alu->def.bit_size);
          LLVMValueRef fa = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
          LLVMValueRef z  = LLVMConstReal(ft, 0.0);
          LLVMValueRef res;
-         if (alu->op == nir_op_fneg) {
+         if (alu->op == nir_op_fsqrt) {
+            res = emit_fsqrt(t, fa);
+         } else if (alu->op == nir_op_frsq) {
+            res = LLVMBuildFDiv(t->b, LLVMConstReal(ft, 1.0),
+                                emit_fsqrt(t, fa), "frsq");
+         } else if (alu->op == nir_op_fneg) {
             res = LLVMBuildFNeg(t->b, fa, "");
          } else if (alu->op == nir_op_fabs) {
             res = LLVMBuildSelect(t->b,
@@ -556,18 +755,41 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          r = LLVMBuildBitCast(t->b, res, ity(t, alu->def.bit_size), "");
          break;
       }
-      /* float width conversions */
-      case nir_op_f2f64:
-         r = LLVMBuildBitCast(t->b, LLVMBuildFPExt(t->b,
-            LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->f64, ""), t->i64, "f2f64");
+      /* float width conversions — branch on the actual LLVM operand width so
+       * the bitcasts stay legal even when the source value was materialized at
+       * a different width than its NIR bit_size (a same-width convert is the
+       * identity on the bit pattern). */
+      case nir_op_f2f64: {
+         LLVMValueRef v = alu_src(t, alu, 0, c);
+         if (LLVMTypeOf(v) == t->i64) {
+            r = v;   /* already an f64 bit pattern */
+         } else {
+            r = LLVMBuildBitCast(t->b, LLVMBuildFPExt(t->b,
+               LLVMBuildBitCast(t->b, v, t->f32, ""), t->f64, ""),
+               t->i64, "f2f64");
+         }
          break;
-      case nir_op_f2f32:
-         r = LLVMBuildBitCast(t->b, LLVMBuildFPTrunc(t->b,
-            LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f64, ""),
-            t->f32, ""), t->i32, "f2f32");
+      }
+      case nir_op_f2f32: {
+         LLVMValueRef v = alu_src(t, alu, 0, c);
+         if (LLVMTypeOf(v) == t->i32) {
+            r = v;   /* already an f32 bit pattern */
+         } else {
+            r = LLVMBuildBitCast(t->b, LLVMBuildFPTrunc(t->b,
+               LLVMBuildBitCast(t->b, v, t->f64, ""), t->f32, ""),
+               t->i32, "f2f32");
+         }
          break;
+      }
       /* integer modulo + 64-bit pack */
+      case nir_op_idiv:
+         r = LLVMBuildSDiv(t->b, alu_src(t, alu, 0, c),
+                                 alu_src(t, alu, 1, c), "idiv");
+         break;
+      case nir_op_udiv:
+         r = LLVMBuildUDiv(t->b, alu_src(t, alu, 0, c),
+                                 alu_src(t, alu, 1, c), "udiv");
+         break;
       case nir_op_imod:
          r = LLVMBuildSRem(t->b, alu_src(t, alu, 0, c),
                                  alu_src(t, alu, 1, c), "imod");
@@ -641,6 +863,32 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f32, ""), ""),
             t->i32, "frcp");
          break;
+      /* ufind_msb: index of the highest set bit, -1 when the source is 0.
+       * ctlz(0)=32, so 31-ctlz naturally yields -1 for a zero source. */
+      case nir_op_ufind_msb:
+         r = LLVMBuildSub(t->b, LLVMConstInt(t->i32, 31, false),
+                          emit_ctlz(t, alu_src(t, alu, 0, c)), "ufind_msb");
+         break;
+      case nir_op_bit_count:
+         r = emit_ctpop(t, alu_src(t, alu, 0, c));
+         break;
+      case nir_op_fpow: {
+         LLVMTypeRef  ft = fty(t, alu->def.bit_size);
+         LLVMValueRef x  = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
+         LLVMValueRef y  = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c), ft, "");
+         r = LLVMBuildBitCast(t->b, emit_fpow(t, x, y),
+                              ity(t, alu->def.bit_size), "");
+         break;
+      }
+      /* b2b1: normalize a bool to a 1-bit bool (nonzero -> true). */
+      case nir_op_b2b1: {
+         LLVMValueRef v = alu_src(t, alu, 0, c);
+         r = (LLVMTypeOf(v) == LLVMInt1TypeInContext(t->ctx))
+            ? v
+            : LLVMBuildICmp(t->b, LLVMIntNE, v,
+                            LLVMConstInt(LLVMTypeOf(v), 0, false), "b2b1");
+         break;
+      }
       /* bcsel: select(cond, a, b) -- cond is a NIR bool. */
       case nir_op_bcsel: {
          LLVMValueRef cond = alu_src(t, alu, 0, c);
@@ -758,6 +1006,82 @@ static LLVMValueRef emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene,
                                       LLVMValueRef ray[8]);
 static LLVMValueRef emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle);
 static void         emit_vx_rt_cb_ret(struct vp_tr *t, LLVMValueRef action);
+
+/* Emit an atomicrmw / cmpxchg at device pointer p, setting the intrinsic's def
+ * to the old value. Data sources start at src index `di` (rmw: [di]=value;
+ * swap: [di]=compare, [di+1]=new). 32-bit integer only — the lane ABI is 32-bit
+ * and the device A-extension AMOs are .w; float/64-bit atomics fail-compile.
+ * Shared by the ssbo / global / shared atomic intrinsics, which differ only in
+ * how the address p is formed. */
+static void
+emit_atomic_at(struct vp_tr *t, nir_intrinsic_instr *in, LLVMValueRef p,
+               unsigned di, bool is_swap)
+{
+   if (in->def.bit_size != 32) {
+      mesa_logw("vortexpipe: %u-bit atomic unsupported (32-bit only)",
+                in->def.bit_size);
+      t->ok = false;
+      return;
+   }
+   nir_atomic_op aop = nir_intrinsic_atomic_op(in);
+   if (is_swap) {
+      if (aop != nir_atomic_op_cmpxchg) {
+         mesa_logw("vortexpipe: atomic_swap op %d unsupported", aop);
+         t->ok = false;
+         return;
+      }
+      LLVMValueRef r = LLVMBuildAtomicCmpXchg(t->b, p,
+         intr_src(t, in, di), intr_src(t, in, di + 1),
+         LLVMAtomicOrderingSequentiallyConsistent,
+         LLVMAtomicOrderingSequentiallyConsistent, /*singleThread*/ false);
+      ssa_set(t, in->def.index, 0, LLVMBuildExtractValue(t->b, r, 0, "amocas"));
+      return;
+   }
+   LLVMAtomicRMWBinOp op;
+   bool supported = true;
+   switch (aop) {
+   case nir_atomic_op_iadd: op = LLVMAtomicRMWBinOpAdd;  break;
+   case nir_atomic_op_xchg: op = LLVMAtomicRMWBinOpXchg; break;
+   case nir_atomic_op_iand: op = LLVMAtomicRMWBinOpAnd;  break;
+   case nir_atomic_op_ior:  op = LLVMAtomicRMWBinOpOr;   break;
+   case nir_atomic_op_ixor: op = LLVMAtomicRMWBinOpXor;  break;
+   case nir_atomic_op_imin: op = LLVMAtomicRMWBinOpMin;  break;
+   case nir_atomic_op_imax: op = LLVMAtomicRMWBinOpMax;  break;
+   case nir_atomic_op_umin: op = LLVMAtomicRMWBinOpUMin; break;
+   case nir_atomic_op_umax: op = LLVMAtomicRMWBinOpUMax; break;
+   default:                 op = LLVMAtomicRMWBinOpAdd;
+                            supported = false;           break;
+   }
+   if (!supported) {
+      mesa_logw("vortexpipe: atomic op %d unsupported (int32 only)", aop);
+      t->ok = false;
+      return;
+   }
+   LLVMValueRef r = LLVMBuildAtomicRMW(t->b, op, p, intr_src(t, in, di),
+      LLVMAtomicOrderingSequentiallyConsistent, /*singleThread*/ false);
+   ssa_set(t, in->def.index, 0, r);
+}
+
+/* Lazily allocate the per-thread scratch region (nir->scratch_size bytes) as an
+ * entry-block alloca; return its base as an iptr byte address. */
+static LLVMValueRef
+emit_scratch_base(struct vp_tr *t)
+{
+   if (!t->scratch_base) {
+      unsigned sz = t->scratch_size ? t->scratch_size : 4u;
+      LLVMBasicBlockRef cur = LLVMGetInsertBlock(t->b);
+      LLVMValueRef first = LLVMGetFirstInstruction(t->entry);
+      if (first)
+         LLVMPositionBuilderBefore(t->b, first);
+      else
+         LLVMPositionBuilderAtEnd(t->b, t->entry);
+      LLVMValueRef a = LLVMBuildArrayAlloca(t->b, t->i8,
+         LLVMConstInt(t->i32, sz, false), "scratch");
+      LLVMPositionBuilderAtEnd(t->b, cur);
+      t->scratch_base = LLVMBuildPtrToInt(t->b, a, t->iptr, "");
+   }
+   return t->scratch_base;
+}
 
 static void
 emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
@@ -971,6 +1295,29 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       ssa_set(t, in->def.index, 0, r);
       break;
    }
+   /* Raw global-address atomics: src[0] is the device address; data follows
+    * at src[1] (swap: src[1]=compare, src[2]=new). */
+   case nir_intrinsic_global_atomic:
+   case nir_intrinsic_global_atomic_swap: {
+      LLVMValueRef p = LLVMBuildIntToPtr(t->b, intr_src(t, in, 0), t->ptr, "");
+      emit_atomic_at(t, in, p, 1,
+                     in->intrinsic == nir_intrinsic_global_atomic_swap);
+      break;
+   }
+   /* Shared-memory atomics: addr = CTA local-mem base + nir_base + src[0];
+    * data follows at src[1] (swap: src[1]=compare, src[2]=new). */
+   case nir_intrinsic_shared_atomic:
+   case nir_intrinsic_shared_atomic_swap: {
+      if (!t->lmem_base) { t->ok = false; break; }
+      LLVMValueRef addr = LLVMBuildAdd(t->b,
+         LLVMBuildAdd(t->b, t->lmem_base,
+            vp_iptr_const(t, nir_intrinsic_base(in)), ""),
+         vp_to_iptr(t, intr_src(t, in, 0)), "shatomaddr");
+      LLVMValueRef p = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
+      emit_atomic_at(t, in, p, 1,
+                     in->intrinsic == nir_intrinsic_shared_atomic_swap);
+      break;
+   }
    /* Push constants: lavapipe usually lowers these to load_ubo(0, off), but
     * a load_push_constant survives on some paths. Read table[0] (the push-
     * constant constant-buffer base) + off directly, mirroring load_ubo(0). */
@@ -1058,6 +1405,114 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          if (v)
             LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
+      break;
+   }
+   /* Per-thread scratch: addr = scratch base + dynamic offset. */
+   case nir_intrinsic_load_scratch: {
+      LLVMValueRef addr = LLVMBuildAdd(t->b, emit_scratch_base(t),
+         vp_to_iptr(t, intr_src(t, in, 0)), "scaddr");
+      LLVMTypeRef lt  = ity(t, in->def.bit_size);
+      unsigned    esz = in->def.bit_size / 8u;
+      for (unsigned c = 0; c < in->def.num_components; c++) {
+         LLVMValueRef a = LLVMBuildAdd(t->b, addr, vp_iptr_const(t, c * esz), "");
+         LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "scld"));
+      }
+      break;
+   }
+   case nir_intrinsic_store_scratch: {
+      LLVMValueRef addr = LLVMBuildAdd(t->b, emit_scratch_base(t),
+         vp_to_iptr(t, intr_src(t, in, 1)), "scaddr");
+      unsigned mask = nir_intrinsic_write_mask(in);
+      unsigned nc   = nir_src_num_components(in->src[0]);
+      unsigned esz  = nir_src_bit_size(in->src[0]) / 8u;
+      for (unsigned c = 0; c < nc; c++) {
+         if (!(mask & (1u << c))) continue;
+         LLVMValueRef v = ssa_get(t, in->src[0].ssa->index, c);
+         LLVMValueRef a = LLVMBuildAdd(t->b, addr, vp_iptr_const(t, c * esz), "");
+         if (v)
+            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+      }
+      break;
+   }
+   /* A Vortex warp is a subgroup: the warp ballot reduces each lane's
+    * predicate to a lane bitmask. The NIR predicate is a bool; widen to the
+    * i32 the instruction consumes. */
+   case nir_intrinsic_ballot: {
+      LLVMValueRef pred = intr_src(t, in, 0);
+      if (LLVMTypeOf(pred) == LLVMInt1TypeInContext(t->ctx))
+         pred = LLVMBuildZExt(t->b, pred, t->i32, "");
+      ssa_set(t, in->def.index, 0, emit_ballot(t, pred));
+      break;
+   }
+   /* subgroup == warp: the subgroup index within the workgroup is the warp id
+    * (one CTA occupies one core's warps). */
+   case nir_intrinsic_load_subgroup_id:
+      ssa_set(t, in->def.index, 0,
+              emit_csr_read(t, VX_CSR_WARP_ID, "subgroup_id"));
+      break;
+   /* lane index within the subgroup (warp) = Vortex thread id. */
+   case nir_intrinsic_load_subgroup_invocation:
+      ssa_set(t, in->def.index, 0,
+              emit_csr_read(t, VX_CSR_THREAD_ID, "subgroup_inv"));
+      break;
+   /* read_invocation: broadcast src[0] from the lane src[1] to all lanes. */
+   case nir_intrinsic_read_invocation:
+      ssa_set(t, in->def.index, 0,
+              emit_shfl_idx(t, intr_src(t, in, 0), intr_src(t, in, 1)));
+      break;
+   /* read_first_invocation: broadcast from the lowest active lane (lowest set
+    * bit of the active-lane ballot). */
+   case nir_intrinsic_read_first_invocation: {
+      LLVMValueRef low = emit_cttz(t, emit_ballot(t, LLVMConstInt(t->i32, 1, false)));
+      ssa_set(t, in->def.index, 0, emit_shfl_idx(t, intr_src(t, in, 0), low));
+      break;
+   }
+   /* elect: exactly the lowest active lane returns true. The active-lane
+    * ballot's lowest set bit is that lane; compare against this lane's id. */
+   case nir_intrinsic_elect: {
+      LLVMValueRef mask = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+      LLVMValueRef low  = emit_cttz(t, mask);
+      LLVMValueRef lane = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+      ssa_set(t, in->def.index, 0,
+              LLVMBuildICmp(t->b, LLVMIntEQ, lane, low, "elect"));
+      break;
+   }
+   /* Inclusive prefix scan across the warp (subgroup): Hillis-Steele over
+    * shfl_up with a lane-id guard so a lane below the step distance keeps its
+    * own accumulator (shfl_up returns own value out of range — accumulating it
+    * would double-count). Unrolled to cover NT up to 32; steps past NT no-op. */
+   case nir_intrinsic_inclusive_scan: {
+      if (in->def.bit_size != 32) {
+         mesa_logw("vortexpipe: %u-bit inclusive_scan unsupported (32-bit only)",
+                   in->def.bit_size);
+         t->ok = false;
+         break;
+      }
+      nir_op rop = nir_intrinsic_reduction_op(in);
+      LLVMValueRef acc  = intr_src(t, in, 0);
+      LLVMValueRef lane = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+      for (unsigned d = 1; d <= 16u; d <<= 1) {
+         LLVMValueRef nbr  = emit_shfl_up(t, acc, d);
+         LLVMValueRef comb = emit_scan_combine(t, rop, acc, nbr);
+         if (!t->ok)
+            break;
+         LLVMValueRef pred = LLVMBuildICmp(t->b, LLVMIntUGE, lane,
+                                           LLVMConstInt(t->i32, d, false), "");
+         acc = LLVMBuildSelect(t->b, pred, comb, acc, "scan");
+      }
+      if (t->ok)
+         ssa_set(t, in->def.index, 0, acc);
+      break;
+   }
+   /* Flat CTA-linear lane id = warp_id * NT + lane (one CTA per core, so the
+    * warp id within the core is the warp id within the workgroup). */
+   case nir_intrinsic_load_local_invocation_index: {
+      LLVMValueRef wid = emit_csr_read(t, VX_CSR_WARP_ID,     "wid");
+      LLVMValueRef nt  = emit_csr_read(t, VX_CSR_NUM_THREADS, "nt");
+      LLVMValueRef tid = emit_csr_read(t, VX_CSR_THREAD_ID,   "tid");
+      ssa_set(t, in->def.index, 0,
+              LLVMBuildAdd(t->b, LLVMBuildMul(t->b, wid, nt, ""), tid, "lii"));
       break;
    }
    /* workgroup barrier: only the execution-scoped form needs a sync;
@@ -1371,8 +1826,12 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
          v = ssa_get(t, tex->src[i].src.ssa->index, 1);
       }
    }
-   if (tex->op != nir_texop_tex || !u || !v) {
-      mesa_logw("vortexpipe: vp_nir_to_llvm: unsupported texture op");
+   /* Accept auto-LOD (tex) and explicit-LOD/bias (txl/txb) sampling; the device
+    * path samples base level, so the LOD/bias source is ignored. Ray-tracing and
+    * compute shaders emit txl since they have no implicit derivatives. */
+   if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
+        tex->op != nir_texop_txb) || !u || !v) {
+      mesa_logw("vortexpipe: vp_nir_to_llvm: unsupported texture op %d", tex->op);
       t->ok = false;
       return;
    }
@@ -2516,6 +2975,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t.ctx, fn, "entry");
    LLVMPositionBuilderAtEnd(t.b, entry);
    t.entry = entry;
+   t.scratch_size = nir->scratch_size;
 
    /* Where a discarded fragment's stores go to die. Sized for the widest store the
     * translator emits (4 components x 8 bytes), so a retargeted vec4 stays inside
@@ -2702,6 +3162,12 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    } else {
       mesa_logw("vortexpipe: vp_nir_to_llvm: module verify failed: %s",
                 err ? err : "(no message)");
+      if (getenv("VORTEXPIPE_DEBUG_IR")) {
+         char *ir = LLVMPrintModuleToString(t.mod);
+         fprintf(stderr, "=== vortexpipe: rejected LLVM IR ===\n%s"
+                         "=== end IR ===\n", ir);
+         LLVMDisposeMessage(ir);
+      }
    }
    LLVMDisposeMessage(err);
 

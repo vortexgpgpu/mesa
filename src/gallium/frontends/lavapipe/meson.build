@@ -57,5 +57,8 @@ liblavapipe_st = static_library(
   gnu_symbol_visibility : 'hidden',
   include_directories : [ inc_include, inc_src, inc_util, inc_gallium, inc_gallium_aux, inc_llvmpipe ],
   dependencies : [ dep_llvm, idep_nir, idep_mesautil, idep_vulkan_util, idep_vulkan_wsi,
-                   idep_vulkan_runtime, lvp_deps ]
+                   idep_vulkan_runtime, lvp_deps,
+                   # Vortex RTU register-file slot ABI (VX_types.h) for the
+                   # hardware ray-traversal path in lvp_ray_tracing_pipeline.c.
+                   dependency('vortex-runtime') ]
 )

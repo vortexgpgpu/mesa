@@ -75,6 +75,10 @@ struct vp_cso {
    void  *vxbin;           /* compiled Vortex kernel image, or NULL */
    size_t vxbin_size;
    unsigned lmem_size;     /* compute: shared-memory bytes (nir shared_size) */
+   /* compute: the workgroup carries no cross-invocation semantics (no shared
+    * memory, no control barrier, fixed size), so a workgroup larger than the
+    * device CTA cap can be re-tiled into several device CTAs at launch. */
+   bool workgroup_shape_invariant;
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
    struct vp_desc descs[VP_MAX_DESCS];  /* set-0 descriptors the kernel uses */
    unsigned        num_descs;

@@ -113,7 +113,15 @@ vp_create_compute_state(struct pipe_context *pipe,
    if (state->ir_type == PIPE_SHADER_IR_NIR) {
       char *ir = NULL;
       /* shared-memory size -> the launch's local-memory allocation. */
-      cso->lmem_size = ((struct nir_shader *)state->prog)->info.shared_size;
+      const struct shader_info *si = &((struct nir_shader *)state->prog)->info;
+      cso->lmem_size = si->shared_size;
+      /* A workgroup with no shared memory, no control barrier and a fixed
+       * size has independent invocations, so it can be re-tiled to fit the
+       * device CTA cap without changing results (the only cross-workgroup
+       * invariant a ray-tracing megashader reads is the global invocation id). */
+      cso->workgroup_shape_invariant =
+         (si->shared_size == 0) && !si->uses_control_barrier &&
+         !si->workgroup_size_variable;
       /* the set-0 descriptors the kernel reaches -> launch relocation. */
       vp_scan_descriptors((struct nir_shader *)state->prog,
                           cso->descs, &cso->num_descs);
@@ -176,6 +184,38 @@ vp_strict_mode(void)
    return strict;
 }
 
+/* Re-tile a workgroup that exceeds the device CTA cap (num_threads ×
+ * num_warps) into several device CTAs. Valid only for shape-invariant
+ * shaders (see vp_cso.workgroup_shape_invariant): the transform preserves
+ * every axis's global-invocation-id range — new_grid[i] * new_block[i] ==
+ * grid[i] * block[i] — so a kernel that reads only the global id (the
+ * ray-tracing megashader's LaunchIDEXT) sees identical work. Per axis the
+ * new block is the largest divisor of the original block that fits the
+ * remaining thread budget; power-of-two blocks (all Vulkan ray-tracing
+ * workgroups) land on divisors that keep hardware warps whole. Returns
+ * false if the result would still exceed the cap. */
+static bool
+vp_retile_workgroup(const uint32_t grid[3], const uint32_t block[3],
+                    uint32_t cap, uint32_t out_grid[3], uint32_t out_block[3])
+{
+   uint32_t budget = cap;
+   for (int i = 0; i < 3; i++) {
+      uint32_t b = block[i] ? block[i] : 1u;
+      uint32_t best = 1;
+      for (uint32_t d = 1; d <= b && d <= budget; d++) {
+         if (b % d == 0)
+            best = d;
+      }
+      out_block[i] = best;
+      out_grid[i]  = grid[i] * (b / best);
+      budget /= best;
+      if (budget == 0)
+         budget = 1;
+   }
+   uint32_t prod = out_block[0] * out_block[1] * out_block[2];
+   return prod != 0 && prod <= cap;
+}
+
 static void
 vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 {
@@ -191,16 +231,36 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
     * asserts on (`invalid request mask`). Reject up-front. */
    struct vp_screen *vps = vp_reg_get(pipe->screen);
    uint32_t block_size = info->block[0] * info->block[1] * info->block[2];
+
+   /* The grid/block actually dispatched. When a shape-invariant workgroup
+    * exceeds the device CTA cap, re-tile it into device-sized CTAs in place
+    * of the app's oversized one; otherwise dispatch the app's shape. */
+   const uint32_t *eff_grid  = info->grid;
+   const uint32_t *eff_block = info->block;
+   uint32_t rt_grid[3], rt_block[3];
+
    if (vps && vps->hw_max_block_size != 0 &&
        block_size > vps->hw_max_block_size) {
-      mesa_logw("vortexpipe: launch_grid: workgroup size %u (%ux%ux%u) "
-                "exceeds device cap %u (%u threads × %u warps); "
-                "fallback to llvmpipe",
-                block_size,
+      if (cso && cso->workgroup_shape_invariant &&
+          vp_retile_workgroup(info->grid, info->block, vps->hw_max_block_size,
+                              rt_grid, rt_block)) {
+         vp_dbg("vortexpipe: launch_grid: re-tiled workgroup %ux%ux%u -> "
+                "block %ux%ux%u grid %ux%ux%u to fit cap %u",
                 info->block[0], info->block[1], info->block[2],
-                vps->hw_max_block_size,
-                vps->hw_num_threads, vps->hw_num_warps);
-      goto fallback;
+                rt_block[0], rt_block[1], rt_block[2],
+                rt_grid[0], rt_grid[1], rt_grid[2], vps->hw_max_block_size);
+         eff_grid  = rt_grid;
+         eff_block = rt_block;
+      } else {
+         mesa_logw("vortexpipe: launch_grid: workgroup size %u (%ux%ux%u) "
+                   "exceeds device cap %u (%u threads × %u warps) and is not "
+                   "re-tileable; fallback to llvmpipe",
+                   block_size,
+                   info->block[0], info->block[1], info->block[2],
+                   vps->hw_max_block_size,
+                   vps->hw_num_threads, vps->hw_num_warps);
+         goto fallback;
+      }
    }
 
    /* Run on Vortex when the kernel compiled and we have set 0's
@@ -221,13 +281,13 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
       if (desc_host) {
          vp_dbg("vortexpipe: launch_grid -> Vortex grid=[%u,%u,%u] "
                 "block=[%u,%u,%u] descs=%u",
-                info->grid[0], info->grid[1], info->grid[2],
-                info->block[0], info->block[1], info->block[2],
+                eff_grid[0], eff_grid[1], eff_grid[2],
+                eff_block[0], eff_block[1], eff_block[2],
                 cso->num_descs);
          ran_on_vortex = vp_launch(vp->dev, cso->vxbin, cso->vxbin_size,
                                    (uint8_t *)desc_host + vp->cbuf_off[1],
                                    desc_bytes, cso->descs, cso->num_descs,
-                                   info->grid, info->block, cso->lmem_size,
+                                   eff_grid, eff_block, cso->lmem_size,
                                    vps && vps->has_rtu);
          pipe_buffer_unmap(pipe, xfer);
       }
