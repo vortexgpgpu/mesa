@@ -24,6 +24,20 @@ extern "C" {
  * binding N's descriptor starts at N * VP_DESC_STRIDE. */
 #define VP_DESC_STRIDE 256
 
+/* A raw compute shader buffer bound at set_shader_buffers slot `slot`
+ * (not a descriptor-set SSBO). vp_launch uploads `host[0,size)` to device
+ * memory and writes its device address into arg[VP_ARG_SSBO_BASE + slot],
+ * where the kernel's load_ssbo(imm slot, off) reads it. Upload-only: these
+ * are input buffers (e.g. the RT trace-ray command buffer). */
+struct vp_ssbo {
+   const void *host;   /* mapped host bytes */
+   uint32_t    size;   /* buffer_size */
+   unsigned    slot;   /* set_shader_buffers binding index */
+   bool        trace_cmd; /* this slot is an RT VkTraceRaysIndirectCommand2KHR:
+                           * its SBT shader-record device-address fields are
+                           * host pointers and must be relocated on upload. */
+};
+
 /* Run a compiled Vortex compute kernel (.vxbin) on `dev`.
  *
  * `desc_host[0, desc_bytes)` is set 0's descriptor buffer -- an array
@@ -31,9 +45,10 @@ extern "C" {
  * `descs[0, num_descs)` (from vp_scan_descriptors) names the buffer
  * descriptors inside it: each is copied to Vortex device memory and
  * its lp_jit_buffer.ptr rewritten to the device address, so the
- * kernel's load_ssbo/store_ssbo dereference resolves on-device. The
- * kernel runs over grid x block; writable buffers are copied back.
- * `lmem_size` is the per-workgroup shared-memory allocation.
+ * kernel's load_ssbo/store_ssbo dereference resolves on-device.
+ * `ssbos[0, num_ssbos)` are raw set_shader_buffers slots relocated into
+ * the arg block. The kernel runs over grid x block; writable descriptor
+ * buffers are copied back. `lmem_size` is the per-workgroup shared memory.
  *
  * Returns true on success.
  */
@@ -41,6 +56,7 @@ bool vp_launch(vx_device_h dev,
                const void *vxbin, size_t vxbin_size,
                const void *desc_host, uint32_t desc_bytes,
                const struct vp_desc *descs, uint32_t num_descs,
+               const struct vp_ssbo *ssbos, uint32_t num_ssbos,
                const uint32_t grid[3], const uint32_t block[3],
                uint32_t lmem_size, bool has_rtu);
 

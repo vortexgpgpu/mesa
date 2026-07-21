@@ -69,8 +69,8 @@ namespace graphics = vortex::graphics;
 
 /* Folded-in VS stage arg layout (mirrors vp_launch.c): arg slot 0 = VS output
  * buffer device address, slot 1 = attribute table indexed by VS input
- * driver_location with { device base, stride } entries. */
-#define VP_ARG_SLOTS        8
+ * driver_location with { device base, stride } entries. VP_ARG_SLOTS is the
+ * shared kernel-ABI slot count from vp_nir_to_llvm.h. */
 #define VP_ATTR_TABLE_LOCS  8
 
 /* Hard error from the Vortex runtime — log as mesa_loge so the host /

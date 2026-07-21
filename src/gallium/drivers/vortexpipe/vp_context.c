@@ -125,6 +125,10 @@ vp_create_compute_state(struct pipe_context *pipe,
       /* the set-0 descriptors the kernel reaches -> launch relocation. */
       vp_scan_descriptors((struct nir_shader *)state->prog,
                           cso->descs, &cso->num_descs);
+      /* raw const-index shader-buffer slots (RT trace-ray command buffer) ->
+       * SBT shader-record pointer relocation at launch. */
+      cso->trace_cmd_slots =
+         vp_scan_trace_cmd_slots((struct nir_shader *)state->prog);
       if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL, NULL)) {
          if (vp_compile_vxbin(ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
@@ -279,16 +283,40 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
       void *desc_host = pipe_buffer_map(pipe, vp->cbuf[1],
                                         PIPE_MAP_READ, &xfer);
       if (desc_host) {
+         /* Map any raw shader-buffer slots (e.g. the RT trace-ray command
+          * buffer at slot 0) so vp_launch can relocate them into the arg block.
+          * The maps stay valid across vp_launch (it vx_queue_finish()es before
+          * returning, so the async uploads complete before we unmap). */
+         struct vp_ssbo ssbos[VP_MAX_SSBO];
+         struct pipe_transfer *sxfer[VP_MAX_SSBO] = { 0 };
+         uint32_t num_ssbos = 0;
+         for (unsigned s = 0; s < VP_MAX_SSBO; s++) {
+            if (!vp->sbuf[s] || !vp->sbuf_sz[s])
+               continue;
+            void *h = pipe_buffer_map(pipe, vp->sbuf[s], PIPE_MAP_READ, &sxfer[s]);
+            if (!h)
+               continue;
+            ssbos[num_ssbos].host = (uint8_t *)h + vp->sbuf_off[s];
+            ssbos[num_ssbos].size = vp->sbuf_sz[s];
+            ssbos[num_ssbos].slot = s;
+            ssbos[num_ssbos].trace_cmd = (cso->trace_cmd_slots >> s) & 1u;
+            num_ssbos++;
+         }
+
          vp_dbg("vortexpipe: launch_grid -> Vortex grid=[%u,%u,%u] "
-                "block=[%u,%u,%u] descs=%u",
+                "block=[%u,%u,%u] descs=%u ssbos=%u",
                 eff_grid[0], eff_grid[1], eff_grid[2],
                 eff_block[0], eff_block[1], eff_block[2],
-                cso->num_descs);
+                cso->num_descs, num_ssbos);
          ran_on_vortex = vp_launch(vp->dev, cso->vxbin, cso->vxbin_size,
                                    (uint8_t *)desc_host + vp->cbuf_off[1],
                                    desc_bytes, cso->descs, cso->num_descs,
+                                   ssbos, num_ssbos,
                                    eff_grid, eff_block, cso->lmem_size,
                                    vps && vps->has_rtu);
+         for (unsigned s = 0; s < VP_MAX_SSBO; s++)
+            if (sxfer[s])
+               pipe_buffer_unmap(pipe, sxfer[s]);
          pipe_buffer_unmap(pipe, xfer);
       }
    }
@@ -344,6 +372,21 @@ vp_set_shader_buffers(struct pipe_context *pipe, enum pipe_shader_type shader,
                       unsigned writable_mask)
 {
    struct vp_context *vp = vp_reg_get(pipe);
+   /* Capture raw compute shader buffers so launch_grid can relocate them into
+    * the kernel arg block (arg[VP_ARG_SSBO_BASE + slot]). lavapipe binds the RT
+    * trace-ray command buffer here at slot 0; the megashader reads it as
+    * load_ssbo(imm 0, off), so the device address must be supplied here. */
+   if (shader == PIPE_SHADER_COMPUTE) {
+      for (unsigned i = 0; i < count; i++) {
+         unsigned slot = start + i;
+         if (slot >= VP_MAX_SSBO)
+            continue;
+         const struct pipe_shader_buffer *b = bufs ? &bufs[i] : NULL;
+         vp->sbuf[slot]     = b ? b->buffer : NULL;
+         vp->sbuf_off[slot] = b ? b->buffer_offset : 0u;
+         vp->sbuf_sz[slot]  = b ? b->buffer_size : 0u;
+      }
+   }
    vp->lp_set_shader_buffers(pipe, shader, start, count, bufs, writable_mask);
 }
 

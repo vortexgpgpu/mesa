@@ -25,9 +25,8 @@
 
 #include "util/log.h"
 
-/* i64 arg-block slots; slot N == base address of buffer set (N-1).
- * add1 uses slot 1 (descriptor set 0). */
-#define VP_ARG_SLOTS 8
+/* The i64 arg-block layout (VP_ARG_SLOTS, VP_ARG_SSBO_BASE) is the kernel ABI
+ * defined in vp_nir_to_llvm.h — shared with the NIR->LLVM arg[i] reads. */
 
 /* VP_CHECK wraps a Vortex runtime call: any vx_result_t != VX_SUCCESS is a
  * HARD ERROR — the operation we asked the runtime to perform on the device
@@ -50,6 +49,14 @@
  * byte size at +8 (4 bytes). VP_DESC_STRIDE lives in vp_launch.h. */
 #define VP_JIT_BUF_PTR   0
 #define VP_JIT_BUF_SIZE  8
+
+/* A storage-image descriptor's lp_jit_image occupies the first bytes of its
+ * lp_descriptor slot (image union at offset 0): base pointer at +0 (aliases
+ * lp_jit_buffer.ptr), height at +12, row_stride at +24, base_offset at +40. */
+#define VP_JIT_IMG_BASE        0
+#define VP_JIT_IMG_HEIGHT      12
+#define VP_JIT_IMG_ROW_STRIDE  24
+#define VP_JIT_IMG_BASE_OFFSET 40
 
 /* ---- acceleration-structure (BVH) device copy (Phase 7.6) --------- *
  *
@@ -199,6 +206,8 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
 
 struct vp_tri_list {
    float    (*tris)[10];   /* 9 coords + flags(as float bits) per triangle */
+   uint32_t *prim;         /* per-tri gl_PrimitiveID (from the lvp_bvh node)  */
+   uint32_t *geom;         /* per-tri gl_GeometryIndexEXT                     */
    uint32_t  count;
    uint32_t  cap;
    bool      ok;
@@ -225,21 +234,28 @@ vp_xform_compose(const float A[12], const float B[12], float C[12])
 
 static void
 vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
-            const float v2[3])
+            const float v2[3], uint32_t prim_id, uint32_t geom_id)
 {
    if (tl->count == tl->cap) {
       uint32_t ncap = tl->cap ? tl->cap * 2 : 64;
       float (*nt)[10] = realloc(tl->tris, (size_t)ncap * sizeof(*nt));
-      if (!nt) { tl->ok = false; return; }
-      tl->tris = nt;
+      uint32_t *np = realloc(tl->prim, (size_t)ncap * sizeof(*np));
+      uint32_t *ng = realloc(tl->geom, (size_t)ncap * sizeof(*ng));
+      if (nt) tl->tris = nt;
+      if (np) tl->prim = np;
+      if (ng) tl->geom = ng;
+      if (!nt || !np || !ng) { tl->ok = false; return; }
       tl->cap = ncap;
    }
-   float *t = tl->tris[tl->count++];
+   uint32_t idx = tl->count++;
+   float *t = tl->tris[idx];
    t[0]=v0[0]; t[1]=v0[1]; t[2]=v0[2];
    t[3]=v1[0]; t[4]=v1[1]; t[5]=v1[2];
    t[6]=v2[0]; t[7]=v2[1]; t[8]=v2[2];
    uint32_t flags = RTU_TRI_FLAG_OPAQUE;
    memcpy(&t[9], &flags, 4);
+   tl->prim[idx] = prim_id;
+   tl->geom[idx] = geom_id;
 }
 
 /* Walk one node (ptr = offset|type) of the lvp_bvh at base `bvh`, applying
@@ -264,11 +280,18 @@ vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
    case LVP_NODE_TRIANGLE: {
       float coords[9];
       memcpy(coords, node, 36);           /* coords[3][3] */
+      /* lvp_bvh_triangle_node: primitive_id @40, geometry_id_and_flags @44
+       * (low 28 bits = gl_GeometryIndexEXT). Preserve both so the RTU leaf
+       * reports the Vulkan gl_PrimitiveID / geometry index the closest-hit
+       * shader indexes its vertex/index/material SSBOs with. */
+      uint32_t prim_id = 0, geom_flags = 0;
+      memcpy(&prim_id,    node + 40, 4);
+      memcpy(&geom_flags, node + LVP_TRI_GEOMFLAGS_OFF, 4);
       float w0[3], w1[3], w2[3];
       vp_xform_point(M, &coords[0], w0);
       vp_xform_point(M, &coords[3], w1);
       vp_xform_point(M, &coords[6], w2);
-      vp_tri_push(tl, w0, w1, w2);
+      vp_tri_push(tl, w0, w1, w2, prim_id, geom_flags & 0x0fffffffu);
       break;
    }
    case LVP_NODE_INSTANCE: {
@@ -422,6 +445,7 @@ vp_quant(float v, float origin, int exp, bool hi)
  * frees). Returns NULL on OOM. *out_size receives the byte size. */
 static uint8_t *
 vp_bvh_serialize(struct vp_bvh *b, int root, const float (*tris)[10],
+                 const uint32_t *prim, const uint32_t *geom,
                  uint32_t *out_size)
 {
    const uint32_t leaf_bytes = RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_STRIDE;
@@ -447,9 +471,9 @@ vp_bvh_serialize(struct vp_bvh *b, int root, const float (*tris)[10],
       if (n->leaf) {
          uint32_t *lh = (uint32_t *)p;
          lh[0] = RTU_BVH_KIND_LEAF_TRI | (1u << RTU_BVH_COUNT_SHIFT);
-         lh[1] = 0;                    /* geometry_index (single geometry) */
+         lh[1] = geom[n->tri];         /* gl_GeometryIndexEXT */
          lh[2] = 0;
-         lh[3] = n->tri;               /* prim_base = source gl_PrimitiveID */
+         lh[3] = prim[n->tri];         /* prim_base = source gl_PrimitiveID */
          const float *t = tris[n->tri];
          memcpy(p + RTU_BVH_LEAF_HDR_BYTES, t, 36);   /* 9 coords */
          uint32_t flags = RTU_TRI_FLAG_OPAQUE;
@@ -519,7 +543,8 @@ vp_build_bvh4_scene(const struct vp_tri_list *tl, uint32_t *out_size)
       b.order[i] = i;
    }
    int root = vp_bvh_build(&b, 0, n);
-   uint8_t *scene = vp_bvh_serialize(&b, root, tl->tris, out_size);
+   uint8_t *scene = vp_bvh_serialize(&b, root, tl->tris, tl->prim, tl->geom,
+                                     out_size);
 
    free(b.cmin); free(b.cmax); free(b.cen); free(b.order); free(b.nodes);
    return scene;
@@ -535,14 +560,14 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
    vp_walk_node((const uint8_t *)tlas_host, root, kIdentity, &tl, 0);
    if (!tl.ok) {
-      free(tl.tris);
+      free(tl.tris); free(tl.prim); free(tl.geom);
       c->ok = false;
       return 0;
    }
 
    uint32_t size = 0;
    uint8_t *scene = vp_build_bvh4_scene(&tl, &size);
-   free(tl.tris);
+   free(tl.tris); free(tl.prim); free(tl.geom);
    if (!scene) { c->ok = false; return 0; }
 
    if (c->n_bufs >= VP_MAX_BVH || c->n_stages >= VP_MAX_BVH) {
@@ -569,6 +594,7 @@ vp_launch(vx_device_h dev,
           const void *vxbin, size_t vxbin_size,
           const void *desc_host, uint32_t desc_bytes,
           const struct vp_desc *descs, uint32_t num_descs,
+          const struct vp_ssbo *ssbos, uint32_t num_ssbos,
           const uint32_t grid[3], const uint32_t block[3],
           uint32_t lmem_size, bool has_rtu)
 {
@@ -580,6 +606,10 @@ vp_launch(vx_device_h dev,
    vx_buffer_h res[VP_MAX_DESCS]      = { 0 };  /* per-descriptor device buffer */
    void       *res_host[VP_MAX_DESCS] = { 0 };  /* its host backing            */
    uint32_t    res_bytes[VP_MAX_DESCS]= { 0 };
+   vx_buffer_h sres[VP_MAX_SSBO]      = { 0 };  /* per-slot raw-SSBO device buffer */
+   vx_buffer_h sbt_res[VP_MAX_SSBO * 4] = { 0 }; /* relocated SBT shader-record buffers */
+   uint32_t    n_sbt = 0;
+   uint8_t    *cmd_copy[VP_MAX_SSBO]  = { 0 };  /* mutable trace-command copies */
    struct vp_as_ctx asc = { .ok = true };       /* acceleration-structure BVHs */
    uint8_t    *stage = NULL;
 
@@ -617,7 +647,9 @@ vp_launch(vx_device_h dev,
     *    lp_jit_buffer.ptr so load_ssbo/store_ssbo dereference on-device.
     *  - VP_DESC_AS: copy the BVH (TLAS + its BLASes) into device
     *    memory with instance-node links relocated, rewrite the
-    *    accel_struct device address. */
+    *    accel_struct device address.
+    *  - VP_DESC_IMAGE: copy the storage image into device memory,
+    *    rewrite lp_jit_image.base, read back after the launch. */
    for (uint32_t i = 0; i < num_descs; i++) {
       uint8_t *slot = stage + descs[i].offset;
 
@@ -639,13 +671,47 @@ vp_launch(vx_device_h dev,
          continue;
       }
 
+      if (descs[i].kind == VP_DESC_IMAGE) {
+         /* Storage image: copy the host backing to device memory and rewrite
+          * lp_jit_image.base, mirroring the buffer path. Registered in res[]
+          * so it is read back (the shader writes it) and released. Upload +
+          * readback is the correct full-duplex treatment for an accumulation
+          * image, which is both read and written each frame. */
+         uint64_t host_base = 0;
+         uint16_t height    = 0;
+         uint32_t row       = 0;
+         uint32_t base_off  = 0;
+         memcpy(&host_base, slot + VP_JIT_IMG_BASE,        sizeof host_base);
+         memcpy(&height,    slot + VP_JIT_IMG_HEIGHT,      sizeof height);
+         memcpy(&row,       slot + VP_JIT_IMG_ROW_STRIDE,  sizeof row);
+         memcpy(&base_off,  slot + VP_JIT_IMG_BASE_OFFSET, sizeof base_off);
+         if (!host_base || !height || !row)
+            continue;
+         uint32_t isize = base_off + (uint32_t)height * row;
+         VP_CHECK(vx_buffer_create(dev, isize, 0, &res[i]),
+                  "vx_buffer_create(image)");
+         uint64_t dev_addr = 0;
+         VP_CHECK(vx_buffer_address(res[i], &dev_addr), "vx_buffer_address(image)");
+         void *img_upload = (void *)(uintptr_t)host_base;
+         VP_CHECK(vx_enqueue_write(q, res[i], 0, img_upload,
+                                   isize, 0, NULL, NULL),
+                  "vx_enqueue_write(image)");
+         memcpy(slot + VP_JIT_IMG_BASE, &dev_addr, sizeof dev_addr);
+         res_host[i]  = (void *)(uintptr_t)host_base;
+         res_bytes[i] = isize;
+         continue;
+      }
+
       /* VP_DESC_BUFFER */
       uint64_t host_ptr = 0;
-      uint32_t size = 0;
+      uint32_t nelem = 0;
       memcpy(&host_ptr, slot + VP_JIT_BUF_PTR,  sizeof host_ptr);
-      memcpy(&size,     slot + VP_JIT_BUF_SIZE, sizeof size);
-      if (!host_ptr || !size)
+      memcpy(&nelem,    slot + VP_JIT_BUF_SIZE, sizeof nelem);
+      if (!host_ptr || !nelem)
          continue;
+      /* lp_jit_buffer.num_elements is a COUNT: bytes for an SSBO (elem_bytes 1),
+       * dwords for a UBO (elem_bytes 4, DIV_ROUND_UP(size, sizeof(float))). */
+      uint32_t size = nelem * (descs[i].elem_bytes ? descs[i].elem_bytes : 1);
       VP_CHECK(vx_buffer_create(dev, size, 0, &res[i]),
                "vx_buffer_create(resource)");
       uint64_t dev_addr = 0;
@@ -673,6 +739,62 @@ vp_launch(vx_device_h dev,
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
    argblk[1] = desc_dev;
 
+   /* Relocate each raw shader-buffer slot into the device and record its data
+    * address in arg[VP_ARG_SSBO_BASE + slot]. Upload-only (input buffers). */
+   for (uint32_t s = 0; s < num_ssbos; s++) {
+      unsigned slot = ssbos[s].slot;
+      if (slot >= VP_MAX_SSBO || !ssbos[s].host || !ssbos[s].size)
+         continue;
+      /* The RT trace-ray command buffer (VkTraceRaysIndirectCommand2KHR)
+       * embeds SBT shader-record *device addresses* that lavapipe fills with
+       * HOST pointers -- the megashader dereferences the raygen record on-
+       * device to select the raygen (gld==raygen-id) and would read garbage.
+       * Copy each present SBT record to device memory and rewrite its pointer
+       * in a private copy of the command buffer before upload. */
+      const void *upload = ssbos[s].host;
+      if (ssbos[s].trace_cmd && ssbos[s].size >= 96) {
+         /* {device-address offset, size-field offset} for each SBT region:
+          * raygen, miss, hit, callable (offsets per the Vulkan struct). */
+         static const struct { uint32_t addr_off, size_off; } sbt[4] = {
+            { 0, 8 }, { 16, 24 }, { 40, 48 }, { 64, 72 },
+         };
+         cmd_copy[slot] = malloc(ssbos[s].size);
+         if (!cmd_copy[slot]) {
+            mesa_loge("vortexpipe: launch: trace-cmd copy OOM");
+            goto done;
+         }
+         memcpy(cmd_copy[slot], ssbos[s].host, ssbos[s].size);
+         for (unsigned r = 0; r < 4; r++) {
+            uint64_t haddr;
+            uint64_t rsize;
+            memcpy(&haddr, cmd_copy[slot] + sbt[r].addr_off, sizeof haddr);
+            memcpy(&rsize, cmd_copy[slot] + sbt[r].size_off, sizeof rsize);
+            if (!haddr || !rsize || rsize > (1u << 20) ||
+                n_sbt >= VP_MAX_SSBO * 4)
+               continue;
+            vx_buffer_h *rb = &sbt_res[n_sbt++];
+            VP_CHECK(vx_buffer_create(dev, (uint32_t)rsize, 0, rb),
+                     "vx_buffer_create(sbt)");
+            uint64_t rdev = 0;
+            VP_CHECK(vx_buffer_address(*rb, &rdev), "vx_buffer_address(sbt)");
+            VP_CHECK(vx_enqueue_write(q, *rb, 0, (void *)(uintptr_t)haddr,
+                                      (uint32_t)rsize, 0, NULL, NULL),
+                     "vx_enqueue_write(sbt)");
+            memcpy(cmd_copy[slot] + sbt[r].addr_off, &rdev, sizeof rdev);
+         }
+         upload = cmd_copy[slot];
+      }
+
+      VP_CHECK(vx_buffer_create(dev, ssbos[s].size, 0, &sres[slot]),
+               "vx_buffer_create(ssbo)");
+      uint64_t sdev = 0;
+      VP_CHECK(vx_buffer_address(sres[slot], &sdev), "vx_buffer_address(ssbo)");
+      VP_CHECK(vx_enqueue_write(q, sres[slot], 0, (void *)(uintptr_t)upload,
+                                ssbos[s].size, 0, NULL, NULL),
+               "vx_enqueue_write(ssbo)");
+      argblk[VP_ARG_SSBO_BASE + slot] = sdev;
+   }
+
    /* dispatch */
    uint32_t ndim = (grid[2] > 1 || block[2] > 1) ? 3
                  : (grid[1] > 1 || block[1] > 1) ? 2 : 1;
@@ -699,6 +821,12 @@ vp_launch(vx_device_h dev,
    ok = true;
 
 done:
+   for (uint32_t i = 0; i < VP_MAX_SSBO; i++)
+      if (sres[i]) vx_buffer_release(sres[i]);
+   for (uint32_t i = 0; i < n_sbt; i++)
+      if (sbt_res[i]) vx_buffer_release(sbt_res[i]);
+   for (uint32_t i = 0; i < VP_MAX_SSBO; i++)
+      free(cmd_copy[i]);
    for (uint32_t i = 0; i < VP_MAX_DESCS; i++)
       if (res[i]) vx_buffer_release(res[i]);
    for (unsigned i = 0; i < asc.n_bufs; i++)

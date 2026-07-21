@@ -33,6 +33,7 @@
 #include "nir.h"
 #include "compiler/glsl_types.h"
 #include "util/log.h"
+#include "util/format/u_formats.h"
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
@@ -1083,6 +1084,49 @@ emit_scratch_base(struct vp_tr *t)
    return t->scratch_base;
 }
 
+/* lp_jit_image field byte offsets inside a struct lp_descriptor slot. The image
+ * union member starts at offset 0, so base aliases an SSBO's data pointer and is
+ * read the same way (*(i64*)desc). vp_launch rewrites base host->device. */
+#define VP_JIT_IMG_BASE        0
+#define VP_JIT_IMG_ROW_STRIDE  24
+#define VP_JIT_IMG_BASE_OFFSET 40
+
+/* Load a 32-bit lp_jit_image field at `byte_off` from the descriptor address. */
+static LLVMValueRef
+img_desc_u32(struct vp_tr *t, LLVMValueRef desc, unsigned byte_off)
+{
+   LLVMValueRef a = LLVMBuildAdd(t->b, desc,
+      LLVMConstInt(LLVMTypeOf(desc), byte_off, false), "");
+   LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+   return LLVMBuildLoad2(t->b, t->i32, p, "imgfld");
+}
+
+/* f32 in [0,1] -> unorm8 (round-to-nearest), value given as its i32 bit pattern. */
+static LLVMValueRef
+f32bits_to_unorm8(struct vp_tr *t, LLVMValueRef vi)
+{
+   LLVMValueRef f   = LLVMBuildBitCast(t->b, vi, t->f32, "");
+   LLVMValueRef z   = LLVMConstReal(t->f32, 0.0);
+   LLVMValueRef one = LLVMConstReal(t->f32, 1.0);
+   f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, f, z, ""), f, z, "");
+   f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, f, one, ""), f, one, "");
+   LLVMValueRef s = LLVMBuildFAdd(t->b,
+      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, 255.0), ""),
+      LLVMConstReal(t->f32, 0.5), "");
+   LLVMValueRef b = LLVMBuildFPToUI(t->b, s, t->i32, "");
+   return LLVMBuildAnd(t->b, b, LLVMConstInt(t->i32, 0xff, false), "");
+}
+
+/* unorm8 (low byte of `word`) -> f32 in [0,1], returned as its i32 bit pattern. */
+static LLVMValueRef
+unorm8_to_f32bits(struct vp_tr *t, LLVMValueRef word)
+{
+   LLVMValueRef byte = LLVMBuildAnd(t->b, word, LLVMConstInt(t->i32, 0xff, false), "");
+   LLVMValueRef f = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte, t->f32, ""),
+                                 LLVMConstReal(t->f32, 1.0 / 255.0), "");
+   return LLVMBuildBitCast(t->b, f, t->i32, "");
+}
+
 static void
 emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
 {
@@ -1165,10 +1209,13 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_ubo: {
       LLVMValueRef base;
       if (in->intrinsic == nir_intrinsic_load_ubo &&
-          (!t->is_fs || nir_src_is_const(in->src[0]))) {
+          nir_src_is_const(in->src[0])) {
          /* Constant-buffer index form: base = arg[index] read directly. Push
-          * constants (load_ubo(0, off)) take this path in the FS too (src[0] is
-          * the constant 0); the compute AS descriptor read is unchanged. */
+          * constants (load_ubo(0, off)) take this path (src[0] is the constant
+          * 0); the compute acceleration-structure read load_ubo(1, 0) does too
+          * (src[0] is the constant cbuf index). A UBO reached through a computed
+          * const_buf_base+binding address (src[0] non-constant, both FS and
+          * compute) is a descriptor dereference — the else branch below. */
          if (t->arg) {
             LLVMValueRef idx = intr_src(t, in, 0);
             LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
@@ -1176,12 +1223,27 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          } else {
             base = LLVMConstInt(t->i64, 0, false);
          }
+      } else if (in->intrinsic == nir_intrinsic_load_ssbo &&
+                 nir_src_is_const(in->src[0])) {
+         /* Raw shader-buffer slot: a constant src[0] is a set_shader_buffers
+          * binding index (not a descriptor address), so its data base is
+          * arg[VP_ARG_SSBO_BASE + slot] directly — no descriptor dereference.
+          * lavapipe binds the RT trace-ray command buffer this way and reads it
+          * as load_ssbo(imm 0, off); vp_launch relocates it into that arg slot. */
+         unsigned slot = (unsigned)nir_src_as_uint(in->src[0]);
+         if (t->arg && slot < VP_MAX_SSBO) {
+            LLVMValueRef idx = LLVMConstInt(t->i64, VP_ARG_SSBO_BASE + slot, false);
+            LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
+            base = LLVMBuildLoad2(t->b, t->i64, gep, "ssbobase");
+         } else {
+            base = LLVMConstInt(t->i64, 0, false);
+         }
       } else {
          /* Descriptor-address form: src[0] is a descriptor's device address —
-          * load_ssbo, and the lavapipe FS UBO, whose NIR is
+          * load_ssbo, and a UBO (FS or compute) whose NIR is
           * load_ubo(load_const_buf_base_addr_lvp(set)+binding, off). The buffer's
           * data base is the descriptor's lp_jit_buffer.ptr (its first 8 bytes),
-          * which vp_raster relocates host->device before upload. */
+          * which vp_launch relocates host->device before upload. */
          LLVMValueRef desc = intr_src(t, in, 0);              /* descriptor addr */
          LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
          base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase"); /* lp_jit_buffer.ptr */
@@ -1201,10 +1263,24 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    }
    case nir_intrinsic_store_ssbo: {
       /* operand 1 is the buffer descriptor's device address; the data
-       * pointer is its first 8 bytes (see load_ssbo above). */
-      LLVMValueRef desc = intr_src(t, in, 1);
-      LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
-      LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase");
+       * pointer is its first 8 bytes (see load_ssbo above). A constant
+       * operand 1 is a raw shader-buffer slot: its data base is
+       * arg[VP_ARG_SSBO_BASE + slot] directly (see load_ssbo). */
+      LLVMValueRef base;
+      if (nir_src_is_const(in->src[1])) {
+         unsigned slot = (unsigned)nir_src_as_uint(in->src[1]);
+         if (t->arg && slot < VP_MAX_SSBO) {
+            LLVMValueRef idx = LLVMConstInt(t->i64, VP_ARG_SSBO_BASE + slot, false);
+            LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
+            base = LLVMBuildLoad2(t->b, t->i64, gep, "ssbobase");
+         } else {
+            base = LLVMConstInt(t->i64, 0, false);
+         }
+      } else {
+         LLVMValueRef desc = intr_src(t, in, 1);
+         LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
+         base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase");
+      }
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 2),
                                         t->i64, "");
       LLVMValueRef addr = emit_store_addr(t, LLVMBuildAdd(t->b, base, off, ""));
@@ -1623,6 +1699,90 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMBuildStore(t->b,
          LLVMBuildSelect(t->b, cond, LLVMConstInt(t->i32, 0, false), cur, "live"),
          t->fs_live);
+      break;
+   }
+   /* Storage-image load/store. The image is a bindless descriptor whose device
+    * address is src[0]; the pixel address is base + base_offset + x*bpp +
+    * y*row_stride (single-mip 2D; z and multi-level strides are unused by the
+    * RT output/accumulation images). The RT path uses two formats: the
+    * accumulation image is RGBA32F (four 32-bit lanes stored verbatim) and the
+    * tonemapped output image is RGBA8_UNORM (four bytes packed into one word).
+    * Any other format fails loud rather than writing wrong pixels. */
+   case nir_intrinsic_image_load:
+   case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_image_store:
+   case nir_intrinsic_bindless_image_store: {
+      bool store = (in->intrinsic == nir_intrinsic_image_store ||
+                    in->intrinsic == nir_intrinsic_bindless_image_store);
+      enum pipe_format fmt = nir_intrinsic_format(in);
+      unsigned bpp;
+      bool is_f32;
+      if (fmt == PIPE_FORMAT_R32G32B32A32_FLOAT) {
+         bpp = 16; is_f32 = true;
+      } else if (fmt == PIPE_FORMAT_R8G8B8A8_UNORM) {
+         bpp = 4;  is_f32 = false;
+      } else {
+         mesa_logw("vortexpipe: image %s: unsupported format %d "
+                   "(RGBA32F / RGBA8_UNORM only)", store ? "store" : "load", fmt);
+         t->ok = false;
+         break;
+      }
+      LLVMValueRef desc = intr_src(t, in, 0);
+      LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
+      LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "imgbase");
+      LLVMValueRef boff = LLVMBuildZExt(t->b,
+         img_desc_u32(t, desc, VP_JIT_IMG_BASE_OFFSET), t->i64, "");
+      LLVMValueRef row  = LLVMBuildZExt(t->b,
+         img_desc_u32(t, desc, VP_JIT_IMG_ROW_STRIDE), t->i64, "");
+      LLVMValueRef x = LLVMBuildZExt(t->b, ssa_get(t, in->src[1].ssa->index, 0),
+                                     t->i64, "");
+      LLVMValueRef y = LLVMBuildZExt(t->b, ssa_get(t, in->src[1].ssa->index, 1),
+                                     t->i64, "");
+      LLVMValueRef off = LLVMBuildAdd(t->b, boff,
+         LLVMBuildAdd(t->b, LLVMBuildMul(t->b, x, LLVMConstInt(t->i64, bpp, false), ""),
+                            LLVMBuildMul(t->b, y, row, ""), ""), "");
+      LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
+      if (store) {
+         addr = emit_store_addr(t, addr);
+         unsigned nc = nir_src_num_components(in->src[3]);
+         if (is_f32) {
+            for (unsigned c = 0; c < nc; c++) {
+               LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, c);
+               if (!v) continue;
+               LLVMValueRef a = LLVMBuildAdd(t->b, addr,
+                  LLVMConstInt(t->i64, c * 4u, false), "");
+               LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            }
+         } else {
+            LLVMValueRef packed = LLVMConstInt(t->i32, 0, false);
+            for (unsigned c = 0; c < nc; c++) {
+               LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, c);
+               if (!v) continue;
+               LLVMValueRef b = f32bits_to_unorm8(t, v);
+               packed = LLVMBuildOr(t->b, packed,
+                  LLVMBuildShl(t->b, b, LLVMConstInt(t->i32, c * 8u, false), ""), "");
+            }
+            LLVMBuildStore(t->b, packed, LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
+         }
+      } else {
+         if (is_f32) {
+            LLVMTypeRef lt = ity(t, in->def.bit_size);
+            for (unsigned c = 0; c < in->def.num_components; c++) {
+               LLVMValueRef a = LLVMBuildAdd(t->b, addr,
+                  LLVMConstInt(t->i64, c * 4u, false), "");
+               LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+               ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "img"));
+            }
+         } else {
+            LLVMValueRef packed = LLVMBuildLoad2(t->b, t->i32,
+               LLVMBuildIntToPtr(t->b, addr, t->ptr, ""), "img");
+            for (unsigned c = 0; c < in->def.num_components; c++) {
+               LLVMValueRef w = LLVMBuildLShr(t->b, packed,
+                  LLVMConstInt(t->i32, c * 8u, false), "");
+               ssa_set(t, in->def.index, c, unorm8_to_f32bits(t, w));
+            }
+         }
+      }
       break;
    }
    default:
@@ -3264,6 +3424,17 @@ vp_scan_descriptors(struct nir_shader *nir,
                 * data pointer must be relocated like a load/store_ssbo. */
                off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                break;
+            case nir_intrinsic_image_load:
+            case nir_intrinsic_bindless_image_load:
+            case nir_intrinsic_image_store:
+            case nir_intrinsic_bindless_image_store:
+               /* storage image: src[0] is the bindless descriptor address, in
+                * the same const_buf_base+binding form as an SSBO. lp_jit_image
+                * sizing (height*row_stride) is done in the launch relocation. */
+               off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
+               kind = VP_DESC_IMAGE;
+               elem_bytes = 0;
+               break;
             case nir_intrinsic_load_ubo:
                if (nir->info.stage == MESA_SHADER_FRAGMENT) {
                   /* A fragment UBO is a buffer descriptor reached via
@@ -3275,15 +3446,26 @@ vp_scan_descriptors(struct nir_shader *nir,
                      continue;
                   off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                   elem_bytes = 4;
-               } else {
-                  /* compute: lavapipe lowers an acceleration-structure read to
-                   * load_ubo(cbuf_index, byte_offset). */
+               } else if (nir_intrinsic_range(in) == -1) {
+                  /* compute: lavapipe reads the acceleration-structure handle as
+                   * an UNBOUNDED ubo (range == -1), so only that read is an AS —
+                   * src[0] is the constant cbuf index and off is 0. */
                   if (nir_src_is_const(in->src[1]))
                      off = (int)nir_src_as_uint(in->src[1]);
                   if (nir_src_is_const(in->src[0]))
                      cbuf_index = (unsigned)nir_src_as_uint(in->src[0]);
                   kind = VP_DESC_AS;
                   elem_bytes = 0;
+               } else {
+                  /* compute: a finite-range load_ubo is a data UBO (camera /
+                   * scene uniforms) reached through load_ubo(const_buf_base(set)
+                   * +binding, off) — the same descriptor-dereference form as the
+                   * FS UBO. Relocate its lp_jit_buffer.ptr like an SSBO so the
+                   * shader dereferences on-device. A constant src[0] is a push
+                   * constant (bound inline, no descriptor): vp_desc_addr_offset
+                   * returns -1 and it is skipped below. num_elements is dwords. */
+                  off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
+                  elem_bytes = 4;
                }
                break;
             default:
@@ -3308,4 +3490,34 @@ vp_scan_descriptors(struct nir_shader *nir,
       }
    }
    *num_out = n;
+}
+
+/* Bitmask of set_shader_buffers slots the shader reads as a CONSTANT-index
+ * load_ssbo(imm slot, off). That form is unique to a raw shader buffer bound
+ * outside set-0 (the RT trace-ray command buffer via lvp_push_internal_buffer);
+ * ordinary SSBOs reach the data through a descriptor address (non-const src0).
+ * vp_launch uses this to relocate the SBT shader-record device pointers that
+ * live inside that command buffer. */
+unsigned
+vp_scan_trace_cmd_slots(struct nir_shader *nir)
+{
+   unsigned slots = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(blk, impl) {
+         nir_foreach_instr(instr, blk) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if ((in->intrinsic == nir_intrinsic_load_ssbo ||
+                 in->intrinsic == nir_intrinsic_store_ssbo) &&
+                nir_src_is_const(in->src[in->intrinsic == nir_intrinsic_store_ssbo ? 1 : 0])) {
+               unsigned slot = (unsigned)nir_src_as_uint(
+                  in->src[in->intrinsic == nir_intrinsic_store_ssbo ? 1 : 0]);
+               if (slot < 32)
+                  slots |= (1u << slot);
+            }
+         }
+      }
+   }
+   return slots;
 }

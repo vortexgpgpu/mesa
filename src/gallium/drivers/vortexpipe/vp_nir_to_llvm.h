@@ -54,12 +54,30 @@ bool vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
 /* Release a string returned via vp_nir_to_llvm()'s out_ir. */
 void vp_free_ir(char *ir);
 
+/* Kernel argument-block ABI (kernel_main(ptr arg) reads arg[i] as an i64
+ * device address). Shared contract between vp_nir_to_llvm (emits arg[i]
+ * reads) and vp_launch (fills argblk[i]):
+ *   arg[0]                       -- push constants
+ *   arg[1]                       -- set-0 descriptor blob (constant-buffer 1)
+ *   arg[VP_ARG_SSBO_BASE + slot] -- data address of a raw compute shader
+ *                                   buffer bound at set_shader_buffers slot
+ *                                   `slot`. Distinct from the descriptor-set
+ *                                   SSBO path (those live in the set-0 blob):
+ *                                   this is for internal buffers lavapipe binds
+ *                                   directly, e.g. the RT trace-ray command
+ *                                   buffer read as load_ssbo(imm slot, off). */
+#define VP_ARG_SSBO_BASE 4
+#define VP_MAX_SSBO      4
+#define VP_ARG_SLOTS     (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
+
 /* A descriptor a compute kernel reaches through set-0's descriptor
  * buffer (constant-buffer index 1):
  *  - VP_DESC_BUFFER: an SSBO -- lp_jit_buffer{ptr,size} at `offset`.
  *  - VP_DESC_AS: an acceleration structure -- accel_struct device
- *    address at `offset`. */
-enum vp_desc_kind { VP_DESC_BUFFER, VP_DESC_AS };
+ *    address at `offset`.
+ *  - VP_DESC_IMAGE: a storage image -- lp_jit_image at `offset`; base at +0
+ *    (aliases lp_jit_buffer.ptr), size derived from height*row_stride. */
+enum vp_desc_kind { VP_DESC_BUFFER, VP_DESC_AS, VP_DESC_IMAGE };
 struct vp_desc {
    unsigned          offset;   /* byte offset in the descriptor buffer */
    /* The constant-buffer index holding this descriptor = descriptor set + 1
@@ -71,7 +89,7 @@ struct vp_desc {
    /* Byte multiplier for the descriptor's lp_jit_buffer.num_elements field (at
     * +8): an SSBO stores num_elements in bytes (1), a UBO in dwords (4, from
     * lp_jit_buffer_from_pipe_const's DIV_ROUND_UP(size, sizeof(float))). Used
-    * by the FS descriptor relocation to size the device upload; 0 for AS. */
+    * by the descriptor relocation to size the device upload; 0 for AS/image. */
    unsigned          elem_bytes;
 };
 #define VP_MAX_DESCS 16
@@ -82,6 +100,10 @@ struct vp_desc {
  * VP_MAX_DESCS. */
 void vp_scan_descriptors(struct nir_shader *nir,
                          struct vp_desc *out, unsigned *num_out);
+
+/* Bitmask of set_shader_buffers slots read via constant-index load_ssbo/
+ * store_ssbo (the RT trace-ray command buffer). See the definition. */
+unsigned vp_scan_trace_cmd_slots(struct nir_shader *nir);
 
 /* Lower Vulkan ray-query / ray-tracing NIR (rq_* and trace_ray, left
  * intact by lavapipe when the driver advertises driver_ray_queries) into

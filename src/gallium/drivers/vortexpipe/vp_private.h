@@ -79,6 +79,10 @@ struct vp_cso {
     * memory, no control barrier, fixed size), so a workgroup larger than the
     * device CTA cap can be re-tiled into several device CTAs at launch. */
    bool workgroup_shape_invariant;
+   /* compute: bitmask of set_shader_buffers slots the kernel reads as a
+    * const-index load_ssbo(imm slot, off) -- the RT trace-ray command buffer,
+    * whose embedded SBT shader-record pointers need device relocation. */
+   uint32_t trace_cmd_slots;
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
    struct vp_desc descs[VP_MAX_DESCS];  /* set-0 descriptors the kernel uses */
    unsigned        num_descs;
@@ -177,6 +181,13 @@ struct vp_context {
    struct pipe_resource *fs_cbuf[8];
    unsigned              fs_cbuf_off[8];
    unsigned              fs_cbuf_sz[8];
+   /* Raw compute shader buffers bound via set_shader_buffers (distinct from
+    * the descriptor-set SSBOs, which live in the set-0 blob at cbuf[1]).
+    * lavapipe binds internal buffers here — e.g. the RT trace-ray command
+    * buffer at slot 0 — and the kernel reads them as load_ssbo(imm slot). */
+   struct pipe_resource *sbuf[VP_MAX_SSBO];
+   unsigned              sbuf_off[VP_MAX_SSBO];
+   unsigned              sbuf_sz[VP_MAX_SSBO];
    void *(*lp_create_compute_state)(struct pipe_context *,
                                     const struct pipe_compute_state *);
    void  (*lp_bind_compute_state)(struct pipe_context *, void *);
