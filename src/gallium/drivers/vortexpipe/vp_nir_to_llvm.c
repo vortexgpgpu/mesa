@@ -413,6 +413,18 @@ emit_cttz(struct vp_tr *t, LLVMValueRef v)
    return LLVMBuildCall2(t->b, fty, fn, a, 2, "cttz");
 }
 
+/* llvm.bitreverse.i32 (reverse bit order) -> Vortex has no native op; the RISC-V
+ * backend expands it, but declaring the intrinsic keeps codegen one node wide. */
+static LLVMValueRef
+emit_bitreverse(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef  fty = LLVMFunctionType(t->i32, &t->i32, 1, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.bitreverse.i32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.bitreverse.i32", fty);
+   return LLVMBuildCall2(t->b, fty, fn, &v, 1, "bitreverse");
+}
+
 /* vx ballot (custom-0, funct3=3, funct7=1): rd = per-lane predicate reduced to
  * a warp bitmask (bit i = lane i's predicate). Side-effecting so the optimizer
  * cannot hoist it across the divergent control flow whose mask it reports. */
@@ -966,6 +978,10 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
       /* Float width conversions. Drive off the NIR source/dest bit sizes (not the
        * LLVM operand type — a 16-bit float shares the i32 lane rep with f32) so
        * f2f16/f2f32/f2f64 pick the right FPExt/FPTrunc/identity in every case. */
+      /* f2f16_rtne is f2f16 with an explicit round-to-nearest-even request;
+       * from_float's FPTrunc-to-half already rounds RTNE under the default mode,
+       * so it shares the f2f16 path. SPIR-V OpQuantizeToF16 lowers to this. */
+      case nir_op_f2f16_rtne:
       case nir_op_f2f16:
       case nir_op_f2f32:
       case nir_op_f2f64: {
@@ -1124,6 +1140,19 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
       case nir_op_bit_count:
          r = emit_ctpop(t, alu_src(t, alu, 0, c));
          break;
+      case nir_op_bitfield_reverse:
+         r = emit_bitreverse(t, alu_src(t, alu, 0, c));
+         break;
+      /* find_lsb: index of the lowest set bit, -1 when the source is 0. cttz(0)
+       * is 32 (zero-is-not-poison), so a zero source is mapped to -1 explicitly. */
+      case nir_op_find_lsb: {
+         LLVMValueRef v  = alu_src(t, alu, 0, c);
+         LLVMValueRef tz = emit_cttz(t, v);
+         r = LLVMBuildSelect(t->b,
+             LLVMBuildICmp(t->b, LLVMIntEQ, v, LLVMConstInt(t->i32, 0, false), ""),
+             LLVMConstInt(t->i32, -1, true), tz, "find_lsb");
+         break;
+      }
       case nir_op_fpow: {
          unsigned bs = alu->def.bit_size;
          LLVMValueRef x = as_float(t, alu_src(t, alu, 0, c), bs);
@@ -2702,7 +2731,7 @@ emit_store_i32(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef val)
 static LLVMValueRef
 emit_vx_frag_payload(struct vp_tr *t, unsigned word)
 {
-   return emit_csr_read(t, word ? VX_CSR_FRAG_PID : VX_CSR_FRAG_POSMASK,
+   return emit_csr_read(t, word ? VX_CSR_FRAG_PID : VX_CSR_FRAG_POS,
                         word ? "frag_pid" : "frag_pos");
 }
 
