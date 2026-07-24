@@ -13,6 +13,7 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -112,8 +113,20 @@ vp_create_compute_state(struct pipe_context *pipe,
    /* Translate NIR -> LLVM IR -> Vortex .vxbin and retain it. */
    if (state->ir_type == PIPE_SHADER_IR_NIR) {
       char *ir = NULL;
+      struct nir_shader *cs_nir = (struct nir_shader *)state->prog;
+      /* VK_KHR_zero_initialize_workgroup_memory: a `shared` var with a null
+       * initializer must read back as zero. Vortex LMEM is not cleared between
+       * dispatches, so emit the standard cooperative zeroing pass (store_shared
+       * of zeros strided by local_invocation_index + a workgroup barrier). Align
+       * the region up to the 16B store granularity; the LMEM allocation below
+       * picks up the aligned size so the zeroing never runs past it. */
+      if (cs_nir->info.zero_initialize_shared_memory && cs_nir->info.shared_size > 0) {
+         cs_nir->info.shared_size = (cs_nir->info.shared_size + 15u) & ~15u;
+         NIR_PASS(_, cs_nir, nir_zero_initialize_shared_memory,
+                  cs_nir->info.shared_size, /*chunk_size=*/16);
+      }
       /* shared-memory size -> the launch's local-memory allocation. */
-      const struct shader_info *si = &((struct nir_shader *)state->prog)->info;
+      const struct shader_info *si = &cs_nir->info;
       cso->lmem_size = si->shared_size;
       /* A workgroup with no shared memory, no control barrier and a fixed
        * size has independent invocations, so it can be re-tiled to fit the
@@ -236,6 +249,22 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    struct vp_screen *vps = vp_reg_get(pipe->screen);
    uint32_t block_size = info->block[0] * info->block[1] * info->block[2];
 
+   /* Empty dispatch: any zero grid or block dimension means zero workgroups /
+    * zero invocations, which is defined to do nothing. Return before touching
+    * the device — dispatching a zero-extent grid would otherwise fire warps
+    * that write garbage. (Indirect dispatch reads its extent from a buffer at
+    * device time, so it is not shape-checked here.) */
+   if (!info->indirect) {
+      uint32_t grid_size = info->grid[0] * info->grid[1] * info->grid[2];
+      if (grid_size == 0 || block_size == 0) {
+         vp_dbg("vortexpipe: launch_grid: empty dispatch grid=[%u,%u,%u] "
+                "block=[%u,%u,%u] — no-op",
+                info->grid[0], info->grid[1], info->grid[2],
+                info->block[0], info->block[1], info->block[2]);
+         return;
+      }
+   }
+
    /* The grid/block actually dispatched. When a shape-invariant workgroup
     * exceeds the device CTA cap, re-tile it into device-sized CTAs in place
     * of the app's oversized one; otherwise dispatch the app's shape. */
@@ -265,6 +294,29 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
                    vps->hw_num_threads, vps->hw_num_warps);
          goto fallback;
       }
+   }
+
+   /* Indirect dispatch: the workgroup counts are not in info->grid but in a
+    * device buffer at indirect_offset (three uint32 x/y/z). Read them and
+    * dispatch that grid; a zero count is an empty (no-op) dispatch. Without
+    * this the stale info->grid is dispatched (wrong workgroup count). */
+   uint32_t ind_grid[3];
+   if (info->indirect) {
+      struct pipe_transfer *ixfer = NULL;
+      const uint32_t *counts = (const uint32_t *)pipe_buffer_map_range(
+         pipe, info->indirect, info->indirect_offset,
+         3 * sizeof(uint32_t), PIPE_MAP_READ, &ixfer);
+      if (!counts)
+         goto fallback;
+      ind_grid[0] = counts[0];
+      ind_grid[1] = counts[1];
+      ind_grid[2] = counts[2];
+      pipe_buffer_unmap(pipe, ixfer);
+      if (ind_grid[0] == 0 || ind_grid[1] == 0 || ind_grid[2] == 0) {
+         vp_dbg("vortexpipe: launch_grid: empty indirect dispatch — no-op");
+         return;
+      }
+      eff_grid = ind_grid;
    }
 
    /* Run on Vortex when the kernel compiled and we have set 0's
@@ -312,7 +364,8 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
                                    (uint8_t *)desc_host + vp->cbuf_off[1],
                                    desc_bytes, cso->descs, cso->num_descs,
                                    ssbos, num_ssbos,
-                                   eff_grid, eff_block, cso->lmem_size,
+                                   eff_grid, eff_block, info->grid_base,
+                                   cso->lmem_size,
                                    vps && vps->has_rtu);
          for (unsigned s = 0; s < VP_MAX_SSBO; s++)
             if (sxfer[s])
@@ -322,11 +375,13 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    }
 
    if (ran_on_vortex) {
+      vp->launches_device++;
       vp_dbg("vortexpipe: launch_grid ran on Vortex");
       return;
    }
 
 fallback:
+   vp->launches_cpu++;
    if (vp_strict_mode()) {
       /* Refuse the silent llvmpipe fallback: the test harness catches
        * mesa_loge and fails the test, instead of green-lighting CPU
@@ -1866,6 +1921,7 @@ vp_draw_vbo(struct pipe_context *pipe,
             if (cbxfer[i]) pipe_buffer_unmap(pipe, cbxfer[i]);
          if (drew) {
             vp->rfb_dirty = true;   /* device colour ahead of the resource */
+            vp->draws_device++;
             vp_dbg("vortexpipe: draw_vbo -> Vortex VS+RASTER+OM (one OP_DRAW) "
                    "(%u verts, %ux%u, depth_test=%d, textured=%d)",
                    count, w, h, om.depth_test, tex_used);
@@ -1918,6 +1974,7 @@ vp_draw_vbo(struct pipe_context *pipe,
 
 llvmpipe:
    /* inherit-and-accelerate fallback */
+   vp->draws_cpu++;
    if (vp_strict_mode()) {
       mesa_loge("vortexpipe: draw_vbo: Vortex path unavailable, "
                 "STRICT mode refuses llvmpipe fallback");
@@ -1944,6 +2001,13 @@ vp_context_destroy(struct pipe_context *pipe)
 {
    struct vp_context *vp = vp_reg_get(pipe);
    void (*lp_destroy)(struct pipe_context *) = vp->lp_context_destroy;
+
+   /* Work placement for this context, in one machine-readable line the smoke
+    * harness greps: <on device>/<total> for each of dispatch and draw. */
+   if (getenv("VORTEXPIPE_ATTRIB"))
+      fprintf(stderr, "vortexpipe-attrib: launches=%u/%u draws=%u/%u\n",
+              vp->launches_device, vp->launches_device + vp->launches_cpu,
+              vp->draws_device, vp->draws_device + vp->draws_cpu);
 
    /* release the cached draw-integration objects (need a
     * live pipe) */

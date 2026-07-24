@@ -58,6 +58,7 @@ bool vp_launch(vx_device_h dev,
                const struct vp_desc *descs, uint32_t num_descs,
                const struct vp_ssbo *ssbos, uint32_t num_ssbos,
                const uint32_t grid[3], const uint32_t block[3],
+               const uint32_t grid_base[3],
                uint32_t lmem_size, bool has_rtu);
 
 /* The vertex-buffer geometry feeding a VS kernel: a single interleaved

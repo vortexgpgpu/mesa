@@ -101,6 +101,66 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
    return vps->lp_finalize_nir(screen, nir);
 }
 
+/* Colour formats the device path renders and samples. The fixed-function
+ * texture unit reads packed-integer formats only and the output merger writes
+ * A8R8G8B8, so a render target or sampled texture outside this set would be
+ * reinterpreted rather than converted -- wrong pixels with no error. Report
+ * those unsupported so Vulkan skips them instead. */
+static bool
+vp_device_format_supported(enum pipe_format format, unsigned usage)
+{
+   const unsigned render_or_sample = PIPE_BIND_RENDER_TARGET |
+                                     PIPE_BIND_DEPTH_STENCIL |
+                                     PIPE_BIND_SAMPLER_VIEW;
+   if (!(usage & render_or_sample))
+      return true;   /* buffer / vertex / transfer use is format-agnostic here */
+
+   switch (format) {
+   /* output-merger colour + the sampler's 32-bit source format */
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   /* packed-integer texture formats the fixed-function sampler decodes */
+   case PIPE_FORMAT_B5G6R5_UNORM:
+   case PIPE_FORMAT_B5G5R5A1_UNORM:
+   case PIPE_FORMAT_B4G4R4A4_UNORM:
+   case PIPE_FORMAT_L8A8_UNORM:
+   case PIPE_FORMAT_L8_UNORM:
+   case PIPE_FORMAT_A8_UNORM:
+   /* depth/stencil the output merger tests and writes */
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+   case PIPE_FORMAT_Z16_UNORM:
+   case PIPE_FORMAT_Z32_FLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+vp_screen_is_format_supported(struct pipe_screen *screen,
+                              enum pipe_format format,
+                              enum pipe_texture_target target,
+                              unsigned sample_count,
+                              unsigned storage_sample_count,
+                              unsigned usage)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (!vps->lp_is_format_supported(screen, format, target, sample_count,
+                                    storage_sample_count, usage))
+      return false;
+   /* Without a Vortex device this screen is plain llvmpipe; keep its answer. */
+   if (!vps->dev)
+      return true;
+   /* The device path is single-sample (see the multisample features reported
+    * off in lvp_device.c). */
+   if (sample_count > 1 || storage_sample_count > 1)
+      return false;
+   return vp_device_format_supported(format, usage);
+}
+
 struct pipe_screen *
 vortexpipe_create_screen(struct sw_winsys *winsys)
 {
@@ -149,16 +209,18 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    }
 
    /* Patch the entry points vortexpipe intercepts; record originals. */
-   vps->lp_context_create  = screen->context_create;
-   vps->lp_screen_destroy  = screen->destroy;
-   vps->lp_screen_get_name = screen->get_name;
-   vps->lp_finalize_nir    = screen->finalize_nir;
+   vps->lp_context_create      = screen->context_create;
+   vps->lp_screen_destroy      = screen->destroy;
+   vps->lp_screen_get_name     = screen->get_name;
+   vps->lp_finalize_nir        = screen->finalize_nir;
+   vps->lp_is_format_supported = screen->is_format_supported;
    vp_reg_put(screen, vps);
 
-   screen->context_create = vp_context_create;
-   screen->destroy        = vp_screen_destroy;
-   screen->get_name       = vp_screen_get_name;
-   screen->finalize_nir   = vp_finalize_nir;
+   screen->context_create      = vp_context_create;
+   screen->destroy             = vp_screen_destroy;
+   screen->get_name            = vp_screen_get_name;
+   screen->finalize_nir        = vp_finalize_nir;
+   screen->is_format_supported = vp_screen_is_format_supported;
 
    /* Clamp llvmpipe's compute caps to the Vortex hardware cap so well-
     * behaved Vulkan apps that read maxComputeWorkGroupSize /
@@ -193,6 +255,15 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
     * vortexpipe to lower (vp_nir_lower_ray_tracing_to_rtu) instead of
     * expanding them to a software BVH walk. */
    ((struct pipe_caps *)&screen->caps)->driver_ray_queries = vps->has_rtu;
+
+   /* shaderFloat64 must match the device (lvp derives it from caps.doubles).
+    * Only advertise doubles when the Vortex FPU has the RISC-V D extension; an
+    * F-only (FLEN=32) build would otherwise inherit llvmpipe's doubles=1 and
+    * run fp64 shaders on a device that cannot execute them (silent wrong
+    * results, e.g. zero_initialize_workgroup_memory.types.f64* returning
+    * garbage). Without D, honestly report no fp64 so such tests are skipped. */
+   if (vps->dev && !(vps->hw_isa_flags & VX_ISA_STD_D))
+      ((struct pipe_caps *)&screen->caps)->doubles = 0;
 
    vp_dbg("vortexpipe: screen ready (llvmpipe base, Vortex hooks armed)");
    return screen;

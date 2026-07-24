@@ -596,6 +596,7 @@ vp_launch(vx_device_h dev,
           const struct vp_desc *descs, uint32_t num_descs,
           const struct vp_ssbo *ssbos, uint32_t num_ssbos,
           const uint32_t grid[3], const uint32_t block[3],
+          const uint32_t grid_base[3],
           uint32_t lmem_size, bool has_rtu)
 {
    bool ok = false;
@@ -738,6 +739,12 @@ vp_launch(vx_device_h dev,
     * instead of allocating an args buffer. */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
    argblk[1] = desc_dev;
+   /* vkCmdDispatchBase base offset -> gl_WorkGroupID (added in-shader). */
+   if (grid_base) {
+      argblk[VP_ARG_GRID_BASE_XY] = (uint64_t)grid_base[0]
+                                  | ((uint64_t)grid_base[1] << 32);
+      argblk[VP_ARG_GRID_BASE_Z]  = (uint64_t)grid_base[2];
+   }
 
    /* Relocate each raw shader-buffer slot into the device and record its data
     * address in arg[VP_ARG_SSBO_BASE + slot]. Upload-only (input buffers). */
@@ -858,7 +865,11 @@ vp_launch_vs(vx_device_h dev,
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
    vx_buffer_h obuf = NULL, vbuf = NULL, tbuf = NULL;
-   char vxpath[] = "/tmp/vortexpipe-vs.XXXXXX";
+   char vxpath[512];
+   const char *vs_tmpdir = getenv("TMPDIR");
+   if (!vs_tmpdir || !*vs_tmpdir)
+      vs_tmpdir = "/tmp";
+   snprintf(vxpath, sizeof vxpath, "%s/vortexpipe-vs.XXXXXX", vs_tmpdir);
    int  vxfd = -1;
 
    *out_buf  = NULL;

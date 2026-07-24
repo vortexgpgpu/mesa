@@ -287,6 +287,93 @@ emit_fpow(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y)
    return LLVMBuildCall2(t->b, fty, fn, a, 2, "fpow");
 }
 
+static LLVMTypeRef cty(struct vp_tr *t, unsigned bits);
+
+/* Width-aware unary float intrinsic (llvm.<base>.f32/f64). `base` is the
+ * intrinsic stem without the type suffix ("floor","ceil","trunc","round",
+ * "roundeven","exp2","log2","sin","cos"). `fa` is a compute-typed float (from
+ * as_float, always f32/f64 — never half), and the result is the same type; the
+ * caller rounds back to f16 via from_float. The RISC-V backend lowers these to
+ * FPU sequences or libcalls. */
+static LLVMValueRef
+emit_funary_intrin(struct vp_tr *t, const char *base, LLVMValueRef fa,
+                   unsigned bits)
+{
+   const char  *suf = bits == 64 ? "f64" : "f32";
+   char         nm[32];
+   snprintf(nm, sizeof(nm), "llvm.%s.%s", base, suf);
+   LLVMTypeRef  ft  = cty(t, bits);
+   LLVMTypeRef  fnty = LLVMFunctionType(ft, &ft, 1, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, nm);
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, nm, fnty);
+   return LLVMBuildCall2(t->b, fnty, fn, &fa, 1, base);
+}
+
+/* copysign on a compute float: magnitude of `mag`, sign of `sgn`. Implemented
+ * with integer bit ops (clear the sign bit of mag, OR in the sign bit of sgn)
+ * so it lowers cleanly in divergent codegen. Restores the sign of a zero result
+ * from rounding (floor(-0.0) = -0.0, trunc(-0.3) = -0.0, ...). */
+static LLVMValueRef
+emit_fcopysign(struct vp_tr *t, LLVMValueRef mag, LLVMValueRef sgn, unsigned bits)
+{
+   int          is64 = (bits == 64);
+   LLVMTypeRef  it   = is64 ? t->i64 : t->i32;
+   LLVMTypeRef  ft   = is64 ? t->f64 : t->f32;
+   uint64_t     smask = is64 ? 0x8000000000000000ull : 0x80000000ull;
+   LLVMValueRef mb   = LLVMBuildBitCast(t->b, mag, it, "");
+   LLVMValueRef sb   = LLVMBuildBitCast(t->b, sgn, it, "");
+   LLVMValueRef absv = LLVMBuildAnd(t->b, mb,
+                          LLVMConstInt(it, ~smask, false), "");
+   LLVMValueRef sv   = LLVMBuildAnd(t->b, sb,
+                          LLVMConstInt(it, smask, false), "");
+   return LLVMBuildBitCast(t->b, LLVMBuildOr(t->b, absv, sv, ""), ft, "");
+}
+
+/* trunc / floor / ceil, synthesized from fptosi/sitofp. The Vortex LLVM backend
+ * cannot lower llvm.trunc/floor/ceil/round in divergent codegen (they expand to
+ * a rounding pseudo the divergent custom-inserter rejects), but int<->float
+ * converts and float selects lower fine. A value with |x| >= 2^24 (f32) / 2^53
+ * (f64) is already integral, so the round-trip (which would overflow the integer
+ * range) is guarded off and x passes through unchanged. `fa` is a compute float
+ * (f32/f64); the result is the same type. */
+static LLVMValueRef
+emit_ftrunc(struct vp_tr *t, LLVMValueRef fa, unsigned bits)
+{
+   LLVMTypeRef  ft   = cty(t, bits);
+   int          is64 = (bits == 64);
+   LLVMTypeRef  it   = is64 ? t->i64 : t->i32;
+   LLVMValueRef iv   = LLVMBuildFPToSI(t->b, fa, it, "");
+   LLVMValueRef rv   = LLVMBuildSIToFP(t->b, iv, ft, "");
+   LLVMValueRef ax   = emit_funary_intrin(t, "fabs", fa, bits);
+   LLVMValueRef big  = LLVMBuildFCmp(t->b, LLVMRealOGE, ax,
+                          LLVMConstReal(ft, is64 ? 9007199254740992.0
+                                                 : 16777216.0), "");
+   return emit_fcopysign(t, LLVMBuildSelect(t->b, big, fa, rv, "ftrunc"),
+                         fa, bits);
+}
+static LLVMValueRef
+emit_ffloor(struct vp_tr *t, LLVMValueRef fa, unsigned bits)
+{
+   LLVMTypeRef  ft = cty(t, bits);
+   LLVMValueRef tr = emit_ftrunc(t, fa, bits);
+   /* trunc rounds toward zero; for x<tr (negative non-integers) subtract one. */
+   LLVMValueRef gt = LLVMBuildFCmp(t->b, LLVMRealOGT, tr, fa, "");
+   LLVMValueRef m1 = LLVMBuildFSub(t->b, tr, LLVMConstReal(ft, 1.0), "");
+   return emit_fcopysign(t, LLVMBuildSelect(t->b, gt, m1, tr, "ffloor"),
+                         fa, bits);
+}
+static LLVMValueRef
+emit_fceil(struct vp_tr *t, LLVMValueRef fa, unsigned bits)
+{
+   LLVMTypeRef  ft = cty(t, bits);
+   LLVMValueRef tr = emit_ftrunc(t, fa, bits);
+   LLVMValueRef lt = LLVMBuildFCmp(t->b, LLVMRealOLT, tr, fa, "");
+   LLVMValueRef p1 = LLVMBuildFAdd(t->b, tr, LLVMConstReal(ft, 1.0), "");
+   return emit_fcopysign(t, LLVMBuildSelect(t->b, lt, p1, tr, "fceil"),
+                         fa, bits);
+}
+
 /* llvm.ctpop.i32 (population count / set-bit count). */
 static LLVMValueRef
 emit_ctpop(struct vp_tr *t, LLVMValueRef v)
@@ -454,7 +541,15 @@ emit_vx_barrier(struct vp_tr *t)
                                       /*CanThrow*/ false);
    LLVMValueRef a[2] = { emit_csr_read(t, VX_CSR_CTA_ID,   "cta_id"),
                          emit_csr_read(t, VX_CSR_CTA_SIZE, "cta_warps") };
-   LLVMBuildCall2(t->b, fnty, ia, a, 2, "");
+   LLVMValueRef call = LLVMBuildCall2(t->b, fnty, ia, a, 2, "");
+   /* Mark the barrier convergent: it must execute with the CTA's lanes
+    * converged, so mid-level CFG passes (SimplifyCFG merging two branches on the
+    * same divergent condition) must not duplicate it into, or sink it out of,
+    * divergent control flow. Without this the barrier is placed inside a
+    * divergent if and the workgroup never actually synchronizes. */
+   unsigned conv = LLVMGetEnumAttributeKindForName("convergent", 10);
+   LLVMAddCallSiteAttribute(call, LLVMAttributeFunctionIndex,
+                            LLVMCreateEnumAttribute(t->ctx, conv, 0));
 }
 
 /* VS vertex-input fetch: the device address of attribute `loc` for the
@@ -526,9 +621,99 @@ emit_load_const(struct vp_tr *t, nir_load_const_instr *lc)
  * the translator carries f64 values as i64 bit patterns (rv32 has no
  * D extension; the .vxbin compiler lowers f64 ops to soft-float). */
 static LLVMTypeRef
-fty(struct vp_tr *t, unsigned bits) { return bits == 64 ? t->f64 : t->f32; }
+fty(struct vp_tr *t, unsigned bits) {
+   return bits == 64 ? t->f64
+        : bits == 16 ? LLVMHalfTypeInContext(t->ctx)
+                     : t->f32;
+}
 static LLVMTypeRef
 ity(struct vp_tr *t, unsigned bits) { return bits == 64 ? t->i64 : t->i32; }
+
+/* Compute float type. Vortex has an f32/f64 FPU but NO half hardware (Zfh is
+ * off), and the RISC-V backend cannot lower `half` ops in Vortex's divergent
+ * codegen. So fp16 is computed in f32 exactly as a GPU without native f16 does:
+ * promote to f32, do the op, round the single result back to f16. cty() is the
+ * type the arithmetic runs in (f32 for 16- and 32-bit, f64 for 64-bit). */
+static LLVMTypeRef
+cty(struct vp_tr *t, unsigned bits) { return bits == 64 ? t->f64 : t->f32; }
+
+/* Float ALU operands live in the lane as their IEEE bit pattern in an integer:
+ * i32 for 16- and 32-bit (a 16-bit value occupies the low half), i64 for 64-bit.
+ * as_float() recovers the compute-typed float for an op; from_float() packs a
+ * result back. A 16-bit float is unpacked as its half bit pattern then widened
+ * to f32 for the arithmetic; from_float() truncates the f32 result back to f16
+ * (one correctly-rounded step), so denormals and rounding stay f16-accurate
+ * without ever emitting a native `half` operation. */
+static LLVMValueRef
+as_float(struct vp_tr *t, LLVMValueRef laneval, unsigned bits) {
+   if (bits == 16) {
+      LLVMValueRef h = LLVMBuildTrunc(t->b, laneval,
+                                      LLVMInt16TypeInContext(t->ctx), "");
+      LLVMValueRef hf = LLVMBuildBitCast(t->b, h,
+                                         LLVMHalfTypeInContext(t->ctx), "");
+      return LLVMBuildFPExt(t->b, hf, t->f32, "");
+   }
+   return LLVMBuildBitCast(t->b, laneval, fty(t, bits), "");
+}
+static LLVMValueRef
+from_float(struct vp_tr *t, LLVMValueRef fval, unsigned bits) {
+   if (bits == 16) {
+      LLVMValueRef hf = LLVMBuildFPTrunc(t->b, fval,
+                                         LLVMHalfTypeInContext(t->ctx), "");
+      LLVMValueRef h  = LLVMBuildBitCast(t->b, hf,
+                                         LLVMInt16TypeInContext(t->ctx), "");
+      return LLVMBuildZExt(t->b, h, t->i32, "");
+   }
+   return LLVMBuildBitCast(t->b, fval, ity(t, bits), "");
+}
+
+/* Normalize a `bits`-wide integer held in the i32 lane before a signed (sgn) or
+ * unsigned read. Sub-32-bit arithmetic (iadd/imul/ishl/...) is done in i32 and
+ * can leave dirty high bits, so a signed consumer must sign-extend and an
+ * unsigned consumer must mask from the true width. No-op for >=32-bit sources
+ * or values already at their native LLVM width (i64). */
+static LLVMValueRef
+norm_int_src(struct vp_tr *t, LLVMValueRef v, unsigned bits, bool sgn) {
+   if (bits >= 32 || LLVMTypeOf(v) != t->i32)
+      return v;
+   if (sgn) {
+      unsigned sh = 32 - bits;
+      return LLVMBuildAShr(t->b,
+                LLVMBuildShl(t->b, v, LLVMConstInt(t->i32, sh, false), ""),
+                LLVMConstInt(t->i32, sh, false), "sext");
+   }
+   return LLVMBuildAnd(t->b, v, LLVMConstInt(t->i32, (1u << bits) - 1, false),
+                       "zext");
+}
+
+/* Exact-width integer type for a memory access element (i8/i16/i32/i64).
+ * Distinct from the lane ABI type ity() (only i32/i64): a sub-32-bit access
+ * must touch exactly bit_size/8 bytes. Loading/storing at the wider lane type
+ * would over-read or over-write the neighbouring element — and a widened store
+ * that straddles a 64B device block corrupts memory outright. */
+static LLVMTypeRef
+mem_ty(struct vp_tr *t, unsigned bits) {
+   return LLVMIntTypeInContext(t->ctx, bits);
+}
+
+/* Load a bit_size-wide integer from p, widened (zero-extended) to the lane ABI
+ * type so downstream ops see a normal i32/i64 SSA value. */
+static LLVMValueRef
+vp_load_mem(struct vp_tr *t, unsigned bits, LLVMValueRef p, const char *nm) {
+   LLVMValueRef raw = LLVMBuildLoad2(t->b, mem_ty(t, bits), p, nm);
+   if (bits < 32)
+      return LLVMBuildZExt(t->b, raw, ity(t, bits), "");
+   return raw;
+}
+
+/* Truncate a lane ABI value to the bit_size-wide memory element before storing,
+ * so the backend emits a byte/half store rather than a full word. */
+static LLVMValueRef
+vp_store_mem_val(struct vp_tr *t, unsigned bits, LLVMValueRef v) {
+   if (bits < 32)
+      return LLVMBuildTrunc(t->b, v, mem_ty(t, bits), "");
+   return v;
+}
 
 /* quad-derivative helper (defined with the other Vortex intrinsics, below). */
 static LLVMValueRef emit_quad_deriv(struct vp_tr *t, LLVMValueRef value,
@@ -582,13 +767,13 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          break;
       }
       case nir_op_fadd: case nir_op_fmul: {
-         LLVMTypeRef ft = fty(t, alu->def.bit_size);
-         LLVMValueRef a = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
-         LLVMValueRef b = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c), ft, "");
+         unsigned bs = alu->def.bit_size;
+         LLVMValueRef a = as_float(t, alu_src(t, alu, 0, c), bs);
+         LLVMValueRef b = as_float(t, alu_src(t, alu, 1, c), bs);
          LLVMValueRef res = alu->op == nir_op_fadd
             ? LLVMBuildFAdd(t->b, a, b, "fadd")
             : LLVMBuildFMul(t->b, a, b, "fmul");
-         r = LLVMBuildBitCast(t->b, res, ity(t, alu->def.bit_size), "");
+         r = from_float(t, res, bs);
          break;
       }
       case nir_op_isub:
@@ -632,8 +817,15 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                             : alu->op == nir_op_ige ? LLVMIntSGE
                             : alu->op == nir_op_ult ? LLVMIntULT
                                                     : LLVMIntUGE;
-         LLVMValueRef cmp = LLVMBuildICmp(t->b, p, alu_src(t, alu, 0, c),
-                                          alu_src(t, alu, 1, c), "icmp");
+         /* Normalize sub-32-bit operands by width: signed compares sign-extend,
+          * unsigned/equality mask. Sub-32-bit arithmetic runs in the i32 lane
+          * and leaves dirty high bits (e.g. a 16-bit iadd that overflowed in a
+          * saturating-dot), which would corrupt an i32 icmp. */
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         bool sgn = (alu->op == nir_op_ilt || alu->op == nir_op_ige);
+         LLVMValueRef ca = norm_int_src(t, alu_src(t, alu, 0, c), sbs, sgn);
+         LLVMValueRef cb = norm_int_src(t, alu_src(t, alu, 1, c), sbs, sgn);
+         LLVMValueRef cmp = LLVMBuildICmp(t->b, p, ca, cb, "icmp");
          r = (alu->def.bit_size == 1) ? cmp
            : LLVMBuildSExt(t->b, cmp, t->i32, "");
          break;
@@ -645,9 +837,9 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                              : alu->op == nir_op_fneu ? LLVMRealUNE
                              : alu->op == nir_op_flt ? LLVMRealOLT
                                                      : LLVMRealOGE;
-         LLVMTypeRef ft = fty(t, nir_src_bit_size(alu->src[0].src));
-         LLVMValueRef a = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
-         LLVMValueRef b = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c), ft, "");
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         LLVMValueRef a = as_float(t, alu_src(t, alu, 0, c), sbs);
+         LLVMValueRef b = as_float(t, alu_src(t, alu, 1, c), sbs);
          LLVMValueRef cmp = LLVMBuildFCmp(t->b, p, a, b, "fcmp");
          r = (alu->def.bit_size == 1) ? cmp
            : LLVMBuildSExt(t->b, cmp, t->i32, "");
@@ -688,33 +880,46 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          r = LLVMBuildNeg(t->b, alu_src(t, alu, 0, c), "ineg");
          break;
       /* integer <-> float conversions (floats held as i32 bit patterns) */
-      case nir_op_i2f32:
-         r = LLVMBuildBitCast(t->b,
-            LLVMBuildSIToFP(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->i32, "");
+      case nir_op_i2f16: case nir_op_i2f32: case nir_op_i2f64: {
+         unsigned db  = alu->def.bit_size;
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         LLVMValueRef s = norm_int_src(t, alu_src(t, alu, 0, c), sbs, true);
+         r = from_float(t, LLVMBuildSIToFP(t->b, s, cty(t, db), ""), db);
          break;
-      case nir_op_u2f32:
-         r = LLVMBuildBitCast(t->b,
-            LLVMBuildUIToFP(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->i32, "");
+      }
+      case nir_op_u2f16: case nir_op_u2f32: case nir_op_u2f64: {
+         unsigned db  = alu->def.bit_size;
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         LLVMValueRef s = norm_int_src(t, alu_src(t, alu, 0, c), sbs, false);
+         r = from_float(t, LLVMBuildUIToFP(t->b, s, cty(t, db), ""), db);
          break;
-      case nir_op_f2i32:
-         r = LLVMBuildFPToSI(t->b,
-            LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->i32, "");
+      }
+      case nir_op_f2i8:  case nir_op_f2i16:
+      case nir_op_f2i32: case nir_op_f2i64: {
+         unsigned db = alu->def.bit_size;
+         LLVMValueRef v = LLVMBuildFPToSI(t->b,
+            as_float(t, alu_src(t, alu, 0, c), nir_src_bit_size(alu->src[0].src)),
+            LLVMIntTypeInContext(t->ctx, db), "");
+         r = db < 32 ? LLVMBuildZExt(t->b, v, t->i32, "") : v;
          break;
-      case nir_op_f2u32:
-         r = LLVMBuildFPToUI(t->b,
-            LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->i32, "");
+      }
+      case nir_op_f2u8:  case nir_op_f2u16:
+      case nir_op_f2u32: case nir_op_f2u64: {
+         unsigned db = alu->def.bit_size;
+         LLVMValueRef v = LLVMBuildFPToUI(t->b,
+            as_float(t, alu_src(t, alu, 0, c), nir_src_bit_size(alu->src[0].src)),
+            LLVMIntTypeInContext(t->ctx, db), "");
+         r = db < 32 ? LLVMBuildZExt(t->b, v, t->i32, "") : v;
          break;
+      }
       /* float neg / div / min / max / abs / fused-multiply-add / sign */
       case nir_op_fneg: case nir_op_fdiv:
       case nir_op_fmin: case nir_op_fmax:
       case nir_op_fabs: case nir_op_ffma: case nir_op_fsign:
       case nir_op_fsqrt: case nir_op_frsq: {
-         LLVMTypeRef  ft = fty(t, alu->def.bit_size);
-         LLVMValueRef fa = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
+         unsigned     bs = alu->def.bit_size;
+         LLVMTypeRef  ft = cty(t, bs);
+         LLVMValueRef fa = as_float(t, alu_src(t, alu, 0, c), bs);
          LLVMValueRef z  = LLVMConstReal(ft, 0.0);
          LLVMValueRef res;
          if (alu->op == nir_op_fsqrt) {
@@ -725,9 +930,9 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          } else if (alu->op == nir_op_fneg) {
             res = LLVMBuildFNeg(t->b, fa, "");
          } else if (alu->op == nir_op_fabs) {
-            res = LLVMBuildSelect(t->b,
-               LLVMBuildFCmp(t->b, LLVMRealOLT, fa, z, ""),
-               LLVMBuildFNeg(t->b, fa, ""), fa, "");
+            /* llvm.fabs clears the sign bit outright; a select(x<0,-x,x) would
+             * mishandle -0.0 (-0.0 < 0.0 is false, so it would keep the sign). */
+            res = emit_funary_intrin(t, "fabs", fa, bs);
          } else if (alu->op == nir_op_fsign) {
             res = LLVMBuildSelect(t->b,
                LLVMBuildFCmp(t->b, LLVMRealOGT, fa, z, ""),
@@ -736,8 +941,7 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                   LLVMBuildFCmp(t->b, LLVMRealOLT, fa, z, ""),
                   LLVMConstReal(ft, -1.0), z, ""), "");
          } else {
-            LLVMValueRef fb = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c),
-                                               ft, "");
+            LLVMValueRef fb = as_float(t, alu_src(t, alu, 1, c), bs);
             if (alu->op == nir_op_fdiv)
                res = LLVMBuildFDiv(t->b, fa, fb, "");
             else if (alu->op == nir_op_fmin)
@@ -747,39 +951,35 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                res = LLVMBuildSelect(t->b,
                   LLVMBuildFCmp(t->b, LLVMRealOGT, fa, fb, ""), fa, fb, "");
             else { /* ffma */
-               LLVMValueRef fc = LLVMBuildBitCast(t->b, alu_src(t, alu, 2, c),
-                                                  ft, "");
+               LLVMValueRef fc = as_float(t, alu_src(t, alu, 2, c), bs);
                res = LLVMBuildFAdd(t->b, LLVMBuildFMul(t->b, fa, fb, ""),
                                    fc, "");
             }
          }
-         r = LLVMBuildBitCast(t->b, res, ity(t, alu->def.bit_size), "");
+         r = from_float(t, res, bs);
          break;
       }
       /* float width conversions — branch on the actual LLVM operand width so
        * the bitcasts stay legal even when the source value was materialized at
        * a different width than its NIR bit_size (a same-width convert is the
        * identity on the bit pattern). */
+      /* Float width conversions. Drive off the NIR source/dest bit sizes (not the
+       * LLVM operand type — a 16-bit float shares the i32 lane rep with f32) so
+       * f2f16/f2f32/f2f64 pick the right FPExt/FPTrunc/identity in every case. */
+      case nir_op_f2f16:
+      case nir_op_f2f32:
       case nir_op_f2f64: {
-         LLVMValueRef v = alu_src(t, alu, 0, c);
-         if (LLVMTypeOf(v) == t->i64) {
-            r = v;   /* already an f64 bit pattern */
-         } else {
-            r = LLVMBuildBitCast(t->b, LLVMBuildFPExt(t->b,
-               LLVMBuildBitCast(t->b, v, t->f32, ""), t->f64, ""),
-               t->i64, "f2f64");
-         }
-         break;
-      }
-      case nir_op_f2f32: {
-         LLVMValueRef v = alu_src(t, alu, 0, c);
-         if (LLVMTypeOf(v) == t->i32) {
-            r = v;   /* already an f32 bit pattern */
-         } else {
-            r = LLVMBuildBitCast(t->b, LLVMBuildFPTrunc(t->b,
-               LLVMBuildBitCast(t->b, v, t->f64, ""), t->f32, ""),
-               t->i32, "f2f32");
-         }
+         unsigned sb = nir_src_bit_size(alu->src[0].src);
+         unsigned db = alu->def.bit_size;
+         /* as_float yields the compute type (f32 for 16/32, f64 for 64); convert
+          * between compute types, then from_float rounds to f16 when db==16. An
+          * f16<->f32 convert is a no-op here — the round happens in from_float. */
+         LLVMValueRef s = as_float(t, alu_src(t, alu, 0, c), sb);
+         LLVMValueRef res =
+              (cty(t, db) == cty(t, sb)) ? s
+            : (db == 64) ? LLVMBuildFPExt(t->b, s, t->f64, "f2f")
+                         : LLVMBuildFPTrunc(t->b, s, t->f32, "f2f");
+         r = from_float(t, res, db);
          break;
       }
       /* integer modulo + 64-bit pack */
@@ -814,35 +1014,85 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
             LLVMBuildLShr(t->b, alu_src(t, alu, 0, c),
                           LLVMConstInt(t->i64, 32, false), ""), t->i32, "hi32");
          break;
-      /* bool -> int / float */
-      case nir_op_b2i32: case nir_op_b2f32: {
+      /* bool -> int / float (any result width). Floats round through from_float
+       * so b2f16 lands as a valid f16 bit pattern; sub-32-bit ints are held in
+       * the i32 lane. */
+      case nir_op_b2i8: case nir_op_b2i16:
+      case nir_op_b2i32: case nir_op_b2i64:
+      case nir_op_b2f16: case nir_op_b2f32: case nir_op_b2f64: {
+         unsigned db = alu->def.bit_size;
          LLVMValueRef v = alu_src(t, alu, 0, c);
          LLVMValueRef cond = (LLVMTypeOf(v) == LLVMInt1TypeInContext(t->ctx))
             ? v
             : LLVMBuildICmp(t->b, LLVMIntNE, v,
                             LLVMConstInt(LLVMTypeOf(v), 0, false), "");
-         if (alu->op == nir_op_b2i32)
-            r = LLVMBuildSelect(t->b, cond, LLVMConstInt(t->i32, 1, false),
-                                LLVMConstInt(t->i32, 0, false), "");
-         else
-            r = LLVMBuildBitCast(t->b,
-               LLVMBuildSelect(t->b, cond, LLVMConstReal(t->f32, 1.0),
-                               LLVMConstReal(t->f32, 0.0), ""), t->i32, "");
+         int is_float = (alu->op == nir_op_b2f16 || alu->op == nir_op_b2f32 ||
+                         alu->op == nir_op_b2f64);
+         if (is_float) {
+            LLVMTypeRef ft = cty(t, db);
+            r = from_float(t, LLVMBuildSelect(t->b, cond,
+                   LLVMConstReal(ft, 1.0), LLVMConstReal(ft, 0.0), ""), db);
+         } else {
+            LLVMTypeRef it = (db == 64) ? t->i64 : t->i32;
+            r = LLVMBuildSelect(t->b, cond, LLVMConstInt(it, 1, false),
+                                LLVMConstInt(it, 0, false), "");
+         }
          break;
       }
-      /* width conversions */
+      /* width conversions. Widening normalizes the source from its true bit size
+       * first (sign- or zero-extend), because sub-32-bit arithmetic runs in i32
+       * and can leave dirty high bits (e.g. a 16-bit iadd that wrapped). */
       case nir_op_u2u64:
-         r = LLVMBuildZExt(t->b, alu_src(t, alu, 0, c), t->i64, "u2u64");
+         r = LLVMBuildZExt(t->b,
+               norm_int_src(t, alu_src(t, alu, 0, c),
+                            nir_src_bit_size(alu->src[0].src), false),
+               t->i64, "u2u64");
          break;
       case nir_op_i2i64:
-         r = LLVMBuildSExt(t->b, alu_src(t, alu, 0, c), t->i64, "i2i64");
+         r = LLVMBuildSExt(t->b,
+               norm_int_src(t, alu_src(t, alu, 0, c),
+                            nir_src_bit_size(alu->src[0].src), true),
+               t->i64, "i2i64");
          break;
-      case nir_op_u2u32: case nir_op_i2i32:
-         /* 64-bit source -> 32: truncate; 32-bit source: identity. */
-         r = (LLVMTypeOf(alu_src(t, alu, 0, c)) == t->i64)
-            ? LLVMBuildTrunc(t->b, alu_src(t, alu, 0, c), t->i32, "")
-            : alu_src(t, alu, 0, c);
+      case nir_op_u2u32: case nir_op_i2i32: {
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         LLVMValueRef s = alu_src(t, alu, 0, c);
+         /* 64-bit source -> 32: truncate; otherwise normalize from sbs. */
+         r = (LLVMTypeOf(s) == t->i64)
+            ? LLVMBuildTrunc(t->b, s, t->i32, "")
+            : norm_int_src(t, s, sbs, alu->op == nir_op_i2i32);
          break;
+      }
+      /* Sub-32-bit int conversions. The lane ABI keeps every integer in an i32
+       * (ity() never yields i16/i8). Both the SOURCE and DEST widths matter: the
+       * source is first normalized from its own bit size (an i8 source may sit in
+       * the lane zero-extended, so a signed i2i16 must sign-extend from bit 8, not
+       * bit 16), then the result is produced at the destination width. Used by
+       * packed 8/16-bit math (16bit_storage add-immediate, integer-dot-product). */
+      case nir_op_u2u16: case nir_op_u2u8: {
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         unsigned dbs = (alu->op == nir_op_u2u16) ? 16u : 8u;
+         LLVMValueRef s = alu_src(t, alu, 0, c);
+         if (LLVMTypeOf(s) == t->i64)
+            s = LLVMBuildTrunc(t->b, s, t->i32, "");
+         s = norm_int_src(t, s, sbs, false);           /* clean unsigned source */
+         r = LLVMBuildAnd(t->b, s,
+                LLVMConstInt(t->i32, (1u << dbs) - 1u, false), "u2u");
+         break;
+      }
+      case nir_op_i2i16: case nir_op_i2i8: {
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         unsigned dbs = (alu->op == nir_op_i2i16) ? 16u : 8u;
+         LLVMValueRef s = alu_src(t, alu, 0, c);
+         if (LLVMTypeOf(s) == t->i64)
+            s = LLVMBuildTrunc(t->b, s, t->i32, "");
+         s = norm_int_src(t, s, sbs, true);            /* signed value from source */
+         unsigned sh = 32u - dbs;                       /* canonicalize as dbs-bit signed */
+         r = LLVMBuildAShr(t->b,
+                LLVMBuildShl(t->b, s, LLVMConstInt(t->i32, sh, false), ""),
+                LLVMConstInt(t->i32, sh, false), "i2i");
+         break;
+      }
       /* high 32 bits of a 32x32 multiply */
       case nir_op_umul_high: case nir_op_imul_high: {
          LLVMTypeRef ext = t->i64;
@@ -858,12 +1108,13 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          break;
       }
       /* float reciprocal */
-      case nir_op_frcp:
-         r = LLVMBuildBitCast(t->b,
-            LLVMBuildFDiv(t->b, LLVMConstReal(t->f32, 1.0),
-               LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f32, ""), ""),
-            t->i32, "frcp");
+      case nir_op_frcp: {
+         unsigned bs = alu->def.bit_size;
+         r = from_float(t,
+            LLVMBuildFDiv(t->b, LLVMConstReal(cty(t, bs), 1.0),
+               as_float(t, alu_src(t, alu, 0, c), bs), ""), bs);
          break;
+      }
       /* ufind_msb: index of the highest set bit, -1 when the source is 0.
        * ctlz(0)=32, so 31-ctlz naturally yields -1 for a zero source. */
       case nir_op_ufind_msb:
@@ -874,11 +1125,43 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          r = emit_ctpop(t, alu_src(t, alu, 0, c));
          break;
       case nir_op_fpow: {
-         LLVMTypeRef  ft = fty(t, alu->def.bit_size);
-         LLVMValueRef x  = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
-         LLVMValueRef y  = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c), ft, "");
-         r = LLVMBuildBitCast(t->b, emit_fpow(t, x, y),
-                              ity(t, alu->def.bit_size), "");
+         unsigned bs = alu->def.bit_size;
+         LLVMValueRef x = as_float(t, alu_src(t, alu, 0, c), bs);
+         LLVMValueRef y = as_float(t, alu_src(t, alu, 1, c), bs);
+         r = from_float(t, emit_fpow(t, x, y), bs);
+         break;
+      }
+      /* Unary float rounding + transcendentals. floor/ceil/trunc are synthesized
+       * (see emit_ftrunc) because their intrinsics don't lower in divergent
+       * codegen; fround_even maps to nearbyint (identical under the default
+       * round-to-nearest-even mode); exp2/log2/sin/cos use LLVM intrinsics that
+       * lower to libcalls. */
+      case nir_op_ffloor: case nir_op_fceil: case nir_op_ftrunc:
+      case nir_op_fround_even:
+      case nir_op_fexp2: case nir_op_flog2:
+      case nir_op_fsin: case nir_op_fcos: {
+         unsigned     bs = alu->def.bit_size;
+         LLVMValueRef fa = as_float(t, alu_src(t, alu, 0, c), bs);
+         LLVMValueRef res;
+         switch (alu->op) {
+         case nir_op_ffloor:      res = emit_ffloor(t, fa, bs); break;
+         case nir_op_fceil:       res = emit_fceil(t, fa, bs);  break;
+         case nir_op_ftrunc:      res = emit_ftrunc(t, fa, bs); break;
+         case nir_op_fround_even: res = emit_funary_intrin(t, "nearbyint", fa, bs); break;
+         case nir_op_fexp2:       res = emit_funary_intrin(t, "exp2", fa, bs); break;
+         case nir_op_flog2:       res = emit_funary_intrin(t, "log2", fa, bs); break;
+         case nir_op_fsin:        res = emit_funary_intrin(t, "sin",  fa, bs); break;
+         default:                 res = emit_funary_intrin(t, "cos",  fa, bs); break;
+         }
+         r = from_float(t, res, bs);
+         break;
+      }
+      /* ffract: x - floor(x). */
+      case nir_op_ffract: {
+         unsigned     bs = alu->def.bit_size;
+         LLVMValueRef fa = as_float(t, alu_src(t, alu, 0, c), bs);
+         LLVMValueRef fl = emit_ffloor(t, fa, bs);
+         r = from_float(t, LLVMBuildFSub(t->b, fa, fl, "ffract"), bs);
          break;
       }
       /* b2b1: normalize a bool to a 1-bit bool (nonzero -> true). */
@@ -1138,8 +1421,24 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          in->intrinsic == nir_intrinsic_load_workgroup_id ? VX_CSR_CTA_BLOCK_ID_X
        : in->intrinsic == nir_intrinsic_load_num_workgroups ? VX_CSR_CTA_GRID_DIM_X
                                                           : VX_CSR_CTA_THREAD_ID_X;
-      for (unsigned c = 0; c < in->def.num_components; c++)
-         ssa_set(t, in->def.index, c, emit_csr_read(t, base + c, "id"));
+      for (unsigned c = 0; c < in->def.num_components; c++) {
+         LLVMValueRef id = emit_csr_read(t, base + c, "id");
+         /* gl_WorkGroupID must include the vkCmdDispatchBase base offset
+          * (arg[2]=base_x|base_y<<32, arg[3]=base_z). The hardware block id is
+          * base-relative; the base rides in as a kernel dispatch parameter so
+          * this works identically on SimX and RTL with no KMU change. */
+         if (in->intrinsic == nir_intrinsic_load_workgroup_id && t->arg) {
+            unsigned slot = (c == 2) ? VP_ARG_GRID_BASE_Z : VP_ARG_GRID_BASE_XY;
+            LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg,
+               (LLVMValueRef[]){ LLVMConstInt(t->i64, slot, false) }, 1, "");
+            LLVMValueRef packed = LLVMBuildLoad2(t->b, t->i64, gep, "gbase");
+            if (c == 1)
+               packed = LLVMBuildLShr(t->b, packed, LLVMConstInt(t->i64, 32, false), "");
+            LLVMValueRef off = LLVMBuildTrunc(t->b, packed, t->i32, "");
+            id = LLVMBuildAdd(t->b, id, off, "wgid");
+         }
+         ssa_set(t, in->def.index, c, id);
+      }
       break;
    }
    /* gl_VertexIndex: one Vortex thread per vertex, so it is the CTA
@@ -1251,14 +1550,25 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 1),
                                         t->i64, "");
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
-      LLVMTypeRef  lt   = ity(t, in->def.bit_size);
       unsigned     esz  = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(t->i64, c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "buf"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "buf"));
       }
+      break;
+   }
+   case nir_intrinsic_get_ssbo_size: {
+      /* Runtime length of an unsized SSBO array (GLSL .length()). src[0] is the
+       * buffer's descriptor device address; its lp_jit_buffer.num_elements
+       * (u32 at offset 8, == byte size for an SSBO) is what the intrinsic
+       * returns. The frontend divides by the array stride to get the count. */
+      LLVMValueRef desc = intr_src(t, in, 0);
+      LLVMValueRef sp = LLVMBuildIntToPtr(t->b,
+         LLVMBuildAdd(t->b, desc, LLVMConstInt(t->i64, 8, false), ""),
+         t->ptr, "");
+      ssa_set(t, in->def.index, 0, LLVMBuildLoad2(t->b, t->i32, sp, "ssbosize"));
       break;
    }
    case nir_intrinsic_store_ssbo: {
@@ -1293,7 +1603,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(t->i64, c * esz, false), "");
          if (v)
-            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
+                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
       break;
    }
@@ -1408,13 +1719,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       }
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 0), t->i64, "");
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
-      LLVMTypeRef  lt   = ity(t, in->def.bit_size);
       unsigned     esz  = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(t->i64, c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "push"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "push"));
       }
       break;
    }
@@ -1422,13 +1732,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_global:
    case nir_intrinsic_load_global_constant: {
       LLVMValueRef addr = intr_src(t, in, 0);
-      LLVMTypeRef  lt   = ity(t, in->def.bit_size);
       unsigned     esz  = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(LLVMTypeOf(addr), c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "gld"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "gld"));
       }
       break;
    }
@@ -1443,7 +1752,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(LLVMTypeOf(addr), c * esz, false), "");
          if (v)
-            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
+                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
       break;
    }
@@ -1454,13 +1764,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMBuildAdd(t->b, t->lmem_base,
             vp_iptr_const(t, nir_intrinsic_base(in)), ""),
          vp_to_iptr(t, intr_src(t, in, 0)), "shaddr");
-      LLVMTypeRef lt  = ity(t, in->def.bit_size);
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "sld"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "sld"));
       }
       break;
    }
@@ -1479,7 +1788,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          if (v)
-            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
+                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
       break;
    }
@@ -1487,12 +1797,11 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_scratch: {
       LLVMValueRef addr = LLVMBuildAdd(t->b, emit_scratch_base(t),
          vp_to_iptr(t, intr_src(t, in, 0)), "scaddr");
-      LLVMTypeRef lt  = ity(t, in->def.bit_size);
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr, vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "scld"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "scld"));
       }
       break;
    }
@@ -1507,7 +1816,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef v = ssa_get(t, in->src[0].ssa->index, c);
          LLVMValueRef a = LLVMBuildAdd(t->b, addr, vp_iptr_const(t, c * esz), "");
          if (v)
-            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
+                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
       break;
    }
@@ -1584,16 +1894,36 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    /* Flat CTA-linear lane id = warp_id * NT + lane (one CTA per core, so the
     * warp id within the core is the warp id within the workgroup). */
    case nir_intrinsic_load_local_invocation_index: {
-      LLVMValueRef wid = emit_csr_read(t, VX_CSR_WARP_ID,     "wid");
-      LLVMValueRef nt  = emit_csr_read(t, VX_CSR_NUM_THREADS, "nt");
-      LLVMValueRef tid = emit_csr_read(t, VX_CSR_THREAD_ID,   "tid");
-      ssa_set(t, in->def.index, 0,
-              LLVMBuildAdd(t->b, LLVMBuildMul(t->b, wid, nt, ""), tid, "lii"));
+      /* gl_LocalInvocationIndex is the row-major linearization of the 3D local
+       * invocation id over the workgroup size (Vulkan spec):
+       *   (z*dimY + y)*dimX + x.
+       * Derive it from the CTA-local thread id + block dims — NOT warp_id*NT+tid,
+       * which uses the PHYSICAL warp id (VX_CSR_WARP_ID) and is wrong whenever a
+       * CTA lands on a nonzero physical warp (e.g. single-thread workgroups on
+       * later warps read warp_id>0 → index = warp_id*NT instead of 0). */
+      LLVMValueRef x  = emit_csr_read(t, VX_CSR_CTA_THREAD_ID_X,     "ltx");
+      LLVMValueRef y  = emit_csr_read(t, VX_CSR_CTA_THREAD_ID_X + 1, "lty");
+      LLVMValueRef z  = emit_csr_read(t, VX_CSR_CTA_THREAD_ID_X + 2, "ltz");
+      LLVMValueRef dx = emit_csr_read(t, VX_CSR_CTA_BLOCK_DIM_X,     "bdx");
+      LLVMValueRef dy = emit_csr_read(t, VX_CSR_CTA_BLOCK_DIM_X + 1, "bdy");
+      LLVMValueRef idx = LLVMBuildAdd(t->b,
+         LLVMBuildMul(t->b,
+            LLVMBuildAdd(t->b, LLVMBuildMul(t->b, z, dy, ""), y, ""), dx, ""),
+         x, "lii");
+      ssa_set(t, in->def.index, 0, idx);
       break;
    }
-   /* workgroup barrier: only the execution-scoped form needs a sync;
-    * a pure memory barrier is a no-op in this per-thread model. */
+   /* workgroup barrier. The memory-scoped form must drain this thread's
+    * outstanding memory ops before proceeding: a shared/global atomic whose
+    * result is discarded is not scoreboard-tracked, so without a fence a later
+    * access to the same location can issue while the atomic is still in flight
+    * (observed: atomicAdd then a barrier then atomicExchange reordering). A real
+    * RISC-V fence maps to the LSU FENCE, which stalls the warp until its pending
+    * requests retire. The execution-scoped form additionally syncs CTA warps. */
    case nir_intrinsic_barrier:
+      if (nir_intrinsic_memory_scope(in) != SCOPE_NONE)
+         LLVMBuildFence(t->b, LLVMAtomicOrderingSequentiallyConsistent,
+                        /*singleThread*/ false, "");
       if (nir_intrinsic_execution_scope(in) != SCOPE_NONE)
          emit_vx_barrier(t);
       break;
@@ -1602,13 +1932,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_deref: {
       LLVMValueRef addr = intr_src(t, in, 0);
       if (!addr) { t->ok = false; break; }
-      LLVMTypeRef lt  = ity(t, in->def.bit_size);
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "ld"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "ld"));
       }
       break;
    }
@@ -1626,7 +1955,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         LLVMBuildStore(t->b, v, p);
+         LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[1]), v), p);
       }
       break;
    }
@@ -1715,18 +2044,31 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       bool store = (in->intrinsic == nir_intrinsic_image_store ||
                     in->intrinsic == nir_intrinsic_bindless_image_store);
       enum pipe_format fmt = nir_intrinsic_format(in);
-      unsigned bpp;
-      bool is_f32;
-      if (fmt == PIPE_FORMAT_R32G32B32A32_FLOAT) {
-         bpp = 16; is_f32 = true;
-      } else if (fmt == PIPE_FORMAT_R8G8B8A8_UNORM) {
-         bpp = 4;  is_f32 = false;
-      } else {
+      /* Two storage layouts are emitted: verbatim 32-bit lanes (R/RG/RGBA x
+       * FLOAT/UINT/SINT: the raw bits are copied) and unorm8-packed RGBA8_UNORM
+       * (four bytes in one word). Only the format's own channels are touched, so
+       * a 1-channel R32_UINT writes exactly 4 bytes. Single-mip 2D addressing. */
+      unsigned bpp, nchan;
+      bool packed8, is_float;
+      switch (fmt) {
+      case PIPE_FORMAT_R32G32B32A32_FLOAT: bpp=16; nchan=4; packed8=false; is_float=true;  break;
+      case PIPE_FORMAT_R32G32B32A32_UINT:
+      case PIPE_FORMAT_R32G32B32A32_SINT:  bpp=16; nchan=4; packed8=false; is_float=false; break;
+      case PIPE_FORMAT_R32G32_FLOAT:       bpp=8;  nchan=2; packed8=false; is_float=true;  break;
+      case PIPE_FORMAT_R32G32_UINT:
+      case PIPE_FORMAT_R32G32_SINT:        bpp=8;  nchan=2; packed8=false; is_float=false; break;
+      case PIPE_FORMAT_R32_FLOAT:          bpp=4;  nchan=1; packed8=false; is_float=true;  break;
+      case PIPE_FORMAT_R32_UINT:
+      case PIPE_FORMAT_R32_SINT:           bpp=4;  nchan=1; packed8=false; is_float=false; break;
+      case PIPE_FORMAT_R8G8B8A8_UNORM:     bpp=4;  nchan=4; packed8=true;  is_float=true;  break;
+      default:
          mesa_logw("vortexpipe: image %s: unsupported format %d "
-                   "(RGBA32F / RGBA8_UNORM only)", store ? "store" : "load", fmt);
+                   "(R/RG/RGBA32 FLOAT/UINT/SINT + RGBA8_UNORM only)",
+                   store ? "store" : "load", fmt);
          t->ok = false;
          break;
       }
+      if (!t->ok) break;
       LLVMValueRef desc = intr_src(t, in, 0);
       LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
       LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "imgbase");
@@ -1744,9 +2086,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
       if (store) {
          addr = emit_store_addr(t, addr);
-         unsigned nc = nir_src_num_components(in->src[3]);
-         if (is_f32) {
-            for (unsigned c = 0; c < nc; c++) {
+         if (!packed8) {
+            for (unsigned c = 0; c < nchan; c++) {
                LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, c);
                if (!v) continue;
                LLVMValueRef a = LLVMBuildAdd(t->b, addr,
@@ -1755,7 +2096,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             }
          } else {
             LLVMValueRef packed = LLVMConstInt(t->i32, 0, false);
-            for (unsigned c = 0; c < nc; c++) {
+            for (unsigned c = 0; c < nchan; c++) {
                LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, c);
                if (!v) continue;
                LLVMValueRef b = f32bits_to_unorm8(t, v);
@@ -1765,24 +2106,62 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             LLVMBuildStore(t->b, packed, LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
          }
       } else {
-         if (is_f32) {
-            LLVMTypeRef lt = ity(t, in->def.bit_size);
-            for (unsigned c = 0; c < in->def.num_components; c++) {
-               LLVMValueRef a = LLVMBuildAdd(t->b, addr,
-                  LLVMConstInt(t->i64, c * 4u, false), "");
-               LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-               ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "img"));
-            }
-         } else {
-            LLVMValueRef packed = LLVMBuildLoad2(t->b, t->i32,
+         /* Image loads always yield a vec4; channels the format lacks read back
+          * as 0 (G,B) and 1 (A) per Vulkan storage-image semantics. */
+         LLVMValueRef packed = NULL;
+         if (packed8)
+            packed = LLVMBuildLoad2(t->b, t->i32,
                LLVMBuildIntToPtr(t->b, addr, t->ptr, ""), "img");
-            for (unsigned c = 0; c < in->def.num_components; c++) {
+         LLVMTypeRef lt = ity(t, in->def.bit_size);
+         unsigned one = is_float ? 0x3f800000u : 1u;
+         for (unsigned c = 0; c < in->def.num_components; c++) {
+            LLVMValueRef val;
+            if (c < nchan && packed8) {
                LLVMValueRef w = LLVMBuildLShr(t->b, packed,
                   LLVMConstInt(t->i32, c * 8u, false), "");
-               ssa_set(t, in->def.index, c, unorm8_to_f32bits(t, w));
+               val = unorm8_to_f32bits(t, w);
+            } else if (c < nchan) {
+               LLVMValueRef a = LLVMBuildAdd(t->b, addr,
+                  LLVMConstInt(t->i64, c * 4u, false), "");
+               val = LLVMBuildLoad2(t->b, lt,
+                  LLVMBuildIntToPtr(t->b, a, t->ptr, ""), "img");
+            } else {
+               val = LLVMConstInt(lt, (c == 3) ? one : 0u, false);
             }
+            ssa_set(t, in->def.index, c, val);
          }
       }
+      break;
+   }
+   case nir_intrinsic_image_atomic:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_image_atomic_swap:
+   case nir_intrinsic_bindless_image_atomic_swap: {
+      /* Storage-image atomics. Vulkan permits them only on 32-bit single-channel
+       * formats (R32_UINT/SINT, R32_FLOAT), so the pixel is one 4-byte word at
+       * the same single-mip 2D address as image load/store. The RMW reuses the
+       * device A-extension path: src[0]=image descriptor, src[1]=coordinate,
+       * src[2]=sample, src[3]=data (swap: src[3]=compare, src[4]=new). */
+      bool is_swap = (in->intrinsic == nir_intrinsic_image_atomic_swap ||
+                      in->intrinsic == nir_intrinsic_bindless_image_atomic_swap);
+      LLVMValueRef desc = intr_src(t, in, 0);
+      LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
+      LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "imgbase");
+      LLVMValueRef boff = LLVMBuildZExt(t->b,
+         img_desc_u32(t, desc, VP_JIT_IMG_BASE_OFFSET), t->i64, "");
+      LLVMValueRef row  = LLVMBuildZExt(t->b,
+         img_desc_u32(t, desc, VP_JIT_IMG_ROW_STRIDE), t->i64, "");
+      LLVMValueRef x = LLVMBuildZExt(t->b, ssa_get(t, in->src[1].ssa->index, 0),
+                                     t->i64, "");
+      LLVMValueRef y = (nir_src_num_components(in->src[1]) >= 2)
+         ? LLVMBuildZExt(t->b, ssa_get(t, in->src[1].ssa->index, 1), t->i64, "")
+         : LLVMConstInt(t->i64, 0, false);
+      LLVMValueRef off = LLVMBuildAdd(t->b, boff,
+         LLVMBuildAdd(t->b, LLVMBuildMul(t->b, x, LLVMConstInt(t->i64, 4, false), ""),
+                            LLVMBuildMul(t->b, y, row, ""), ""), "");
+      LLVMValueRef addr = emit_store_addr(t, LLVMBuildAdd(t->b, base, off, ""));
+      LLVMValueRef p = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
+      emit_atomic_at(t, in, p, 3, is_swap);
       break;
    }
    default:

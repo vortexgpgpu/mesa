@@ -805,6 +805,16 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
          /* No on-device transform feedback / geometry streams. */
          features->transformFeedback           = false;
          features->geometryStreams             = false;
+         /* Multisampling is not plumbed on the device path: the fixed-function
+          * output merger is single-sample and the rasterizer tests coverage at
+          * pixel centers only, so a multisample framebuffer would render wrong
+          * pixels rather than fail. Report it unsupported until the device
+          * gains per-sample coverage and merge. */
+         features->sampleRateShading             = false;
+         features->shaderStorageImageMultisample = false;
+         /* The output merger programs one source blend factor per channel
+          * pair; dual-source blending has no encoding. */
+         features->dualSrcBlend                  = false;
       }
    }
 }

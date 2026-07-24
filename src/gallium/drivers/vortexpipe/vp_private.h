@@ -34,6 +34,9 @@ struct vp_screen {
    void (*lp_screen_destroy)(struct pipe_screen *);
    const char *(*lp_screen_get_name)(struct pipe_screen *);
    char *(*lp_finalize_nir)(struct pipe_screen *, struct nir_shader *nir);
+   bool (*lp_is_format_supported)(struct pipe_screen *, enum pipe_format,
+                                  enum pipe_texture_target, unsigned sample_count,
+                                  unsigned storage_sample_count, unsigned usage);
    /* Lazy-formatted device-name override returned by vp_screen_get_name;
     * cached so the pointer Vulkan reads stays valid for the screen's life.
     * Sized to comfortably hold "vortexpipe (Vortex on <llvmpipe name>)". */
@@ -275,6 +278,12 @@ struct vp_context {
                                        const struct pipe_rasterizer_state *);
    void  (*lp_bind_rasterizer_state)(struct pipe_context *, void *);
    void  (*lp_delete_rasterizer_state)(struct pipe_context *, void *);
+   /* Work-placement tally, reported at context teardown when
+    * VORTEXPIPE_ATTRIB=1. A passing test proves correctness, not that the
+    * device ran anything: these separate "ran on Vortex" from "ran on the CPU
+    * through the llvmpipe fallback", so a run can be shown to be real offload. */
+   unsigned launches_device, launches_cpu;
+   unsigned draws_device, draws_cpu;
    /* Viewport transform (screen = ndc*scale + bias) captured from the app's
     * bound VkViewport. The device front end otherwise hardwires a full-fb
     * y-down viewport, so a y-flip (negative-height) or offset/scaled viewport
