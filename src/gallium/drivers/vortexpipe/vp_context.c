@@ -1454,33 +1454,45 @@ vp_gather_vertex_input(struct pipe_context *pipe, struct vp_context *vp,
    struct vp_velems_cso *ve = vp->cur_velems;
    if (!ve || ve->num == 0 || ve->num > VP_MAX_ATTR || vp->num_vbufs == 0)
       return false;
-   for (unsigned i = 0; i < ve->num; i++)
-      if (ve->buffer_index[i] != 0)        /* single vertex buffer only */
-         return false;
 
-   const struct pipe_vertex_buffer *vb = &vp->vbufs[0];
-   if (vb->is_user_buffer || !vb->buffer.resource)
+   /* Multiple vertex bindings are supported as long as they all reference the
+    * same underlying resource — the common case where an app binds one buffer at
+    * several binding points (e.g. deqp's separate position + texcoord bindings
+    * into a single vertex buffer). One upload of that resource then serves every
+    * attribute; each binding's own buffer_offset is folded into the per-attribute
+    * offset below. Distinct resources per binding would need multiple device
+    * uploads and are not yet supported. */
+   const struct pipe_vertex_buffer *vb0 = &vp->vbufs[0];
+   if (vb0->is_user_buffer || !vb0->buffer.resource)
       return false;
+   struct pipe_resource *res = vb0->buffer.resource;
+   for (unsigned i = 0; i < ve->num; i++) {
+      unsigned bi = ve->buffer_index[i];
+      if (bi >= vp->num_vbufs || vp->vbufs[bi].is_user_buffer ||
+          vp->vbufs[bi].buffer.resource != res)
+         return false;                    /* single shared resource only */
+   }
 
-   struct pipe_resource *res = vb->buffer.resource;
    uint8_t *map = pipe_buffer_map(pipe, res, PIPE_MAP_READ, xfer);
    if (!map)
       return false;
 
    vin->data        = map;
    vin->size        = res->width0;
-   vin->base_offset = vb->buffer_offset;
+   vin->base_offset = 0;   /* each binding's buffer_offset folded per-attribute */
    vin->num_attrs   = ve->num;
    for (unsigned i = 0; i < ve->num; i++) {
-      /* the velems index is the VS input driver_location. Fold the draw's
-       * first-vertex offset into the attribute base ONLY for a non-indexed draw,
-       * where the device VS's vid is the 0-based draw position. For an INDEXED
-       * draw the vid is the index value itself (which already addresses the
-       * absolute vertex) and draws[0].start offsets the INDEX buffer (applied in
-       * vp_gather_index_u32) — folding it here too would double-offset the
-       * attribute fetch whenever start != 0. */
+      /* the velems index is the VS input driver_location. attr_offset is the
+       * attribute's absolute byte offset within the shared resource: this
+       * binding's buffer_offset + the attribute's own offset. Fold the draw's
+       * first-vertex offset in ONLY for a non-indexed draw, where the device
+       * VS's vid is the 0-based draw position; for an INDEXED draw the vid is the
+       * index value (already the absolute vertex) and draws[0].start offsets the
+       * INDEX buffer (in vp_gather_index_u32), so folding it here too would
+       * double-offset the attribute fetch whenever start != 0. */
+      unsigned bi = ve->buffer_index[i];
       vin->attr_loc[i]    = i;
-      vin->attr_offset[i] = ve->src_offset[i]
+      vin->attr_offset[i] = vp->vbufs[bi].buffer_offset + ve->src_offset[i]
                           + (indexed ? 0u : draws[0].start * ve->src_stride[i]);
       vin->attr_stride[i] = ve->src_stride[i];
    }
