@@ -24,8 +24,10 @@
 #include "vp_compile.h"      /* vp_xlen_is_64 */
 #include "vp_private.h"      /* vp_dbg */
 #include "gfx_fs_desc_abi.h" /* GFX_FS_ARG_DESC, GFX_FS_ARG_APERTURE */
+#include "gfx_sw_abi.h"      /* gfx_sw_texstate_t (logdim offset for auto-LOD) */
 #include "VX_types.h"        /* VX_MEM_OM_BASE_ADDR */
 
+#include <stddef.h>          /* offsetof */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2651,11 +2653,87 @@ emit_vx_rt_cb_ret(struct vp_tr *t, LLVMValueRef action)
    LLVMBuildCall2(t->b, fnty, ia, a, 1, "");
 }
 
-/* A NIR texture op: gfx-v1 supports a plain 2D `texture()` sampling
- * the single bound texture (TEX stage 0) at LOD 0. The interpolated
- * texcoord is the coord source; the texture/sampler deref sources are
- * fixed-function (TEX DCRs) and ignored. The result vec4 is the
- * unpacked A8R8G8B8 texel as four floats in [0,1]. */
+/* llvm.ctlz.i64: leading-zero count (is_zero_undef=false). */
+static LLVMValueRef
+emit_ctlz64(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef  i1   = LLVMInt1TypeInContext(t->ctx);
+   LLVMTypeRef  args[2] = { t->i64, i1 };
+   LLVMTypeRef  fty  = LLVMFunctionType(t->i64, args, 2, false);
+   LLVMValueRef fn   = LLVMGetNamedFunction(t->mod, "llvm.ctlz.i64");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.ctlz.i64", fty);
+   LLVMValueRef a[2] = { v, LLVMConstInt(i1, 0, false) };
+   return LLVMBuildCall2(t->b, fty, fn, a, 2, "ctlz64");
+}
+
+/* One texel-space gradient: |a-b| widened to i64 and shifted left by the axis's
+ * log2 dimension. abs-vs-0 (not a sign-correct derivative) is all the LOD needs. */
+static LLVMValueRef
+emit_lod_grad(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b, LLVMValueRef logdim)
+{
+   LLVMValueRef d   = LLVMBuildSub(t->b, a, b, "");
+   LLVMValueRef abs = LLVMBuildSelect(t->b,
+      LLVMBuildICmp(t->b, LLVMIntSLT, d, LLVMConstInt(t->i32, 0, false), ""),
+      LLVMBuildNeg(t->b, d, ""), d, "");
+   return LLVMBuildShl(t->b, LLVMBuildZExt(t->b, abs, t->i64, ""),
+                       LLVMBuildZExt(t->b, logdim, t->i64, ""), "grad");
+}
+
+static LLVMValueRef
+emit_umax64(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b)
+{
+   return LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntUGT, a, b, ""), a, b, "");
+}
+
+/* Integer mip LOD for the lane's quad, matching vx_tex_auto_lod (vx_tex_lod.h):
+ * max over the four |du|,|dv| gradients (scaled by log2 dims), then
+ * floor(log2 rho) - FXD_FRAC, clamped to [0, VX_TEX_LOD_MAX]. logw/logh come from
+ * the resident TEX descriptor (fs_texstate) because the TEX DCRs are host-write-
+ * only; quad neighbours arrive through the quad-scoped SHFL (bfly). */
+static LLVMValueRef
+emit_tex_auto_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
+{
+   LLVMValueRef off = LLVMConstInt(t->i32,
+      offsetof(gfx_sw_texstate_t, logdim), false);
+   LLVMValueRef p   = LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off, 1, "logdim_p");
+   LLVMValueRef logdim = LLVMBuildLoad2(t->b, t->i32, p, "logdim");
+   LLVMValueRef logw = LLVMBuildAnd(t->b, logdim,
+      LLVMConstInt(t->i32, 0xFFFF, false), "logw");
+   LLVMValueRef logh = LLVMBuildLShr(t->b, logdim,
+      LLVMConstInt(t->i32, 16, false), "logh");
+
+   /* quad bfly control: (mask 0x3c << 12) | (cval 3 << 6) | dir. */
+   LLVMValueRef bch = LLVMConstInt(t->i32, (0x3c << 12) | (3 << 6) | 1, false);
+   LLVMValueRef bcv = LLVMConstInt(t->i32, (0x3c << 12) | (3 << 6) | 2, false);
+   LLVMValueRef uh = emit_shfl(t, 6, u, bch), uv = emit_shfl(t, 6, u, bcv);
+   LLVMValueRef vh = emit_shfl(t, 6, v, bch), vv = emit_shfl(t, 6, v, bcv);
+
+   LLVMValueRef rho = emit_umax64(t,
+      emit_umax64(t, emit_lod_grad(t, u, uh, logw), emit_lod_grad(t, u, uv, logw)),
+      emit_umax64(t, emit_lod_grad(t, v, vh, logh), emit_lod_grad(t, v, vv, logh)));
+
+   LLVMValueRef msb = LLVMBuildSub(t->b, LLVMConstInt(t->i64, 63, false),
+                                   emit_ctlz64(t, rho), "msb");
+   LLVMValueRef lod = LLVMBuildSub(t->b, msb,
+      LLVMConstInt(t->i64, VP_TEX_FXD_FRAC, false), "lod");
+   LLVMValueRef zero = LLVMConstInt(t->i64, 0, false);
+   lod = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSLT, lod, zero, ""),
+                         zero, lod, "");
+   LLVMValueRef maxlod = LLVMConstInt(t->i64, VX_TEX_LOD_MAX, false);
+   lod = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod, maxlod, ""),
+                         maxlod, lod, "");
+   lod = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntEQ, rho, zero, ""),
+                         zero, lod, "");
+   return LLVMBuildTrunc(t->b, lod, t->i32, "lod32");
+}
+
+/* A NIR texture op: a 2D `texture()`/`textureLod()`/`textureBias()` sampling the
+ * single bound texture (TEX stage 0). The interpolated texcoord is the coord
+ * source; the texture/sampler deref sources are fixed-function (TEX DCRs). For
+ * implicit-LOD `tex`, the mip level is derived from the quad's coordinate
+ * gradients; explicit-LOD/bias take level 0 (no bias arithmetic yet). The result
+ * vec4 is the unpacked A8R8G8B8 texel as four floats in [0,1]. */
 static void
 emit_tex(struct vp_tr *t, nir_tex_instr *tex)
 {
@@ -2666,9 +2744,8 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
          v = ssa_get(t, tex->src[i].src.ssa->index, 1);
       }
    }
-   /* Accept auto-LOD (tex) and explicit-LOD/bias (txl/txb) sampling; the device
-    * path samples base level, so the LOD/bias source is ignored. Ray-tracing and
-    * compute shaders emit txl since they have no implicit derivatives. */
+   /* Accept auto-LOD (tex) and explicit-LOD/bias (txl/txb) sampling. Ray-tracing
+    * and compute shaders emit txl since they have no implicit derivatives. */
    if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
         tex->op != nir_texop_txb) || !u || !v) {
       mesa_logw("vortexpipe: vp_nir_to_llvm: unsupported texture op %d", tex->op);
@@ -2683,8 +2760,31 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
       LLVMBuildBitCast(t->b, v, t->f32, ""), scale, ""), t->i32, "");
 
-   LLVMValueRef texel = emit_vx_tex(t, ux, vx,
-                                    LLVMConstInt(t->i32, 0, false));
+   /* Implicit-LOD `texture()` derives the integer mip from the quad's coordinate
+    * gradients (matching vx_tex_auto_lod); the TEX unit indexes mipoff[lod] for
+    * the level. Explicit-LOD/bias fall back to level 0. The auto-LOD applies only
+    * when the sampler actually has a mip chain (texstate.filter mip-enable bit):
+    * a non-mipmapped NEAREST/LINEAR sampler always reads the base level, whatever
+    * the gradients are. */
+   LLVMValueRef lod;
+   if (tex->op == nir_texop_tex) {
+      LLVMValueRef auto_lod = emit_tex_auto_lod(t, ux, vx);
+      LLVMValueRef foff = LLVMConstInt(t->i32,
+         offsetof(gfx_sw_texstate_t, filter), false);
+      LLVMValueRef fp = LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &foff, 1,
+                                      "filter_p");
+      LLVMValueRef filt = LLVMBuildLoad2(t->b, t->i32, fp, "filter");
+      LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
+         LLVMBuildAnd(t->b, filt,
+            LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
+         LLVMConstInt(t->i32, 0, false), "mip_en");
+      lod = LLVMBuildSelect(t->b, mip_en, auto_lod,
+                            LLVMConstInt(t->i32, 0, false), "lod");
+   } else {
+      lod = LLVMConstInt(t->i32, 0, false);
+   }
+
+   LLVMValueRef texel = emit_vx_tex(t, ux, vx, lod);
 
    /* unpack A8R8G8B8 -> {r,g,b,a} floats in [0,1]. */
    static const unsigned shift[4] = { 16, 8, 0, 24 };
@@ -3447,16 +3547,12 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
     * DCRs, so the kernel only needs the primitive buffer (arg[0]). */
    LLVMPositionBuilderAtEnd(t->b, entry);
    LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
-   /* SW sampler: arg[1] is the resident gfx_sw_texstate_t[] device address
-    * (the host fills it when texturing is routed to software); null on the HW
-    * path. Passed to fs_main as its 3rd param. */
-   LLVMValueRef texstate_ptr;
-   if (t->sw_tex) {
-      LLVMValueRef ts_addr = emit_arg_i32(t, arg, 1);
-      texstate_ptr = LLVMBuildIntToPtr(t->b, ts_addr, t->ptr, "texstate");
-   } else {
-      texstate_ptr = LLVMConstNull(t->ptr);
-   }
+   /* arg[1] is the resident gfx_sw_texstate_t[] device address (host-filled for
+    * any textured draw). The SW sampler reads the whole descriptor; the HW-tex FS
+    * reads only logdim from it to compute the mip LOD. Untextured draws leave
+    * arg[1] zero and never dereference it. Passed to fs_main as its 3rd param. */
+   LLVMValueRef texstate_ptr = LLVMBuildIntToPtr(t->b,
+      emit_arg_i32(t, arg, 1), t->ptr, "texstate");
    /* SW output-merger: arg[2] is the resident gfx_sw_omstate_t device address
     * (host-filled when OM is routed to software). The wrapper merges each covered
     * sub-pixel via gfx_om_fragment_sw over the LSU instead of staging + vx_om4. */
@@ -3568,9 +3664,10 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
     * mem2reg promotes the loop induction; no hand-built phi). */
    LLVMPositionBuilderAtEnd(t->b, entry);
    LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
-   LLVMValueRef texstate_ptr = LLVMConstNull(t->ptr);
-   if (t->sw_tex)
-      texstate_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 1), t->ptr, "texstate");
+   /* arg[1] = resident texstate for any textured draw (HW-tex reads logdim from
+    * it for the mip LOD, SW sampler reads all of it); zero + unused if untextured. */
+   LLVMValueRef texstate_ptr = LLVMBuildIntToPtr(t->b,
+      emit_arg_i32(t, arg, 1), t->ptr, "texstate");
    LLVMValueRef omstate_ptr = LLVMConstNull(t->ptr);
    if (t->sw_om)
       omstate_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 2), t->ptr, "omstate");
@@ -4175,6 +4272,38 @@ vp_scan_descriptors(struct nir_shader *nir,
       }
    }
    *num_out = n;
+}
+
+/* Locate the FS's TEX-stage-0 texture descriptor: the sampled image's lp_descriptor
+ * within its descriptor-set blob, from the first tex instruction's
+ * nir_tex_src_texture_handle (the bindless descriptor address, in the same
+ * const_buf_base+binding form as a storage image). Returns true + (cbuf_index,
+ * offset) so the draw can read lp_jit_texture.base and select the sampled texture.
+ * gfx-v1 drives a single TEX stage, so the first textured sample suffices. */
+bool
+vp_scan_tex_descriptor(struct nir_shader *nir, unsigned *cbuf_index, unsigned *offset)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(blk, impl) {
+         nir_foreach_instr(instr, blk) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            for (unsigned i = 0; i < tex->num_srcs; i++) {
+               if (tex->src[i].src_type != nir_tex_src_texture_handle)
+                  continue;
+               unsigned cb = 1;
+               int off = vp_desc_addr_offset(tex->src[i].src.ssa, &cb);
+               if (off < 0)
+                  return false;
+               *cbuf_index = cb;
+               *offset     = (unsigned)off;
+               return true;
+            }
+         }
+      }
+   }
+   return false;
 }
 
 /* Bitmask of set_shader_buffers slots the shader reads as a CONSTANT-index

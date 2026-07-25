@@ -107,6 +107,13 @@ struct vp_desc {
 void vp_scan_descriptors(struct nir_shader *nir,
                          struct vp_desc *out, unsigned *num_out);
 
+/* Locate the FS's TEX-stage-0 sampled-image descriptor (cbuf_index, byte offset)
+ * from its nir_tex_src_texture_handle, so a draw can read lp_jit_texture.base and
+ * select the actually-sampled texture. Returns false if the FS has no bindless
+ * texture handle (single-texture / non-bindless path uses the captured cur_tex). */
+bool vp_scan_tex_descriptor(struct nir_shader *nir,
+                            unsigned *cbuf_index, unsigned *offset);
+
 /* Bitmask of set_shader_buffers slots read via constant-index load_ssbo/
  * store_ssbo (the RT trace-ray command buffer). See the definition. */
 unsigned vp_scan_trace_cmd_slots(struct nir_shader *nir);

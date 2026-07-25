@@ -595,6 +595,11 @@ vp_create_fs_state(struct pipe_context *pipe,
        * the descriptor-blob relocation the SSBO path needs (follow-up). */
       vp_scan_descriptors((struct nir_shader *)state->ir.nir,
                           cso->descs, &cso->num_descs);
+      /* Locate the sampled texture's descriptor so the draw can pick the right
+       * texture per draw (multi-texture); false ⇒ fall back to cur_tex. */
+      cso->has_tex_desc = vp_scan_tex_descriptor(
+         (struct nir_shader *)state->ir.nir,
+         &cso->tex_desc_cbuf, &cso->tex_desc_offset);
       if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir, NULL,
                          &cso->fs_routing)) {
          bool uses_sw = cso->fs_routing.sw_tex || cso->fs_routing.sw_om;
@@ -683,17 +688,71 @@ vp_create_texture_handle(struct pipe_context *pipe,
       vp->cur_tex = view->texture;
       vp_dbg("vortexpipe: TEX texture captured (%ux%u)",
              vp->cur_tex->width0, vp->cur_tex->height0);
+      /* Record this texture's level-0 host base so a draw can match its FS tex
+       * descriptor (lp_jit_texture.base) back to the resource — the per-draw
+       * selection that lets >1 bound texture disambiguate. Dedup by resource. */
+      struct pipe_resource *res = view->texture;
+      bool known = false;
+      for (unsigned i = 0; i < vp->txh_count; i++)
+         if (vp->txh_res[i] == res) { known = true; break; }
+      if (!known && vp->txh_count < VP_MAX_TEX_HANDLES) {
+         struct pipe_transfer *xfer = NULL;
+         const void *base = pipe_texture_map(pipe, res, 0, 0, PIPE_MAP_READ,
+                                             0, 0, res->width0, res->height0, &xfer);
+         if (base) {
+            vp->txh_base[vp->txh_count] = base;
+            vp->txh_res[vp->txh_count]  = res;
+            vp->txh_count++;
+            pipe_texture_unmap(pipe, xfer);
+         }
+      }
    }
    if (state) {
       vp->cur_sampler_store.filter = vp_vx_filter(state->mag_img_filter);
       vp->cur_sampler_store.wrap_u = vp_vx_wrap(state->wrap_s);
       vp->cur_sampler_store.wrap_v = vp_vx_wrap(state->wrap_t);
+      /* Vulkan has no "disable mipmapping" flag; a non-mipmapped NEAREST/LINEAR
+       * sampler is expressed as max_lod == 0.25, which clamps the LOD so only the
+       * base level is ever read. A level >= 1 is reachable only when max_lod > 0.5
+       * (nearest-mip selects ceil(lod + 0.5) - 1), so that is the mipmap-enable
+       * test — min_mip_filter is always NEAREST here and cannot distinguish them. */
+      vp->cur_sampler_store.mip_enable = (state->max_lod > 0.5f);
       vp->cur_sampler = &vp->cur_sampler_store;
-      vp_dbg("vortexpipe: TEX sampler captured filter=%u wrap=%u,%u",
+      vp_dbg("vortexpipe: TEX sampler captured filter=%u wrap=%u,%u mip_enable=%u",
              vp->cur_sampler->filter, vp->cur_sampler->wrap_u,
-             vp->cur_sampler->wrap_v);
+             vp->cur_sampler->wrap_v, vp->cur_sampler->mip_enable);
    }
    return vp->lp_create_texture_handle(pipe, view, state);
+}
+
+/* Pick the texture the FS actually samples this draw. lavapipe keeps sampled
+ * images in per-set descriptor blobs the shader dereferences (not through
+ * set_sampler_views), so a shader with >1 bound texture would otherwise all
+ * resolve to the last handle create_texture_handle captured. Read
+ * lp_jit_texture.base (offset 0 of the sampled image's lp_descriptor) from the
+ * bound blob at the FS's (cbuf_index, offset) and match it to a recorded
+ * resource, overriding cur_tex. On any miss (no bindless handle, unmapped blob,
+ * unrecorded base) cur_tex is left as captured — the single-texture path. */
+static void
+vp_resolve_tex_from_desc(struct pipe_context *pipe, struct vp_context *vp,
+                         const struct vp_cso *fs)
+{
+   if (!fs || !fs->has_tex_desc)
+      return;
+   unsigned ci = fs->tex_desc_cbuf;
+   if (ci >= 8 || !vp->fs_cbuf[ci])
+      return;
+   if (fs->tex_desc_offset + sizeof(const void *) > vp->fs_cbuf_sz[ci])
+      return;
+   struct pipe_transfer *xfer = NULL;
+   const uint8_t *blob = pipe_buffer_map(pipe, vp->fs_cbuf[ci], PIPE_MAP_READ, &xfer);
+   if (!blob)
+      return;
+   const void *base = NULL;
+   memcpy(&base, blob + vp->fs_cbuf_off[ci] + fs->tex_desc_offset, sizeof base);
+   pipe_buffer_unmap(pipe, xfer);
+   for (unsigned i = 0; i < vp->txh_count; i++)
+      if (vp->txh_base[i] == base) { vp->cur_tex = vp->txh_res[i]; break; }
 }
 
 /* ---- graphics: vertex input ---------------------------------------- *
@@ -1037,33 +1096,66 @@ vp_fb_ensure_mrt(struct pipe_context *pipe, struct vp_context *vp,
 static bool
 vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
               struct pipe_resource *res, uint32_t w, uint32_t h,
-              uint64_t *tex_dev)
+              uint64_t *tex_dev, uint32_t mip_off[VX_TEX_LOD_MAX + 1])
 {
    if (vp->rtex_buf && vp->rtex_res == res &&
-       vp->rtex_w == w && vp->rtex_h == h)
+       vp->rtex_w == w && vp->rtex_h == h) {
+      memcpy(mip_off, vp->rtex_mipoff, sizeof(vp->rtex_mipoff));
       return vx_buffer_address(vp->rtex_buf, tex_dev) == VX_SUCCESS;
+   }
 
    if (vp->rtex_buf) { vx_buffer_release(vp->rtex_buf); vp->rtex_buf = NULL; }
    vp->rtex_res = NULL;
 
-   const uint32_t texel_count = w * h;
-   uint8_t *px = malloc((size_t)texel_count * 4);
-   uint32_t *texbuf = malloc((size_t)texel_count * 4);
-   bool ok = px && texbuf && vp_resource_rw(pipe, res, w, h, px, false);
-   if (ok) {
-      for (uint32_t i = 0; i < texel_count; i++) {
-         uint32_t r = px[i * 4 + 0], g = px[i * 4 + 1];
-         uint32_t b = px[i * 4 + 2], a = px[i * 4 + 3];
-         texbuf[i] = (a << 24) | (r << 16) | (g << 8) | b;
-      }
-      ok = vp_dev_upload(vp->dev, texbuf, (size_t)texel_count * 4,
-                         &vp->rtex_buf, tex_dev);
+   /* Upload the whole mip chain contiguously so the TEX unit can address any
+    * level the shader selects: level l lives at texel offset off_texels[l] and
+    * has dims max(1, w>>l) x max(1, h>>l). mip_off carries the byte offsets;
+    * levels past the resource's last are clamped to the smallest real level so
+    * an over-large computed LOD still lands on valid texels. A single-level
+    * texture yields off 0 for every LOD (byte-identical to the old upload). */
+   const uint32_t last = (res->last_level < (uint32_t)VX_TEX_LOD_MAX)
+                       ? res->last_level : (uint32_t)VX_TEX_LOD_MAX;
+   uint32_t off_texels[VX_TEX_LOD_MAX + 1] = { 0 };
+   uint32_t total = 0;
+   for (uint32_t l = 0; l <= last; l++) {
+      uint32_t wl = (w >> l) ? (w >> l) : 1u;
+      uint32_t hl = (h >> l) ? (h >> l) : 1u;
+      off_texels[l] = total;
+      total += wl * hl;
    }
-   free(px);
+
+   uint32_t *texbuf = malloc((size_t)total * 4);
+   bool ok = texbuf != NULL;
+   for (uint32_t l = 0; ok && l <= last; l++) {
+      uint32_t wl = (w >> l) ? (w >> l) : 1u;
+      uint32_t hl = (h >> l) ? (h >> l) : 1u;
+      struct pipe_transfer *xfer = NULL;
+      uint8_t *map = pipe_texture_map(pipe, res, l, 0, PIPE_MAP_READ,
+                                      0, 0, wl, hl, &xfer);
+      if (!map) { ok = false; break; }
+      uint32_t *dst = texbuf + off_texels[l];
+      for (uint32_t y = 0; y < hl; y++) {
+         uint8_t *m = map + (size_t)y * xfer->stride;
+         for (uint32_t x = 0; x < wl; x++) {
+            uint32_t r = m[x * 4 + 0], g = m[x * 4 + 1];
+            uint32_t b = m[x * 4 + 2], a = m[x * 4 + 3];
+            dst[(size_t)y * wl + x] = (a << 24) | (r << 16) | (g << 8) | b;
+         }
+      }
+      pipe_texture_unmap(pipe, xfer);
+   }
+
+   for (uint32_t l = 0; l <= (uint32_t)VX_TEX_LOD_MAX; l++)
+      mip_off[l] = off_texels[l <= last ? l : last] * 4u;
+
+   if (ok)
+      ok = vp_dev_upload(vp->dev, texbuf, (size_t)total * 4,
+                         &vp->rtex_buf, tex_dev);
    free(texbuf);
    if (!ok) return false;
    vp->rtex_res = res;
    vp->rtex_w = w; vp->rtex_h = h;
+   memcpy(vp->rtex_mipoff, mip_off, sizeof(vp->rtex_mipoff));
    return true;
 }
 
@@ -1834,6 +1926,9 @@ vp_draw_vbo(struct pipe_context *pipe,
          struct vp_tex_params tex = { 0 };
          bool tex_used = false;
          uint32_t tw = 0, th = 0;
+         /* Select the per-draw sampled texture from the FS descriptor (multi-
+          * texture); no-op when the FS has no bindless handle. */
+         vp_resolve_tex_from_desc(pipe, vp, fs);
          if (vp->cur_tex) {
             tw = vp->cur_tex->width0;
             th = vp->cur_tex->height0;
@@ -1846,6 +1941,8 @@ vp_draw_vbo(struct pipe_context *pipe,
                                             : VX_TEX_WRAP_CLAMP;
                tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
                                             : VX_TEX_WRAP_CLAMP;
+               tex.mip_enable = vp->cur_sampler ? vp->cur_sampler->mip_enable
+                                                : false;
                tex_used = true;
             }
          }
@@ -1856,7 +1953,8 @@ vp_draw_vbo(struct pipe_context *pipe,
          uint64_t color_dev = 0, depth_dev = 0, tex_dev = 0;
          bool drew = vp_fb_ensure(pipe, vp, w, h, &om, &color_dev, &depth_dev);
          if (drew && tex_used)
-            drew = vp_tex_ensure(pipe, vp, vp->cur_tex, tw, th, &tex_dev);
+            drew = vp_tex_ensure(pipe, vp, vp->cur_tex, tw, th, &tex_dev,
+                                 tex.mip_off);
 
          /* A draw whose FS writes >1 colour output AND targets >1 bound
           * attachment renders each attachment into its own resident buffer and

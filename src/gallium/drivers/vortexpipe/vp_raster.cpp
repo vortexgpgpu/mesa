@@ -516,14 +516,21 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
        * device address (arg[1]). The FS (compiled with sw_tex) then samples via
        * gfx_tex_sample_sw over the LSU instead of the FF TEX unit. The descriptor
        * outlives vx_enqueue_draw / vx_queue_finish (declared in this scope). */
+      /* Build the resident descriptor whenever a texture is bound, not only for
+       * sw_tex: the HW-tex FS reads logdim from it to compute the mip LOD
+       * (vx_tex_auto_lod), since the TEX DCRs are host-write-only. The SW sampler
+       * additionally consumes format/filter/wrap/mip_off/base from it. */
       gfx_sw_texstate_t texstate{};
-      if (sw_tex && tex_dev && tex) {
+      if (tex_dev && tex) {
          texstate.base   = tex_dev;
          for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i)
-            texstate.mip_off[i] = 0;   /* single mip (gfx-v1 textures) */
+            texstate.mip_off[i] = tex->mip_off[i];
          texstate.logdim = (vp_log2u(tex->height) << 16) | vp_log2u(tex->width);
          texstate.format = VX_TEX_FORMAT_A8R8G8B8;
-         texstate.filter = tex->filter;
+         /* mip-enable is a descriptor-only bit (the FS reads it to gate its
+          * auto-LOD); it never reaches the HW TEX_FILTER DCR below. */
+         texstate.filter = tex->filter |
+            (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u);
          texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
          /* Carry the mip-0 integer dims so the SW sampler can address NPOT
           * textures (multiply addressing). POT textures leave width==1<<logdim
@@ -867,7 +874,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          DCRW(VX_DCR_TEX_FILTER,       tex->filter);
          DCRW(VX_DCR_TEX_WRAP,         (tex->wrap_v << 16) | tex->wrap_u);
          DCRW(VX_DCR_TEX_ADDR,         (uint32_t)(tex_dev / 64));
-         DCRW(VX_DCR_TEX_MIPOFF_BASE,  0);
+         /* Per-LOD mip byte offsets: the TEX unit indexes mipoff[selected lod]
+          * (VX_tex_core) to reach that level's texels within the resident base. */
+         for (uint32_t j = 0; j <= (uint32_t)VX_TEX_LOD_MAX; ++j)
+            DCRW(VX_DCR_TEX_MIPOFF_BASE + j, tex->mip_off[j]);
       }
 
       LAUNCH(&fli);

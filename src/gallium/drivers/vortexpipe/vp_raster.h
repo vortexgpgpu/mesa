@@ -19,6 +19,7 @@
 #include <stdbool.h>
 
 #include "vortex2.h"
+#include "VX_types.h"            /* VX_TEX_LOD_MAX */
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
 #include "gfx_fs_desc_abi.h"     /* GFX_FS_DESC_SLOTS */
 
@@ -90,9 +91,11 @@ struct vp_mrt_params {
 struct vp_tex_params {
    uint32_t    width;
    uint32_t    height;
-   uint32_t    filter;      /* VX_TEX_FILTER_* */
+   uint32_t    filter;      /* VX_TEX_FILTER_* (bit0 mag/min, bit1 mip-linear) */
    uint32_t    wrap_u;      /* VX_TEX_WRAP_* */
    uint32_t    wrap_v;
+   bool        mip_enable;  /* sampler has a mip chain (else FS forces LOD 0) */
+   uint32_t    mip_off[VX_TEX_LOD_MAX + 1];  /* per-LOD byte offset from base */
 };
 
 /* Run the WHOLE draw as one device-orchestrated command: the vertex shader

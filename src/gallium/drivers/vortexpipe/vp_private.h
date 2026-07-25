@@ -23,6 +23,7 @@
 #include "pipe/p_state.h"      /* struct pipe_vertex_buffer (stored by value) */
 
 #include "vortex2.h"
+#include "VX_types.h"            /* VX_TEX_LOD_MAX */
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
 #include "gfx_fs_desc_abi.h"     /* GFX_OM_MAX_RT */
 
@@ -89,6 +90,15 @@ struct vp_cso {
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
    struct vp_desc descs[VP_MAX_DESCS];  /* set-0 descriptors the kernel uses */
    unsigned        num_descs;
+   /* Fragment TEX-stage-0 texture descriptor location: the (cbuf_index, byte
+    * offset) of the sampled image's lp_descriptor within its descriptor-set
+    * blob, from the tex instruction's nir_tex_src_texture_handle. Lets the draw
+    * pick the *actually sampled* texture per draw (lp_jit_texture.base at +0),
+    * instead of the last-created handle. has_tex_desc=false ⇒ fall back to the
+    * captured cur_tex (single-texture shaders / no bindless handle). */
+   bool     has_tex_desc;
+   unsigned tex_desc_cbuf;
+   unsigned tex_desc_offset;
    /* Residency: the vxbin loaded onto the device once and reused across
     * draws (compile-once + upload-resident-once — no per-draw module reload,
     * no /tmp round-trip). Lazily loaded by vp_raster_draw, released on delete.
@@ -147,6 +157,7 @@ struct vp_sampler_cso {
    uint32_t filter;            /* VX_TEX_FILTER_* */
    uint32_t wrap_u;            /* VX_TEX_WRAP_* */
    uint32_t wrap_v;
+   bool     mip_enable;        /* sampler reaches a non-base level (max_lod > 0.5) */
 };
 
 /* Captured vertex-input layout. The VS kernel fetches one thread's
@@ -258,6 +269,18 @@ struct vp_context {
    vx_buffer_h           rtex_buf;
    struct pipe_resource *rtex_res;
    unsigned              rtex_w, rtex_h;
+   /* Per-LOD byte offset into rtex_buf (mip 0 at [0]); the whole mip chain is
+    * uploaded contiguously so the TEX unit can address any selected level. */
+   uint32_t              rtex_mipoff[VX_TEX_LOD_MAX + 1];
+   /* Sampled-texture identity map: every texture that gets a bindless handle
+    * (create_texture_handle) is recorded here as (resource, level-0 host base).
+    * A draw reads its FS tex descriptor's lp_jit_texture.base and matches it to
+    * pick the sampled resource — so >1 bound texture selects correctly instead
+    * of always sampling the last handle created. */
+#define VP_MAX_TEX_HANDLES 32
+   const void           *txh_base[VP_MAX_TEX_HANDLES];
+   struct pipe_resource *txh_res[VP_MAX_TEX_HANDLES];
+   unsigned              txh_count;
    /* Output-merger state (depth-stencil-alpha + blend). */
    struct vp_dsa_cso   *cur_dsa;
    struct vp_blend_cso *cur_blend;
