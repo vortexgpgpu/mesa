@@ -471,13 +471,21 @@ emit_shfl_up(struct vp_tr *t, LLVMValueRef value, unsigned delta)
 }
 
 /* shfl_idx (gather): every lane reads `value` from source lane `src` (dynamic).
- * bval=src, cval=0x3f, mask=0 -> 0xFC0 | src. */
+ * bval=src, cval=0x3f, mask=0 -> 0xFC0 | src. The shfl instruction is i32-typed,
+ * so a sub-i32 value (a bool arrives as i1 from the subgroup broadcast / shuffle
+ * / quad lowerings) is widened for transport and narrowed back — the inline-asm
+ * call would otherwise fail IR verification. Type-preserving, so every caller
+ * (shuffle, read_invocation, vote_ieq, ...) sees the value's original type. */
 static LLVMValueRef
 emit_shfl_idx(struct vp_tr *t, LLVMValueRef value, LLVMValueRef src)
 {
-   LLVMValueRef bc = LLVMBuildOr(t->b, LLVMConstInt(t->i32, 0xFC0u, false),
-                                 src, "shflidx_bc");
-   return emit_shfl(t, 7, value, bc);
+   LLVMTypeRef  vt  = LLVMTypeOf(value);
+   LLVMValueRef v32 = (vt == t->i32) ? value
+                    : LLVMBuildZExt(t->b, value, t->i32, "shfl_w");
+   LLVMValueRef bc  = LLVMBuildOr(t->b, LLVMConstInt(t->i32, 0xFC0u, false),
+                                  src, "shflidx_bc");
+   LLVMValueRef r   = emit_shfl(t, 7, v32, bc);
+   return (vt == t->i32) ? r : LLVMBuildTrunc(t->b, r, vt, "shfl_n");
 }
 
 /* Combine two lane values under a subgroup reduction op (32-bit). Operands and
@@ -519,6 +527,42 @@ emit_scan_combine(struct vp_tr *t, nir_op rop, LLVMValueRef a, LLVMValueRef b)
    }
 }
 
+/* The identity element of a subgroup reduction op, as the i32 lane bit pattern.
+ * Used to seed the lane-0 slot of an exclusive scan. Returns NULL (clears ok)
+ * for an op with no identity mapping. */
+static LLVMValueRef
+emit_scan_identity(struct vp_tr *t, nir_op rop)
+{
+   switch (rop) {
+   case nir_op_iadd: case nir_op_ior: case nir_op_ixor:
+      return LLVMConstInt(t->i32, 0, false);
+   case nir_op_imul:
+      return LLVMConstInt(t->i32, 1, false);
+   case nir_op_iand:
+      return LLVMConstInt(t->i32, 0xFFFFFFFFu, false);
+   case nir_op_umin:
+      return LLVMConstInt(t->i32, 0xFFFFFFFFu, false);
+   case nir_op_umax:
+      return LLVMConstInt(t->i32, 0, false);
+   case nir_op_imin:
+      return LLVMConstInt(t->i32, 0x7FFFFFFFu, false);
+   case nir_op_imax:
+      return LLVMConstInt(t->i32, 0x80000000u, false);
+   case nir_op_fadd:
+      return LLVMConstInt(t->i32, 0x00000000u, false);          /* +0.0f */
+   case nir_op_fmul:
+      return LLVMConstInt(t->i32, 0x3F800000u, false);          /* 1.0f  */
+   case nir_op_fmin:
+      return LLVMConstInt(t->i32, 0x7F800000u, false);          /* +inf  */
+   case nir_op_fmax:
+      return LLVMConstInt(t->i32, 0xFF800000u, false);          /* -inf  */
+   default:
+      mesa_logw("vortexpipe: subgroup scan op %d has no identity", rop);
+      t->ok = false;
+      return NULL;
+   }
+}
+
 /* read a RISC-V CSR via inline asm: `csrr <rd>, <csr>` -> i32 */
 static LLVMValueRef
 emit_csr_read(struct vp_tr *t, unsigned csr, const char *name)
@@ -532,6 +576,41 @@ emit_csr_read(struct vp_tr *t, unsigned csr, const char *name)
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
    return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, name);
+}
+
+/* Inclusive prefix scan of `val` across the warp (subgroup) under reduction op
+ * `rop`: Hillis-Steele over shfl_up. Two guards decide whether a lane combines
+ * its neighbour at step d:
+ *   - in range: the source lane (lane-d) must exist (lane >= d);
+ *   - source active: the source lane must be an active invocation.
+ * The second matters under divergence — a shfl from an inactive lane returns the
+ * reader's OWN value, so combining it unconditionally would double-count for a
+ * non-idempotent op (add/mul/xor); an active source at a further power-of-two
+ * distance is still picked up in a later step. Unrolled to cover NT up to 32.
+ * Returns the inclusive result (NULL + clears ok on an unmapped op). */
+static LLVMValueRef
+emit_subgroup_incl_scan(struct vp_tr *t, nir_op rop, LLVMValueRef val)
+{
+   LLVMValueRef acc    = val;
+   LLVMValueRef lane   = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+   LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+   LLVMValueRef one    = LLVMConstInt(t->i32, 1, false);
+   for (unsigned d = 1; d <= 16u; d <<= 1) {
+      LLVMValueRef dc   = LLVMConstInt(t->i32, d, false);
+      LLVMValueRef nbr  = emit_shfl_up(t, acc, d);
+      LLVMValueRef comb = emit_scan_combine(t, rop, acc, nbr);
+      if (!t->ok)
+         return NULL;
+      LLVMValueRef inrange = LLVMBuildICmp(t->b, LLVMIntUGE, lane, dc, "");
+      LLVMValueRef srcbit  = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, active, LLVMBuildSub(t->b, lane, dc, ""), ""),
+         one, "");
+      LLVMValueRef srcact  = LLVMBuildICmp(t->b, LLVMIntNE, srcbit,
+         LLVMConstInt(t->i32, 0, false), "");
+      LLVMValueRef doit = LLVMBuildAnd(t->b, inrange, srcact, "");
+      acc = LLVMBuildSelect(t->b, doit, comb, acc, "scan");
+   }
+   return acc;
 }
 
 /* vx_barrier(): a workgroup execution barrier (custom-0, funct3=4).
@@ -1893,31 +1972,114 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
               LLVMBuildICmp(t->b, LLVMIntEQ, lane, low, "elect"));
       break;
    }
-   /* Inclusive prefix scan across the warp (subgroup): Hillis-Steele over
-    * shfl_up with a lane-id guard so a lane below the step distance keeps its
-    * own accumulator (shfl_up returns own value out of range — accumulating it
-    * would double-count). Unrolled to cover NT up to 32; steps past NT no-op. */
-   case nir_intrinsic_inclusive_scan: {
+   /* shuffle: each lane reads src[0] from the lane numbered src[1]. shfl_idx
+    * takes a dynamic source lane and preserves the value type, so this is a
+    * direct gather. */
+   case nir_intrinsic_shuffle:
+      ssa_set(t, in->def.index, 0,
+              emit_shfl_idx(t, intr_src(t, in, 0), intr_src(t, in, 1)));
+      break;
+   /* vote_all / vote_any: reduce a per-lane predicate over the ACTIVE lanes.
+    * active = ballot(1); votes = ballot(pred). all = (votes & active)==active;
+    * any = (votes & active)!=0. Restricting to the active mask is what makes the
+    * result correct under divergence. */
+   case nir_intrinsic_vote_all:
+   case nir_intrinsic_vote_any: {
+      LLVMValueRef pred = intr_src(t, in, 0);
+      if (LLVMTypeOf(pred) == LLVMInt1TypeInContext(t->ctx))
+         pred = LLVMBuildZExt(t->b, pred, t->i32, "");
+      LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+      LLVMValueRef votes  = LLVMBuildAnd(t->b, emit_ballot(t, pred), active, "");
+      LLVMValueRef r = in->intrinsic == nir_intrinsic_vote_all
+         ? LLVMBuildICmp(t->b, LLVMIntEQ, votes, active, "vote_all")
+         : LLVMBuildICmp(t->b, LLVMIntNE, votes,
+                         LLVMConstInt(t->i32, 0, false), "vote_any");
+      ssa_set(t, in->def.index, 0, r);
+      break;
+   }
+   /* vote_ieq / vote_feq: true iff src[0] is equal across all active lanes.
+    * Broadcast the lowest active lane's value, compare per-lane, then vote_all
+    * that comparison. feq uses ordered float equality (NaN => not-all-equal,
+    * which is the defined result). */
+   case nir_intrinsic_vote_ieq:
+   case nir_intrinsic_vote_feq: {
+      LLVMValueRef val    = intr_src(t, in, 0);
+      LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+      LLVMValueRef low    = emit_cttz(t, active);
+      LLVMValueRef first  = emit_shfl_idx(t, val, low);
+      LLVMValueRef eq;
+      if (in->intrinsic == nir_intrinsic_vote_feq) {
+         unsigned bs = in->src[0].ssa->bit_size;
+         eq = LLVMBuildFCmp(t->b, LLVMRealOEQ,
+                            as_float(t, val, bs), as_float(t, first, bs), "");
+      } else {
+         eq = LLVMBuildICmp(t->b, LLVMIntEQ, val, first, "");
+      }
+      LLVMValueRef votes = LLVMBuildAnd(t->b,
+         emit_ballot(t, LLVMBuildZExt(t->b, eq, t->i32, "")), active, "");
+      ssa_set(t, in->def.index, 0,
+              LLVMBuildICmp(t->b, LLVMIntEQ, votes, active, "vote_eq"));
+      break;
+   }
+   /* Subgroup scans/reduction over the warp. All three share the inclusive
+    * Hillis-Steele scan (emit_subgroup_incl_scan):
+    *   inclusive[i] = combine(lanes 0..i)
+    *   exclusive[i] = combine(lanes 0..i-1); lane 0 = identity  (= incl shifted up 1)
+    *   reduce       = combine(all active lanes) = inclusive of the highest active lane
+    * 32-bit lane values only (the shfl transport width). */
+   case nir_intrinsic_inclusive_scan:
+   case nir_intrinsic_exclusive_scan:
+   case nir_intrinsic_reduce: {
       if (in->def.bit_size != 32) {
-         mesa_logw("vortexpipe: %u-bit inclusive_scan unsupported (32-bit only)",
+         mesa_logw("vortexpipe: %u-bit subgroup scan/reduce unsupported (32-bit only)",
                    in->def.bit_size);
          t->ok = false;
          break;
       }
-      nir_op rop = nir_intrinsic_reduction_op(in);
-      LLVMValueRef acc  = intr_src(t, in, 0);
-      LLVMValueRef lane = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
-      for (unsigned d = 1; d <= 16u; d <<= 1) {
-         LLVMValueRef nbr  = emit_shfl_up(t, acc, d);
-         LLVMValueRef comb = emit_scan_combine(t, rop, acc, nbr);
+      nir_op rop  = nir_intrinsic_reduction_op(in);
+      LLVMValueRef incl = emit_subgroup_incl_scan(t, rop, intr_src(t, in, 0));
+      if (!t->ok)
+         break;
+      LLVMValueRef r;
+      if (in->intrinsic == nir_intrinsic_inclusive_scan) {
+         r = incl;
+      } else if (in->intrinsic == nir_intrinsic_exclusive_scan) {
+         /* exclusive[i] = the inclusive value of the nearest LOWER active lane;
+          * the first active lane gets the op identity. Probe lower lanes at
+          * power-of-two distances and take the first in-range active one — the
+          * `got` flag keeps it to the NEAREST. Divergence-safe like the inclusive
+          * scan; a fixed shfl_up(1) would read an inactive neighbour under a
+          * strided active mask and deliver the wrong lane's value. */
+         LLVMValueRef lane   = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+         LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+         LLVMValueRef one    = LLVMConstInt(t->i32, 1, false);
+         LLVMValueRef zero   = LLVMConstInt(t->i32, 0, false);
+         LLVMTypeRef  i1t    = LLVMInt1TypeInContext(t->ctx);
+         r = emit_scan_identity(t, rop);
          if (!t->ok)
             break;
-         LLVMValueRef pred = LLVMBuildICmp(t->b, LLVMIntUGE, lane,
-                                           LLVMConstInt(t->i32, d, false), "");
-         acc = LLVMBuildSelect(t->b, pred, comb, acc, "scan");
+         LLVMValueRef got = LLVMConstInt(i1t, 0, false);
+         for (unsigned d = 1; d <= 16u; d <<= 1) {
+            LLVMValueRef dc      = LLVMConstInt(t->i32, d, false);
+            LLVMValueRef cand    = emit_shfl_up(t, incl, d);
+            LLVMValueRef inrange = LLVMBuildICmp(t->b, LLVMIntUGE, lane, dc, "");
+            LLVMValueRef srcbit  = LLVMBuildAnd(t->b,
+               LLVMBuildLShr(t->b, active,
+                             LLVMBuildSub(t->b, lane, dc, ""), ""), one, "");
+            LLVMValueRef srcact  = LLVMBuildICmp(t->b, LLVMIntNE, srcbit, zero, "");
+            LLVMValueRef here    = LLVMBuildAnd(t->b, inrange, srcact, "");
+            LLVMValueRef take    = LLVMBuildAnd(t->b, here,
+                                                LLVMBuildNot(t->b, got, ""), "");
+            r   = LLVMBuildSelect(t->b, take, cand, r, "excl");
+            got = LLVMBuildOr(t->b, got, here, "");
+         }
+      } else { /* reduce: broadcast the highest active lane's inclusive value */
+         LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+         LLVMValueRef hi = LLVMBuildSub(t->b, LLVMConstInt(t->i32, 31, false),
+                                        emit_ctlz(t, active), "hi_lane");
+         r = emit_shfl_idx(t, incl, hi);
       }
-      if (t->ok)
-         ssa_set(t, in->def.index, 0, acc);
+      ssa_set(t, in->def.index, 0, r);
       break;
    }
    /* Flat CTA-linear lane id = warp_id * NT + lane (one CTA per core, so the
@@ -2982,7 +3144,12 @@ emit_om_aperture_load(struct vp_tr *t, LLVMValueRef arg)
       t->om_ap_xbits = t->om_ap_ybits = t->om_ap_shift = NULL;
       return;
    }
+   /* The aperture word is a packed 32-bit geometry field, not a pointer, so
+    * force it to i32: emit_arg_i32 returns pointer-width (i64 at XLEN=64) and the
+    * unpack below is all i32 arithmetic. */
    LLVMValueRef w = emit_arg_i32(t, arg, GFX_FS_ARG_APERTURE);
+   if (LLVMTypeOf(w) != t->i32)
+      w = LLVMBuildTrunc(t->b, w, t->i32, "ap_word");
    LLVMValueRef m8 = LLVMConstInt(t->i32, 0xffu, false);
    t->om_ap_xbits = LLVMBuildAnd(t->b, w, m8, "ap_xbits");
    t->om_ap_ybits = LLVMBuildAnd(t->b,

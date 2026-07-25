@@ -815,6 +815,26 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
          /* The output merger programs one source blend factor per channel
           * pair; dual-source blending has no encoding. */
          features->dualSrcBlend                  = false;
+         /* Atomics: the device A-extension has only 32-bit integer AMOs.
+          * 64-bit atomics have no RV32 encoding at all; float atomics would
+          * lower to an integer compare-exchange loop but the float-atomic
+          * buffer path currently reads uninitialized memory. Advertise the
+          * honest set — 32-bit integer atomics only (int32 atomics pass CTS).
+          * float16/float64 are already reported unsupported above. */
+         features->shaderBufferInt64Atomics      = false;
+         features->shaderSharedInt64Atomics      = false;
+         features->shaderBufferFloat32Atomics    = false;
+         features->shaderBufferFloat32AtomicAdd  = false;
+         features->shaderSharedFloat32Atomics    = false;
+         features->shaderSharedFloat32AtomicAdd  = false;
+         features->shaderImageFloat32Atomics     = false;
+         features->shaderImageFloat32AtomicAdd   = false;
+         features->sparseImageFloat32Atomics     = false;
+         features->sparseImageFloat32AtomicAdd   = false;
+         features->shaderBufferFloat32AtomicMinMax = false;
+         features->shaderSharedFloat32AtomicMinMax = false;
+         features->shaderImageFloat32AtomicMinMax  = false;
+         features->sparseImageFloat32AtomicMinMax  = false;
       }
    }
 }
