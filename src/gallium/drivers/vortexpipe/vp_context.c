@@ -1541,66 +1541,83 @@ vp_draw_passthrough(struct vp_context *vp, struct pipe_context *pipe,
    return true;
 }
 
-/* Fill `vin` with the bound vertex-buffer geometry so the VS kernel
- * can fetch per-vertex attributes. gfx-v1 supports a single
- * resource-backed interleaved vertex buffer; returns false (the draw
- * then falls back to llvmpipe) for anything else. On success *xfer
- * holds the buffer mapping the caller must unmap. */
+/* Fill `vin` with the bound vertex-buffer geometry so the VS kernel can fetch
+ * per-vertex attributes, across one or more distinct resource-backed vertex
+ * buffers. Returns false (the draw then falls back to llvmpipe) for user buffers
+ * or more distinct buffers than the table holds. On success `xfers[0..num_bufs)`
+ * hold the buffer mappings the caller unmaps via vp_unmap_vertex_input. */
 static bool
 vp_gather_vertex_input(struct pipe_context *pipe, struct vp_context *vp,
                        const struct pipe_draw_start_count_bias *draws,
                        bool indexed,
                        struct vp_vertex_input *vin,
-                       struct pipe_transfer **xfer)
+                       struct pipe_transfer *xfers[VP_MAX_ATTR])
 {
    struct vp_velems_cso *ve = vp->cur_velems;
    if (!ve || ve->num == 0 || ve->num > VP_MAX_ATTR || vp->num_vbufs == 0)
       return false;
 
-   /* Multiple vertex bindings are supported as long as they all reference the
-    * same underlying resource — the common case where an app binds one buffer at
-    * several binding points (e.g. deqp's separate position + texcoord bindings
-    * into a single vertex buffer). One upload of that resource then serves every
-    * attribute; each binding's own buffer_offset is folded into the per-attribute
-    * offset below. Distinct resources per binding would need multiple device
-    * uploads and are not yet supported. */
-   const struct pipe_vertex_buffer *vb0 = &vp->vbufs[0];
-   if (vb0->is_user_buffer || !vb0->buffer.resource)
-      return false;
-   struct pipe_resource *res = vb0->buffer.resource;
+   /* Collect the distinct vertex-buffer resources the attributes reference. An
+    * app may bind one buffer per attribute (e.g. deqp's separate position /
+    * texcoord / ... bindings into distinct buffers) or share one buffer across
+    * several bindings; each distinct resource is uploaded once and every
+    * attribute records which one it fetches from. */
+   struct pipe_resource *res_list[VP_MAX_ATTR];
+   unsigned nbufs = 0;
    for (unsigned i = 0; i < ve->num; i++) {
       unsigned bi = ve->buffer_index[i];
       if (bi >= vp->num_vbufs || vp->vbufs[bi].is_user_buffer ||
-          vp->vbufs[bi].buffer.resource != res)
-         return false;                    /* single shared resource only */
-   }
-
-   uint8_t *map = pipe_buffer_map(pipe, res, PIPE_MAP_READ, xfer);
-   if (!map)
-      return false;
-
-   vin->data        = map;
-   vin->size        = res->width0;
-   vin->base_offset = 0;   /* each binding's buffer_offset folded per-attribute */
-   vin->num_attrs   = ve->num;
-   for (unsigned i = 0; i < ve->num; i++) {
+          !vp->vbufs[bi].buffer.resource)
+         return false;
+      struct pipe_resource *res = vp->vbufs[bi].buffer.resource;
+      unsigned bufidx = nbufs;
+      for (unsigned j = 0; j < nbufs; j++)
+         if (res_list[j] == res) { bufidx = j; break; }
+      if (bufidx == nbufs) {
+         if (nbufs >= VP_MAX_ATTR)
+            return false;   /* more distinct buffers than the table holds */
+         res_list[nbufs++] = res;
+      }
       /* the velems index is the VS input driver_location. attr_offset is the
-       * attribute's absolute byte offset within the shared resource: this
-       * binding's buffer_offset + the attribute's own offset. Fold the draw's
-       * first-vertex offset in ONLY for a non-indexed draw, where the device
-       * VS's vid is the 0-based draw position; for an INDEXED draw the vid is the
-       * index value (already the absolute vertex) and draws[0].start offsets the
-       * INDEX buffer (in vp_gather_index_u32), so folding it here too would
-       * double-offset the attribute fetch whenever start != 0. */
-      unsigned bi = ve->buffer_index[i];
+       * attribute's byte offset within its own buffer: this binding's
+       * buffer_offset + the attribute's src_offset. Fold the draw's first-vertex
+       * offset in ONLY for a non-indexed draw, where the device VS's vid is the
+       * 0-based draw position; for an INDEXED draw the vid is the index value
+       * (already the absolute vertex) and draws[0].start offsets the INDEX buffer
+       * (in vp_gather_index_u32), so folding it here too would double-offset. */
       vin->attr_loc[i]    = i;
+      vin->attr_buf[i]    = bufidx;
       vin->attr_offset[i] = vp->vbufs[bi].buffer_offset + ve->src_offset[i]
                           + (indexed ? 0u : draws[0].start * ve->src_stride[i]);
       vin->attr_stride[i] = ve->src_stride[i];
    }
-   vp_dbg("vortexpipe: vertex-input: %u attrs, vbuf %u bytes",
-          vin->num_attrs, vin->size);
+
+   /* Map each distinct resource; unmap what we mapped if any map fails. */
+   for (unsigned j = 0; j < nbufs; j++) {
+      void *map = pipe_buffer_map(pipe, res_list[j], PIPE_MAP_READ, &xfers[j]);
+      if (!map) {
+         for (unsigned k = 0; k < j; k++)
+            pipe_buffer_unmap(pipe, xfers[k]);
+         return false;
+      }
+      vin->buf_data[j] = map;
+      vin->buf_size[j] = res_list[j]->width0;
+   }
+   vin->num_bufs  = nbufs;
+   vin->num_attrs = ve->num;
+   vp_dbg("vortexpipe: vertex-input: %u attrs across %u buffer(s)",
+          vin->num_attrs, vin->num_bufs);
    return true;
+}
+
+/* Unmap the transfers a successful vp_gather_vertex_input opened (one per
+ * distinct bound buffer). A no-op when nothing was gathered (num_bufs == 0). */
+static void
+vp_unmap_vertex_input(struct pipe_context *pipe,
+                      struct pipe_transfer *xfers[VP_MAX_ATTR], unsigned num_bufs)
+{
+   for (unsigned j = 0; j < num_bufs; j++)
+      if (xfers[j]) pipe_buffer_unmap(pipe, xfers[j]);
 }
 
 /* Upload the draw's index buffer to the device as a flat u32-per-vertex array
@@ -1780,9 +1797,9 @@ vp_draw_vbo(struct pipe_context *pipe,
       /* Gather the vertex-buffer geometry if the VS fetches inputs;
        * if it needs them and we can't supply them, fall back wholly. */
       struct vp_vertex_input vin = { 0 };
-      struct pipe_transfer  *vxfer = NULL;
+      struct pipe_transfer  *vxfers[VP_MAX_ATTR] = { NULL };
       bool vin_ok = !vs->vs_layout.needs_vertex_input ||
-                    vp_gather_vertex_input(pipe, vp, draws, indexed, &vin, &vxfer);
+                    vp_gather_vertex_input(pipe, vp, draws, indexed, &vin, vxfers);
 
       /* Indexed draw: upload the index buffer (widened to u32) so the VS can
        * resolve the per-vertex index on device. Strips/fans are translated to a
@@ -1802,7 +1819,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                     vp_gather_index_u32(pipe, vp, info, draws, &index_dev, &ibuf);
       }
       if (!index_ok) {
-         if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+         vp_unmap_vertex_input(pipe, vxfers, vin.num_bufs);
          goto llvmpipe;
       }
 
@@ -1902,7 +1919,7 @@ vp_draw_vbo(struct pipe_context *pipe,
          uint32_t cull_mode = vp_cull_mode(vp->cur_rast);
          if (vp->cur_rast && vp->cur_rast->cull_face == PIPE_FACE_FRONT_AND_BACK) {
             vp_dbg("vortexpipe: draw_vbo -> cull FRONT_AND_BACK, nothing drawn");
-            if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+            vp_unmap_vertex_input(pipe, vxfers, vin.num_bufs);
             if (ibuf) vx_buffer_release(ibuf);
             return;
          }
@@ -1983,7 +2000,7 @@ vp_draw_vbo(struct pipe_context *pipe,
           * would dereference an unbound RT. Vulkan discards the surplus outputs,
           * so run this draw on llvmpipe rather than launch a mismatched kernel. */
          if (num_color > 1 && (unsigned)vp->fb_nr_cbufs < num_color) {
-            if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+            vp_unmap_vertex_input(pipe, vxfers, vin.num_bufs);
             if (ibuf)  vx_buffer_release(ibuf);
             goto llvmpipe;
          }
@@ -2049,7 +2066,7 @@ vp_draw_vbo(struct pipe_context *pipe,
             vp_dbg("vortexpipe: draw_vbo -> Vortex VS+RASTER+OM (one OP_DRAW) "
                    "(%u verts, %ux%u, depth_test=%d, textured=%d)",
                    count, w, h, om.depth_test, tex_used);
-            if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+            vp_unmap_vertex_input(pipe, vxfers, vin.num_bufs);
             if (ibuf) vx_buffer_release(ibuf);
             return;
          }
@@ -2084,15 +2101,14 @@ vp_draw_vbo(struct pipe_context *pipe,
                       "(llvmpipe raster)", count);
                free(xverts);
                vx_buffer_release(vsbuf);
-               if (vxfer) pipe_buffer_unmap(pipe, vxfer);
+               vp_unmap_vertex_input(pipe, vxfers, vin.num_bufs);
                return;
             }
             free(xverts);
             if (vsbuf) vx_buffer_release(vsbuf);
          }
       }
-      if (vxfer)
-         pipe_buffer_unmap(pipe, vxfer);
+      vp_unmap_vertex_input(pipe, vxfers, vin.num_bufs);
       if (ibuf) vx_buffer_release(ibuf);
    }
 

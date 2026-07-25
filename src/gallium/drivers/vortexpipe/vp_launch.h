@@ -61,19 +61,21 @@ bool vp_launch(vx_device_h dev,
                const uint32_t grid_base[3],
                uint32_t lmem_size, bool has_rtu);
 
-/* The vertex-buffer geometry feeding a VS kernel: a single interleaved
- * host vertex buffer plus the per-attribute layout. The VS kernel
- * fetches attribute `loc` of vertex `vid` at
- *   data + base_offset + attr_offset[loc] + vid*attr_stride[loc].
- * NULL passed to vp_launch_vs means a self-contained VS (the corner
- * arrays are baked in -- gl_VertexIndex only, no vertex buffer). */
+/* The vertex-buffer geometry feeding a VS kernel: the distinct vertex-buffer
+ * resources the draw binds, plus the per-attribute layout. Each attribute may
+ * come from its own buffer (an app that binds one buffer per attribute), so the
+ * VS kernel fetches attribute `loc` of vertex `vid` at
+ *   buf_data[attr_buf[loc]] + attr_offset[loc] + vid*attr_stride[loc].
+ * NULL passed to vp_launch_vs means a self-contained VS (the corner arrays are
+ * baked in -- gl_VertexIndex only, no vertex buffer). */
 struct vp_vertex_input {
-   const void *data;          /* host vertex-buffer bytes */
-   uint32_t    size;          /* data length in bytes */
-   uint32_t    base_offset;   /* pipe_vertex_buffer.buffer_offset */
+   uint32_t    num_bufs;         /* distinct bound vertex-buffer resources */
+   const void *buf_data[8];      /* host bytes of each distinct buffer */
+   uint32_t    buf_size[8];      /* length of each buffer in bytes */
    uint32_t    num_attrs;
    uint32_t    attr_loc[8];      /* VS input driver_location */
-   uint32_t    attr_offset[8];   /* byte offset of the attribute in a vertex */
+   uint32_t    attr_buf[8];      /* which buf_data[] this attribute fetches from */
+   uint32_t    attr_offset[8];   /* byte offset of the attribute in its buffer */
    uint32_t    attr_stride[8];   /* bytes between consecutive vertices */
 };
 

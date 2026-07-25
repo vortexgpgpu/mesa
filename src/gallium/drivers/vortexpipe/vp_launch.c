@@ -864,7 +864,8 @@ vp_launch_vs(vx_device_h dev,
    vx_queue_h  q    = NULL;
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
-   vx_buffer_h obuf = NULL, vbuf = NULL, tbuf = NULL;
+   vx_buffer_h obuf = NULL, tbuf = NULL;
+   vx_buffer_h vbufs_dev[8] = { NULL };   /* one per distinct vertex buffer */
    char vxpath[512];
    const char *vs_tmpdir = getenv("TMPDIR");
    if (!vs_tmpdir || !*vs_tmpdir)
@@ -962,18 +963,24 @@ vp_launch_vs(vx_device_h dev,
     * outlive the `if` block -- the same lifetime rule as argblk. */
    uint32_t table[VP_ATTR_TABLE_LOCS * 2] = { 0 };
    if (vin && vin->num_attrs) {
-      VP_CHECK(vx_buffer_create(dev, vin->size, 0, &vbuf),
-               "vx_buffer_create(vbuf)");
-      uint64_t vbuf_dev = 0;
-      VP_CHECK(vx_buffer_address(vbuf, &vbuf_dev), "vx_buffer_address(vbuf)");
-      VP_CHECK(vx_enqueue_write(q, vbuf, 0, vin->data, vin->size,
-                                0, NULL, NULL), "vx_enqueue_write(vbuf)");
+      /* Upload each distinct vertex-buffer resource once; an attribute points at
+       * its own buffer's device base + its byte offset. */
+      uint64_t buf_dev[8] = { 0 };
+      for (uint32_t j = 0; j < vin->num_bufs; j++) {
+         VP_CHECK(vx_buffer_create(dev, vin->buf_size[j], 0, &vbufs_dev[j]),
+                  "vx_buffer_create(vbuf)");
+         VP_CHECK(vx_buffer_address(vbufs_dev[j], &buf_dev[j]),
+                  "vx_buffer_address(vbuf)");
+         VP_CHECK(vx_enqueue_write(q, vbufs_dev[j], 0, vin->buf_data[j],
+                                   vin->buf_size[j], 0, NULL, NULL),
+                  "vx_enqueue_write(vbuf)");
+      }
 
       for (uint32_t i = 0; i < vin->num_attrs; i++) {
          uint32_t loc = vin->attr_loc[i];
          if (loc >= VP_ATTR_TABLE_LOCS)
             continue;
-         table[loc * 2 + 0] = (uint32_t)vbuf_dev + vin->base_offset
+         table[loc * 2 + 0] = (uint32_t)buf_dev[vin->attr_buf[i]]
                             + vin->attr_offset[i];
          table[loc * 2 + 1] = vin->attr_stride[i];
       }
@@ -1011,7 +1018,7 @@ vp_launch_vs(vx_device_h dev,
 
 done:
    if (tbuf) vx_buffer_release(tbuf);
-   if (vbuf) vx_buffer_release(vbuf);
+   for (unsigned j = 0; j < 8; j++) if (vbufs_dev[j]) vx_buffer_release(vbufs_dev[j]);
    if (!ok && obuf) vx_buffer_release(obuf);   /* on success the caller owns obuf */
    if (kbuf) vx_kernel_release(kbuf);
    if (kmod) vx_module_release(kmod);

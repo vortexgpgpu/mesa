@@ -287,7 +287,8 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
    /* The front-end working set + colour/depth/texture buffers are resident
     * (pool- / context-owned); only the per-draw VS-output + vertex-input
     * buffers are owned here. */
-   vx_buffer_h vsbuf = NULL, vbuf = NULL, tbuf = NULL, fabuf = NULL;
+   vx_buffer_h vsbuf = NULL, tbuf = NULL, fabuf = NULL;
+   vx_buffer_h vbufs_dev[8] = { NULL };   /* one per distinct vertex buffer */
    /* Per-draw FS descriptor table + one device buffer per bound fragment
     * constant buffer (push constants / UBOs / descriptor blob). */
    vx_buffer_h fs_desc_buf = NULL;
@@ -665,15 +666,22 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       uint64_t vs_argblk[VP_ARG_SLOTS] = { 0 };
       vs_argblk[0] = vs_out_dev;
       if (vin && vin->num_attrs) {
-         VP_CHECK(vx_buffer_create(dev, vin->size, 0, &vbuf), "vx_buffer_create(vbuf)");
-         uint64_t vbuf_dev = 0;
-         VP_CHECK(vx_buffer_address(vbuf, &vbuf_dev), "vx_buffer_address(vbuf)");
-         VP_CHECK(vx_enqueue_write(q, vbuf, 0, vin->data, vin->size, 0, NULL, NULL),
-                  "vx_enqueue_write(vbuf)");
+         /* Upload each distinct vertex-buffer resource once; an attribute then
+          * points at its own buffer's device base + its byte offset. */
+         uint64_t buf_dev[8] = { 0 };
+         for (uint32_t j = 0; j < vin->num_bufs; j++) {
+            VP_CHECK(vx_buffer_create(dev, vin->buf_size[j], 0, &vbufs_dev[j]),
+                     "vx_buffer_create(vbuf)");
+            VP_CHECK(vx_buffer_address(vbufs_dev[j], &buf_dev[j]),
+                     "vx_buffer_address(vbuf)");
+            VP_CHECK(vx_enqueue_write(q, vbufs_dev[j], 0, vin->buf_data[j],
+                                      vin->buf_size[j], 0, NULL, NULL),
+                     "vx_enqueue_write(vbuf)");
+         }
          for (uint32_t i = 0; i < vin->num_attrs; i++) {
             uint32_t loc = vin->attr_loc[i];
             if (loc >= VP_ATTR_TABLE_LOCS) continue;
-            vs_attr_table[loc * 2 + 0] = (uint32_t)vbuf_dev + vin->base_offset
+            vs_attr_table[loc * 2 + 0] = (uint32_t)buf_dev[vin->attr_buf[i]]
                                        + vin->attr_offset[i];
             vs_attr_table[loc * 2 + 1] = vin->attr_stride[i];
          }
@@ -904,7 +912,7 @@ done:
     * are resident (pool- / context-cached) and persist across draws; only the
     * per-draw VS-output + vertex-input buffers are released here. */
    if (tbuf) vx_buffer_release(tbuf);
-   if (vbuf) vx_buffer_release(vbuf);
+   for (vx_buffer_h &b : vbufs_dev) { if (b) vx_buffer_release(b); }
    if (vsbuf) vx_buffer_release(vsbuf);
    if (fabuf) vx_buffer_release(fabuf);
    if (fs_desc_buf) vx_buffer_release(fs_desc_buf);
