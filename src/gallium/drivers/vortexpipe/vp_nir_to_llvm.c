@@ -1492,30 +1492,78 @@ img_desc_u32(struct vp_tr *t, LLVMValueRef desc, unsigned byte_off)
    return LLVMBuildLoad2(t->b, t->i32, p, "imgfld");
 }
 
-/* f32 in [0,1] -> unorm8 (round-to-nearest), value given as its i32 bit pattern. */
+/* f32 in [0,1] -> unsigned-normalized integer of `bits` width (round-to-nearest),
+ * value given as its i32 bit pattern. Covers the 8-bit channels of RGBA8_UNORM and
+ * the 10/2-bit channels of R10G10B10A2_UNORM. */
 static LLVMValueRef
-f32bits_to_unorm8(struct vp_tr *t, LLVMValueRef vi)
+f32bits_to_unorm(struct vp_tr *t, LLVMValueRef vi, unsigned bits)
 {
+   double maxv = (double)((1u << bits) - 1u);
    LLVMValueRef f   = LLVMBuildBitCast(t->b, vi, t->f32, "");
    LLVMValueRef z   = LLVMConstReal(t->f32, 0.0);
    LLVMValueRef one = LLVMConstReal(t->f32, 1.0);
    f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, f, z, ""), f, z, "");
    f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, f, one, ""), f, one, "");
    LLVMValueRef s = LLVMBuildFAdd(t->b,
-      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, 255.0), ""),
+      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, maxv), ""),
       LLVMConstReal(t->f32, 0.5), "");
    LLVMValueRef b = LLVMBuildFPToUI(t->b, s, t->i32, "");
-   return LLVMBuildAnd(t->b, b, LLVMConstInt(t->i32, 0xff, false), "");
+   return LLVMBuildAnd(t->b, b, LLVMConstInt(t->i32, (1u << bits) - 1u, false), "");
 }
 
-/* unorm8 (low byte of `word`) -> f32 in [0,1], returned as its i32 bit pattern. */
+/* `bits`-wide unsigned-normalized field (low bits of `word`) -> f32 in [0,1],
+ * returned as its i32 bit pattern. */
 static LLVMValueRef
-unorm8_to_f32bits(struct vp_tr *t, LLVMValueRef word)
+unorm_to_f32bits(struct vp_tr *t, LLVMValueRef word, unsigned bits)
 {
-   LLVMValueRef byte = LLVMBuildAnd(t->b, word, LLVMConstInt(t->i32, 0xff, false), "");
-   LLVMValueRef f = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte, t->f32, ""),
-                                 LLVMConstReal(t->f32, 1.0 / 255.0), "");
+   LLVMValueRef m = LLVMBuildAnd(t->b, word,
+      LLVMConstInt(t->i32, (1u << bits) - 1u, false), "");
+   LLVMValueRef f = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, m, t->f32, ""),
+      LLVMConstReal(t->f32, 1.0 / (double)((1u << bits) - 1u)), "");
    return LLVMBuildBitCast(t->b, f, t->i32, "");
+}
+
+/* f32 (as i32 bits) -> unsigned float, 5-bit exponent + `mbits` mantissa, no sign
+ * (the packed floats of R11G11B10: R,G use mbits=6, B uses mbits=5). These share
+ * the IEEE half's 5-bit exponent, so the value is relayed through a half: fptrunc
+ * supplies correct rounding/denormals/overflow, and the field is the top (5+mbits)
+ * bits of the half with the always-zero sign dropped. */
+static LLVMValueRef
+f32bits_to_ufloat(struct vp_tr *t, LLVMValueRef vi, unsigned mbits)
+{
+   unsigned shift = 10 - mbits;                 /* a half carries 10 mantissa bits */
+   unsigned mask  = (1u << (5 + mbits)) - 1u;
+   LLVMValueRef f = LLVMBuildBitCast(t->b, vi, t->f32, "");
+   f = LLVMBuildSelect(t->b,                    /* unsigned: clamp <=0 and NaN to 0 */
+      LLVMBuildFCmp(t->b, LLVMRealOGT, f, LLVMConstReal(t->f32, 0.0), ""),
+      f, LLVMConstReal(t->f32, 0.0), "");
+   LLVMValueRef hi = LLVMBuildZExt(t->b,
+      LLVMBuildBitCast(t->b, LLVMBuildFPTrunc(t->b, f,
+         LLVMHalfTypeInContext(t->ctx), ""), LLVMInt16TypeInContext(t->ctx), ""),
+      t->i32, "");
+   /* round the dropped low mantissa bits (round half up); a carry propagates
+    * through the mantissa into the exponent, matching IEEE overflow to inf. */
+   hi = LLVMBuildAdd(t->b, hi, LLVMConstInt(t->i32, 1u << (shift - 1), false), "");
+   return LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, hi, LLVMConstInt(t->i32, shift, false), ""),
+      LLVMConstInt(t->i32, mask, false), "");
+}
+
+/* inverse of f32bits_to_ufloat: unsigned-float field (low bits of `word`) -> f32
+ * bit pattern, via the same half relay. */
+static LLVMValueRef
+ufloat_to_f32bits(struct vp_tr *t, LLVMValueRef word, unsigned mbits)
+{
+   unsigned shift = 10 - mbits;
+   unsigned mask  = (1u << (5 + mbits)) - 1u;
+   LLVMValueRef fld = LLVMBuildAnd(t->b, word,
+      LLVMConstInt(t->i32, mask, false), "");
+   LLVMValueRef h16 = LLVMBuildTrunc(t->b,
+      LLVMBuildShl(t->b, fld, LLVMConstInt(t->i32, shift, false), ""),
+      LLVMInt16TypeInContext(t->ctx), "");
+   LLVMValueRef ff = LLVMBuildFPExt(t->b,
+      LLVMBuildBitCast(t->b, h16, LLVMHalfTypeInContext(t->ctx), ""), t->f32, "");
+   return LLVMBuildBitCast(t->b, ff, t->i32, "");
 }
 
 static void
@@ -2235,31 +2283,43 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       bool store = (in->intrinsic == nir_intrinsic_image_store ||
                     in->intrinsic == nir_intrinsic_bindless_image_store);
       enum pipe_format fmt = nir_intrinsic_format(in);
-      /* Two storage layouts are emitted: verbatim 32-bit lanes (R/RG/RGBA x
-       * FLOAT/UINT/SINT: the raw bits are copied) and unorm8-packed RGBA8_UNORM
-       * (four bytes in one word). Only the format's own channels are touched, so
-       * a 1-channel R32_UINT writes exactly 4 bytes. Single-mip 2D addressing. */
+      /* Storage layouts by class: verbatim 32-bit lanes (RAW32: R/RG/RGBA x
+       * FLOAT/UINT/SINT, raw bits copied), one 16-bit half (F16), and single
+       * 32-bit packed words (UNORM8; R10G10B10A2 UNORM/UINT; R11G11B10 float).
+       * Only the format's own channels are touched. Single-mip 2D addressing. */
       unsigned bpp, nchan;
-      bool packed8, is_float;
+      enum { IMG_RAW32, IMG_UNORM8, IMG_F16, IMG_RGB10A2_UNORM,
+             IMG_RGB10A2_UINT, IMG_RG11B10F } cls;
+      bool is_float;
       switch (fmt) {
-      case PIPE_FORMAT_R32G32B32A32_FLOAT: bpp=16; nchan=4; packed8=false; is_float=true;  break;
+      case PIPE_FORMAT_R32G32B32A32_FLOAT: bpp=16; nchan=4; cls=IMG_RAW32; is_float=true;  break;
       case PIPE_FORMAT_R32G32B32A32_UINT:
-      case PIPE_FORMAT_R32G32B32A32_SINT:  bpp=16; nchan=4; packed8=false; is_float=false; break;
-      case PIPE_FORMAT_R32G32_FLOAT:       bpp=8;  nchan=2; packed8=false; is_float=true;  break;
+      case PIPE_FORMAT_R32G32B32A32_SINT:  bpp=16; nchan=4; cls=IMG_RAW32; is_float=false; break;
+      case PIPE_FORMAT_R32G32_FLOAT:       bpp=8;  nchan=2; cls=IMG_RAW32; is_float=true;  break;
       case PIPE_FORMAT_R32G32_UINT:
-      case PIPE_FORMAT_R32G32_SINT:        bpp=8;  nchan=2; packed8=false; is_float=false; break;
-      case PIPE_FORMAT_R32_FLOAT:          bpp=4;  nchan=1; packed8=false; is_float=true;  break;
+      case PIPE_FORMAT_R32G32_SINT:        bpp=8;  nchan=2; cls=IMG_RAW32; is_float=false; break;
+      case PIPE_FORMAT_R32_FLOAT:          bpp=4;  nchan=1; cls=IMG_RAW32; is_float=true;  break;
       case PIPE_FORMAT_R32_UINT:
-      case PIPE_FORMAT_R32_SINT:           bpp=4;  nchan=1; packed8=false; is_float=false; break;
-      case PIPE_FORMAT_R8G8B8A8_UNORM:     bpp=4;  nchan=4; packed8=true;  is_float=true;  break;
+      case PIPE_FORMAT_R32_SINT:           bpp=4;  nchan=1; cls=IMG_RAW32; is_float=false; break;
+      case PIPE_FORMAT_R8G8B8A8_UNORM:     bpp=4;  nchan=4; cls=IMG_UNORM8;        is_float=true;  break;
+      case PIPE_FORMAT_R16_FLOAT:          bpp=2;  nchan=1; cls=IMG_F16;           is_float=true;  break;
+      case PIPE_FORMAT_R10G10B10A2_UNORM:  bpp=4;  nchan=4; cls=IMG_RGB10A2_UNORM; is_float=true;  break;
+      case PIPE_FORMAT_R10G10B10A2_UINT:   bpp=4;  nchan=4; cls=IMG_RGB10A2_UINT;  is_float=false; break;
+      case PIPE_FORMAT_R11G11B10_FLOAT:    bpp=4;  nchan=3; cls=IMG_RG11B10F;      is_float=true;  break;
       default:
-         mesa_logw("vortexpipe: image %s: unsupported format %d "
-                   "(R/RG/RGBA32 FLOAT/UINT/SINT + RGBA8_UNORM only)",
+         mesa_logw("vortexpipe: image %s: unsupported format %d",
                    store ? "store" : "load", fmt);
          t->ok = false;
          break;
       }
       if (!t->ok) break;
+      /* Field bit-offset and (for the two non-RAW packed classes) the per-channel
+       * width, indexed by component. RGB10A2: R,G,B are 10-bit, A is 2-bit at
+       * bit 30. R11G11B10: R,G are 11-bit at 0/11, B is 10-bit at 22. */
+      const unsigned f_off[4]   = { 0, 10, 20, 30 };  /* RGB10A2 field offsets */
+      const unsigned f_ubits[4] = { 10, 10, 10, 2 };  /* RGB10A2 field widths  */
+      const unsigned uf_off[3]  = { 0, 11, 22 };      /* R11G11B10 field offsets */
+      const unsigned uf_mant[3] = { 6, 6, 5 };        /* R11G11B10 mantissa bits */
       LLVMValueRef desc = intr_src(t, in, 0);
       LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
       LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "imgbase");
@@ -2275,9 +2335,11 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMBuildAdd(t->b, LLVMBuildMul(t->b, x, LLVMConstInt(t->i64, bpp, false), ""),
                             LLVMBuildMul(t->b, y, row, ""), ""), "");
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
+      LLVMTypeRef i16 = LLVMInt16TypeInContext(t->ctx);
+      LLVMTypeRef half = LLVMHalfTypeInContext(t->ctx);
       if (store) {
          addr = emit_store_addr(t, addr);
-         if (!packed8) {
+         if (cls == IMG_RAW32) {
             for (unsigned c = 0; c < nchan; c++) {
                LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, c);
                if (!v) continue;
@@ -2285,39 +2347,87 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
                   LLVMConstInt(t->i64, c * 4u, false), "");
                LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
             }
+         } else if (cls == IMG_F16) {
+            /* one 16-bit half (relay through the same fptrunc as from_float) */
+            LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, 0);
+            LLVMValueRef h = LLVMBuildBitCast(t->b,
+               LLVMBuildFPTrunc(t->b, LLVMBuildBitCast(t->b, v, t->f32, ""), half, ""),
+               i16, "");
+            LLVMBuildStore(t->b, h, LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
          } else {
+            /* single 32-bit packed word: UNORM8, R10G10B10A2 (UNORM/UINT), R11G11B10F */
             LLVMValueRef packed = LLVMConstInt(t->i32, 0, false);
             for (unsigned c = 0; c < nchan; c++) {
                LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, c);
                if (!v) continue;
-               LLVMValueRef b = f32bits_to_unorm8(t, v);
+               LLVMValueRef fld;
+               unsigned off;
+               switch (cls) {
+               case IMG_UNORM8:
+                  fld = f32bits_to_unorm(t, v, 8);  off = c * 8u; break;
+               case IMG_RGB10A2_UNORM:
+                  fld = f32bits_to_unorm(t, v, f_ubits[c]); off = f_off[c]; break;
+               case IMG_RGB10A2_UINT:
+                  fld = LLVMBuildAnd(t->b, v,
+                     LLVMConstInt(t->i32, (1u << f_ubits[c]) - 1u, false), "");
+                  off = f_off[c]; break;
+               default: /* IMG_RG11B10F */
+                  fld = f32bits_to_ufloat(t, v, uf_mant[c]); off = uf_off[c]; break;
+               }
                packed = LLVMBuildOr(t->b, packed,
-                  LLVMBuildShl(t->b, b, LLVMConstInt(t->i32, c * 8u, false), ""), "");
+                  LLVMBuildShl(t->b, fld, LLVMConstInt(t->i32, off, false), ""), "");
             }
             LLVMBuildStore(t->b, packed, LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
          }
       } else {
          /* Image loads always yield a vec4; channels the format lacks read back
           * as 0 (G,B) and 1 (A) per Vulkan storage-image semantics. */
-         LLVMValueRef packed = NULL;
-         if (packed8)
-            packed = LLVMBuildLoad2(t->b, t->i32,
+         LLVMValueRef word = NULL;
+         if (cls == IMG_UNORM8 || cls == IMG_RGB10A2_UNORM ||
+             cls == IMG_RGB10A2_UINT || cls == IMG_RG11B10F)
+            word = LLVMBuildLoad2(t->b, t->i32,
                LLVMBuildIntToPtr(t->b, addr, t->ptr, ""), "img");
          LLVMTypeRef lt = ity(t, in->def.bit_size);
          unsigned one = is_float ? 0x3f800000u : 1u;
          for (unsigned c = 0; c < in->def.num_components; c++) {
             LLVMValueRef val;
-            if (c < nchan && packed8) {
-               LLVMValueRef w = LLVMBuildLShr(t->b, packed,
-                  LLVMConstInt(t->i32, c * 8u, false), "");
-               val = unorm8_to_f32bits(t, w);
-            } else if (c < nchan) {
+            if (c >= nchan) {
+               val = LLVMConstInt(lt, (c == 3) ? one : 0u, false);
+            } else switch (cls) {
+            case IMG_RAW32: {
                LLVMValueRef a = LLVMBuildAdd(t->b, addr,
                   LLVMConstInt(t->i64, c * 4u, false), "");
                val = LLVMBuildLoad2(t->b, lt,
                   LLVMBuildIntToPtr(t->b, a, t->ptr, ""), "img");
-            } else {
-               val = LLVMConstInt(lt, (c == 3) ? one : 0u, false);
+               break;
+            }
+            case IMG_F16: {
+               LLVMValueRef h = LLVMBuildLoad2(t->b, i16,
+                  LLVMBuildIntToPtr(t->b, addr, t->ptr, ""), "img");
+               val = LLVMBuildBitCast(t->b,
+                  LLVMBuildFPExt(t->b, LLVMBuildBitCast(t->b, h, half, ""), t->f32, ""),
+                  t->i32, "");
+               break;
+            }
+            case IMG_UNORM8:
+               val = unorm_to_f32bits(t,
+                  LLVMBuildLShr(t->b, word, LLVMConstInt(t->i32, c * 8u, false), ""), 8);
+               break;
+            case IMG_RGB10A2_UNORM:
+               val = unorm_to_f32bits(t,
+                  LLVMBuildLShr(t->b, word, LLVMConstInt(t->i32, f_off[c], false), ""),
+                  f_ubits[c]);
+               break;
+            case IMG_RGB10A2_UINT:
+               val = LLVMBuildAnd(t->b,
+                  LLVMBuildLShr(t->b, word, LLVMConstInt(t->i32, f_off[c], false), ""),
+                  LLVMConstInt(t->i32, (1u << f_ubits[c]) - 1u, false), "");
+               break;
+            default: /* IMG_RG11B10F */
+               val = ufloat_to_f32bits(t,
+                  LLVMBuildLShr(t->b, word, LLVMConstInt(t->i32, uf_off[c], false), ""),
+                  uf_mant[c]);
+               break;
             }
             ssa_set(t, in->def.index, c, val);
          }
