@@ -170,8 +170,9 @@ struct vp_tr {
    struct vp_var  vars[VP_MAXV];
    unsigned       nvars;
    /* Per-unit SW routing (FS only). fs_texstate is fs_main's 3rd
-    * param: a resident gfx_sw_texstate_t[] (per sampler stage), used by
-    * emit_vx_tex when sw_tex; null pointer when texturing is HW. */
+    * param: a resident gfx_sw_texstate_t[] (per sampler stage). The SW sampler
+    * reads all of it; the HW-tex FS reads logdim/filter to derive the mip LOD and
+    * the min/mag tap. Zero (unused) for an untextured draw. */
    bool           sw_tex;
    bool           sw_om;
    bool           sw_raster;  /* FS is the one-warp-per-tile SW-raster kernel */
@@ -1393,7 +1394,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
    ssa_set(t, d->def.index, 0, addr);
 }
 
-/* RTU emit helpers (defined after emit_vx_tex, below). */
+/* RTU emit helpers (defined after the TEX emitters, below). */
 static LLVMValueRef emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status);
 static LLVMValueRef emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene,
                                       LLVMValueRef flags_cull,
@@ -2512,27 +2513,29 @@ emit_vx_gfx_get_after(struct vp_tr *t, unsigned slot, LLVMValueRef handle)
    return LLVMBuildCall2(t->b, fnty, ia, a, 1, "texw");
 }
 
-/* vx_tex: sample TEX stage 0 (custom-1 funct3=5, R4-type). u/v/lod ride
- * rs1/rs2/rs3 and the packed A8R8G8B8 texel returns in rd. */
+/* Software sampler: gfx_tex_sample_sw(&texstate[0], u, v, lod, filter) on the
+ * resident descriptor table (fs_main's 3rd param). Same fixed-point u/v/lod
+ * convention; `filter` (tap in bit0, mip-linear in bit1) is resolved by the caller.
+ * Returns the packed A8R8G8B8 texel. */
 static LLVMValueRef
-emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
-            LLVMValueRef lod)
+emit_tex_sw(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lod,
+            LLVMValueRef filter)
 {
-   /* Software sampler: call gfx_tex_sample_sw(&texstate[0], u, v, lod) on the
-    * resident descriptor table (fs_main's 3rd param) instead of the FF TEX unit.
-    * Same fixed-point u/v/lod convention; returns the packed A8R8G8B8 texel. */
-   if (t->sw_tex) {
-      LLVMTypeRef params[4] = { t->ptr, t->i32, t->i32, t->i32 };
-      LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 4, false);
-      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_sw");
-      if (!fn)
-         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_sw", fty);
-      LLVMValueRef a[4] = { t->fs_texstate, u, v, lod };  /* stage 0 = table[0] */
-      return LLVMBuildCall2(t->b, fty, fn, a, 4, "texsw");
-   }
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_sw", fty);
+   LLVMValueRef a[5] = { t->fs_texstate, u, v, lod, filter };  /* stage 0 = table[0] */
+   return LLVMBuildCall2(t->b, fty, fn, a, 5, "texsw");
+}
 
-   /* vx_tex: rs1=u, rs2=v, rs3=lod, rd=texel, funct2=stage(0). The TEX unit takes
-    * its operands in registers -- no window staging, no handle chaining. */
+/* vx_tex: sample TEX stage 0 (custom-1 funct3=5, R4-type). u/v/lod ride rs1/rs2/rs3
+ * and the packed A8R8G8B8 texel returns in rd. The tap filter is a per-draw DCR, so
+ * this path is only used for non-mipmapped draws (single filter, base level). */
+static LLVMValueRef
+emit_tex_hw(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lod)
+{
    const char *s = ".insn r4 43, 5, 0, $0, $1, $2, $3";
    LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 3, false);
@@ -2686,13 +2689,13 @@ emit_umax64(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b)
    return LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntUGT, a, b, ""), a, b, "");
 }
 
-/* Integer mip LOD for the lane's quad, matching vx_tex_auto_lod (vx_tex_lod.h):
- * max over the four |du|,|dv| gradients (scaled by log2 dims), then
- * floor(log2 rho) - FXD_FRAC, clamped to [0, VX_TEX_LOD_MAX]. logw/logh come from
- * the resident TEX descriptor (fs_texstate) because the TEX DCRs are host-write-
- * only; quad neighbours arrive through the quad-scoped SHFL (bfly). */
+/* The lane quad's max texel-space gradient rho (S.FXD_FRAC fixed-point, i64):
+ * max over the four |du|,|dv| gradients scaled by the log2 dims. log2(rho) - FXD_FRAC
+ * is lambda. logw/logh come from the resident TEX descriptor (fs_texstate) because the
+ * TEX DCRs are host-write-only; quad neighbours arrive through the quad-scoped SHFL
+ * (bfly), so this must run with the whole quad active. */
 static LLVMValueRef
-emit_tex_auto_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
+emit_tex_grad_rho(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
 {
    LLVMValueRef off = LLVMConstInt(t->i32,
       offsetof(gfx_sw_texstate_t, logdim), false);
@@ -2709,23 +2712,96 @@ emit_tex_auto_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
    LLVMValueRef uh = emit_shfl(t, 6, u, bch), uv = emit_shfl(t, 6, u, bcv);
    LLVMValueRef vh = emit_shfl(t, 6, v, bch), vv = emit_shfl(t, 6, v, bcv);
 
-   LLVMValueRef rho = emit_umax64(t,
+   return emit_umax64(t,
       emit_umax64(t, emit_lod_grad(t, u, uh, logw), emit_lod_grad(t, u, uv, logw)),
       emit_umax64(t, emit_lod_grad(t, v, vh, logh), emit_lod_grad(t, v, vv, logh)));
+}
+
+/* Load the resident TEX descriptor's filter word (fs_texstate). */
+static LLVMValueRef
+emit_tex_filter_word(struct vp_tr *t)
+{
+   LLVMValueRef off = LLVMConstInt(t->i32,
+      offsetof(gfx_sw_texstate_t, filter), false);
+   LLVMValueRef p = LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off, 1, "filter_p");
+   return LLVMBuildLoad2(t->b, t->i32, p, "filter");
+}
+
+/* Implicit-LOD sample of a mipmapped texture through the SW sampler: the HW TEX
+ * unit has one per-draw filter DCR and no inter-level blend, so a mipmapped sampler
+ * routes here. Resolve the tap filter per fragment from the sign of lambda (minified
+ * -> min tap, magnified -> mag tap), pick the mip level (round-to-nearest for
+ * mip-nearest, Q(VX_TEX_LOD_FRAC_BITS) fractional lambda for mip-linear), and sample.
+ * Must run with the whole quad active (the derivative SHFL). */
+static LLVMValueRef
+emit_tex_sw_resolved(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
+{
+   LLVMValueRef rho  = emit_tex_grad_rho(t, u, v);
+   LLVMValueRef filt = emit_tex_filter_word(t);
+   LLVMValueRef zero64 = LLVMConstInt(t->i64, 0, false);
+
+   /* minified when lambda > 0, i.e. rho > 2^FXD_FRAC (rho carries FXD_FRAC frac bits). */
+   LLVMValueRef one_fxd = LLVMConstInt(t->i64, (uint64_t)1 << VP_TEX_FXD_FRAC, false);
+   LLVMValueRef minified = LLVMBuildICmp(t->b, LLVMIntUGT, rho, one_fxd, "minified");
+
+   /* tap: min (bit3) when minified, mag (bit0) otherwise. */
+   LLVMValueRef mag_tap = LLVMBuildAnd(t->b, filt, LLVMConstInt(t->i32, 1, false), "mag_tap");
+   LLVMValueRef min_tap = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, filt, LLVMConstInt(t->i32, 3, false), ""),
+      LLVMConstInt(t->i32, 1, false), "min_tap");
+   LLVMValueRef tap = LLVMBuildSelect(t->b, minified, min_tap, mag_tap, "tap");
+
+   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
+      LLVMConstInt(t->i32, 0, false), "mip_lin");
 
    LLVMValueRef msb = LLVMBuildSub(t->b, LLVMConstInt(t->i64, 63, false),
                                    emit_ctlz64(t, rho), "msb");
-   LLVMValueRef lod = LLVMBuildSub(t->b, msb,
-      LLVMConstInt(t->i64, VP_TEX_FXD_FRAC, false), "lod");
-   LLVMValueRef zero = LLVMConstInt(t->i64, 0, false);
-   lod = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSLT, lod, zero, ""),
-                         zero, lod, "");
+   LLVMValueRef one_msb = LLVMBuildShl(t->b, LLVMConstInt(t->i64, 1, false), msb, "one_msb");
+
+   /* mip-nearest level = round(lambda) = ceil(lambda+0.5)-1: step up when rho passes
+    * the sqrt(2)*2^msb midpoint (181/128 ~= sqrt2). */
+   LLVMValueRef thr = LLVMBuildLShr(t->b,
+      LLVMBuildMul(t->b, one_msb, LLVMConstInt(t->i64, 181, false), ""),
+      LLVMConstInt(t->i64, 7, false), "thr");
+   LLVMValueRef round_up = LLVMBuildZExt(t->b,
+      LLVMBuildICmp(t->b, LLVMIntUGE, rho, thr, ""), t->i64, "round_up");
+   LLVMValueRef lod_near = LLVMBuildSub(t->b,
+      LLVMBuildAdd(t->b, msb, round_up, ""),
+      LLVMConstInt(t->i64, VP_TEX_FXD_FRAC, false), "lod_near");
    LLVMValueRef maxlod = LLVMConstInt(t->i64, VX_TEX_LOD_MAX, false);
-   lod = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod, maxlod, ""),
-                         maxlod, lod, "");
-   lod = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntEQ, rho, zero, ""),
-                         zero, lod, "");
-   return LLVMBuildTrunc(t->b, lod, t->i32, "lod32");
+   lod_near = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_near, maxlod, ""),
+                              maxlod, lod_near, "");
+
+   /* mip-linear (trilinear): Q(VX_TEX_LOD_FRAC_BITS) fixed-point lambda; the SW
+    * sampler splits it into floor level + fractional blend. Fractional part of
+    * log2(rho) approximated by the mantissa (rho & (2^msb-1)) / 2^msb. */
+   LLVMValueRef ip = LLVMBuildShl(t->b,
+      LLVMBuildSub(t->b, msb, LLVMConstInt(t->i64, VP_TEX_FXD_FRAC, false), ""),
+      LLVMConstInt(t->i64, VX_TEX_LOD_FRAC_BITS, false), "");
+   LLVMValueRef mant = LLVMBuildAnd(t->b, rho,
+      LLVMBuildSub(t->b, one_msb, LLVMConstInt(t->i64, 1, false), ""), "");
+   LLVMValueRef fp = LLVMBuildLShr(t->b,
+      LLVMBuildShl(t->b, mant, LLVMConstInt(t->i64, VX_TEX_LOD_FRAC_BITS, false), ""),
+      msb, "");
+   LLVMValueRef lod_lin = LLVMBuildAdd(t->b, ip, fp, "lod_lin");
+
+   LLVMValueRef lod64 = LLVMBuildSelect(t->b, mip_lin, lod_lin, lod_near, "");
+   /* magnified -> base level 0; rho==0 (uniform quad) -> level 0. */
+   lod64 = LLVMBuildSelect(t->b, minified, lod64, zero64, "");
+   lod64 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntEQ, rho, zero64, ""),
+                           zero64, lod64, "");
+   LLVMValueRef lod = LLVMBuildTrunc(t->b, lod64, t->i32, "lod");
+
+   /* sw_filter = tap | mip-linear (only meaningful when minified). */
+   LLVMValueRef mip_bit = LLVMBuildSelect(t->b,
+      LLVMBuildAnd(t->b, minified, mip_lin, ""),
+      LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false),
+      LLVMConstInt(t->i32, 0, false), "");
+   LLVMValueRef sw_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+
+   return emit_tex_sw(t, u, v, lod, sw_filter);
 }
 
 /* A NIR texture op: a 2D `texture()`/`textureLod()`/`textureBias()` sampling the
@@ -2760,31 +2836,54 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
       LLVMBuildBitCast(t->b, v, t->f32, ""), scale, ""), t->i32, "");
 
-   /* Implicit-LOD `texture()` derives the integer mip from the quad's coordinate
-    * gradients (matching vx_tex_auto_lod); the TEX unit indexes mipoff[lod] for
-    * the level. Explicit-LOD/bias fall back to level 0. The auto-LOD applies only
-    * when the sampler actually has a mip chain (texstate.filter mip-enable bit):
-    * a non-mipmapped NEAREST/LINEAR sampler always reads the base level, whatever
-    * the gradients are. */
-   LLVMValueRef lod;
-   if (tex->op == nir_texop_tex) {
-      LLVMValueRef auto_lod = emit_tex_auto_lod(t, ux, vx);
-      LLVMValueRef foff = LLVMConstInt(t->i32,
-         offsetof(gfx_sw_texstate_t, filter), false);
-      LLVMValueRef fp = LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &foff, 1,
-                                      "filter_p");
-      LLVMValueRef filt = LLVMBuildLoad2(t->b, t->i32, fp, "filter");
+   /* Sample. Implicit-LOD `texture()` on a HW-TEX device: a mipmapped sampler
+    * (texstate.filter mip-enable bit) routes to the SW sampler, which resolves the
+    * min/mag tap per fragment and the mip level (nearest or trilinear); a non-
+    * mipmapped sampler stays on the fast HW TEX path at the base level. mip-enable is
+    * a uniform descriptor bit, so the branch never diverges. On a TEX-less device
+    * (t->sw_tex) every sample is software. Explicit-LOD/bias (txl/txb) have no
+    * derivatives and take the base level. */
+   LLVMValueRef texel;
+   if (tex->op == nir_texop_tex && !t->sw_tex) {
+      LLVMValueRef filt = emit_tex_filter_word(t);
       LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
          LLVMBuildAnd(t->b, filt,
             LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
          LLVMConstInt(t->i32, 0, false), "mip_en");
-      lod = LLVMBuildSelect(t->b, mip_en, auto_lod,
-                            LLVMConstInt(t->i32, 0, false), "lod");
-   } else {
-      lod = LLVMConstInt(t->i32, 0, false);
-   }
+      LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
+      LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_sw");
+      LLVMBasicBlockRef bb_hw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_hw");
+      LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_merge");
+      LLVMBuildCondBr(t->b, mip_en, bb_sw, bb_hw);
 
-   LLVMValueRef texel = emit_vx_tex(t, ux, vx, lod);
+      LLVMPositionBuilderAtEnd(t->b, bb_sw);
+      LLVMValueRef texel_sw = emit_tex_sw_resolved(t, ux, vx);
+      LLVMBasicBlockRef end_sw = LLVMGetInsertBlock(t->b);
+      LLVMBuildBr(t->b, bb_mg);
+
+      LLVMPositionBuilderAtEnd(t->b, bb_hw);
+      LLVMValueRef texel_hw = emit_tex_hw(t, ux, vx, LLVMConstInt(t->i32, 0, false));
+      LLVMBasicBlockRef end_hw = LLVMGetInsertBlock(t->b);
+      LLVMBuildBr(t->b, bb_mg);
+
+      LLVMPositionBuilderAtEnd(t->b, bb_mg);
+      texel = LLVMBuildPhi(t->b, t->i32, "texel");
+      LLVMValueRef vals[2] = { texel_sw, texel_hw };
+      LLVMBasicBlockRef bbs[2] = { end_sw, end_hw };
+      LLVMAddIncoming(texel, vals, bbs, 2);
+   } else if (tex->op == nir_texop_tex) {
+      /* TEX-less device: software always. Resolves min/mag + mip like the HW-device
+       * SW branch (a non-mipmapped sampler falls out as magnified -> base level). */
+      texel = emit_tex_sw_resolved(t, ux, vx);
+   } else {
+      /* txl/txb: explicit LOD 0, no derivatives. */
+      LLVMValueRef z = LLVMConstInt(t->i32, 0, false);
+      texel = t->sw_tex
+         ? emit_tex_sw(t, ux, vx, z,
+                       LLVMBuildAnd(t->b, emit_tex_filter_word(t),
+                          LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR - 1, false), ""))
+         : emit_tex_hw(t, ux, vx, z);
+   }
 
    /* unpack A8R8G8B8 -> {r,g,b,a} floats in [0,1]. */
    static const unsigned shift[4] = { 16, 8, 0, 24 };

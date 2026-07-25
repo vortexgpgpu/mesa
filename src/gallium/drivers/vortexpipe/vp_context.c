@@ -602,7 +602,13 @@ vp_create_fs_state(struct pipe_context *pipe,
          &cso->tex_desc_cbuf, &cso->tex_desc_offset);
       if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir, NULL,
                          &cso->fs_routing)) {
-         bool uses_sw = cso->fs_routing.sw_tex || cso->fs_routing.sw_om;
+         /* Co-compile the gfx_sw ABI (gfx_tex_sample_sw / gfx_om_fragment_sw)
+          * whenever the FS could call it: a routed-to-SW unit, or a HW-TEX shader
+          * that samples a texture (a mipmapped sampler routes to the SW sampler at
+          * draw time via the emit_tex runtime branch). --gc-sections drops it if
+          * unused, so a non-mipmapped textured FS pays only compile time. */
+         bool uses_sw = cso->fs_routing.sw_tex || cso->fs_routing.sw_om ||
+                        cso->has_tex_desc;
          if (vp_compile_vxbin(ir, VP_STARTUP_FS, uses_sw, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled fragment shader -> %zu-byte .vxbin%s",
                    cso->vxbin_size, uses_sw ? " (SW units)" : "");
@@ -708,7 +714,8 @@ vp_create_texture_handle(struct pipe_context *pipe,
       }
    }
    if (state) {
-      vp->cur_sampler_store.filter = vp_vx_filter(state->mag_img_filter);
+      vp->cur_sampler_store.filter     = vp_vx_filter(state->mag_img_filter);
+      vp->cur_sampler_store.min_filter = vp_vx_filter(state->min_img_filter);
       vp->cur_sampler_store.wrap_u = vp_vx_wrap(state->wrap_s);
       vp->cur_sampler_store.wrap_v = vp_vx_wrap(state->wrap_t);
       /* Vulkan has no "disable mipmapping" flag; a non-mipmapped NEAREST/LINEAR
@@ -717,10 +724,13 @@ vp_create_texture_handle(struct pipe_context *pipe,
        * (nearest-mip selects ceil(lod + 0.5) - 1), so that is the mipmap-enable
        * test — min_mip_filter is always NEAREST here and cannot distinguish them. */
       vp->cur_sampler_store.mip_enable = (state->max_lod > 0.5f);
+      vp->cur_sampler_store.mip_linear =
+         (state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR);
       vp->cur_sampler = &vp->cur_sampler_store;
-      vp_dbg("vortexpipe: TEX sampler captured filter=%u wrap=%u,%u mip_enable=%u",
-             vp->cur_sampler->filter, vp->cur_sampler->wrap_u,
-             vp->cur_sampler->wrap_v, vp->cur_sampler->mip_enable);
+      vp_dbg("vortexpipe: TEX sampler captured mag=%u min=%u wrap=%u,%u mip_enable=%u mip_linear=%u",
+             vp->cur_sampler->filter, vp->cur_sampler->min_filter,
+             vp->cur_sampler->wrap_u, vp->cur_sampler->wrap_v,
+             vp->cur_sampler->mip_enable, vp->cur_sampler->mip_linear);
    }
    return vp->lp_create_texture_handle(pipe, view, state);
 }
@@ -1941,7 +1951,11 @@ vp_draw_vbo(struct pipe_context *pipe,
                                             : VX_TEX_WRAP_CLAMP;
                tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
                                             : VX_TEX_WRAP_CLAMP;
+               tex.min_filter = vp->cur_sampler ? vp->cur_sampler->min_filter
+                                                : VX_TEX_FILTER_POINT;
                tex.mip_enable = vp->cur_sampler ? vp->cur_sampler->mip_enable
+                                                : false;
+               tex.mip_linear = vp->cur_sampler ? vp->cur_sampler->mip_linear
                                                 : false;
                tex_used = true;
             }

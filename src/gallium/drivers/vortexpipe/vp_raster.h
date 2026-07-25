@@ -91,10 +91,12 @@ struct vp_mrt_params {
 struct vp_tex_params {
    uint32_t    width;
    uint32_t    height;
-   uint32_t    filter;      /* VX_TEX_FILTER_* (bit0 mag/min, bit1 mip-linear) */
+   uint32_t    filter;      /* VX_TEX_FILTER_* -- the mag tap */
+   uint32_t    min_filter;  /* VX_TEX_FILTER_* -- the min (minification) tap */
    uint32_t    wrap_u;      /* VX_TEX_WRAP_* */
    uint32_t    wrap_v;
    bool        mip_enable;  /* sampler has a mip chain (else FS forces LOD 0) */
+   bool        mip_linear;  /* mip mode LINEAR (trilinear) rather than nearest */
    uint32_t    mip_off[VX_TEX_LOD_MAX + 1];  /* per-LOD byte offset from base */
 };
 

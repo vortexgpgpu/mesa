@@ -154,10 +154,12 @@ struct vp_rast_cso {
  * routes both image views and samplers through create_texture_handle,
  * so vortexpipe captures the sampler's filter/wrap there. */
 struct vp_sampler_cso {
-   uint32_t filter;            /* VX_TEX_FILTER_* */
+   uint32_t filter;            /* VX_TEX_FILTER_* -- the mag tap */
+   uint32_t min_filter;        /* VX_TEX_FILTER_* -- the min (minification) tap */
    uint32_t wrap_u;            /* VX_TEX_WRAP_* */
    uint32_t wrap_v;
    bool     mip_enable;        /* sampler reaches a non-base level (max_lod > 0.5) */
+   bool     mip_linear;        /* mip mode is LINEAR (trilinear) rather than nearest */
 };
 
 /* Captured vertex-input layout. The VS kernel fetches one thread's

@@ -527,10 +527,14 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
             texstate.mip_off[i] = tex->mip_off[i];
          texstate.logdim = (vp_log2u(tex->height) << 16) | vp_log2u(tex->width);
          texstate.format = VX_TEX_FORMAT_A8R8G8B8;
-         /* mip-enable is a descriptor-only bit (the FS reads it to gate its
-          * auto-LOD); it never reaches the HW TEX_FILTER DCR below. */
-         texstate.filter = tex->filter |
-            (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u);
+         /* Descriptor-only filter bits (the FS reads them; they never reach the HW
+          * TEX_FILTER DCR below): mag tap (bit0, from tex->filter), min tap (bit3),
+          * mip-linear (bit1) and mip-enable (bit2). A mipmapped sampler routes to
+          * the SW sampler, which resolves min-vs-mag per fragment from these. */
+         texstate.filter = tex->filter
+            | (tex->min_filter == VX_TEX_FILTER_BILINEAR ? GFX_SW_TEX_FILTER_MIN_BILINEAR : 0u)
+            | (tex->mip_linear ? VX_TEX_FILTER_MIP_LINEAR : 0u)
+            | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u);
          texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
          /* Carry the mip-0 integer dims so the SW sampler can address NPOT
           * textures (multiply addressing). POT textures leave width==1<<logdim
