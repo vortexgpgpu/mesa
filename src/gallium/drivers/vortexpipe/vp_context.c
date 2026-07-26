@@ -580,7 +580,9 @@ vp_fs_uses_sw_texop(struct nir_shader *nir)
             if (instr->type != nir_instr_type_tex)
                continue;
             nir_tex_instr *tex = nir_instr_as_tex(instr);
-            if (tex->is_shadow || tex->is_array || tex->op == nir_texop_tg4 ||
+            if (tex->is_shadow || tex->is_array ||
+                tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
+                tex->op == nir_texop_tg4 ||
                 tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
                return true;
          }

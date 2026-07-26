@@ -3002,6 +3002,23 @@ emit_tex_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef
    emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 5, "texarray"));
 }
 
+/* samplerCube: gfx_tex_sample_cube_sw(&texstate[0], sc, tc, rc, lod) -- pick the
+ * face from the major axis of the (sc,tc,rc) direction, project, and sample; the
+ * six faces are slices of the resident descriptor (layer_stride apart). Unpack the
+ * A8R8G8B8 texel to the def's vec4. */
+static void
+emit_tex_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc, LLVMValueRef tc,
+              LLVMValueRef rc, LLVMValueRef lod)
+{
+   LLVMTypeRef params[5] = { t->ptr, t->f32, t->f32, t->f32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_cube_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_cube_sw", fty);
+   LLVMValueRef a[5] = { t->fs_texstate, sc, tc, rc, lod };
+   emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 5, "texcube"));
+}
+
 /* A NIR texture op: a 2D `texture()`/`textureLod()`/`textureBias()` sampling the
  * single bound texture (TEX stage 0), or `texelFetch()` (integer-coord fetch, no
  * filter). The interpolated texcoord is the coord source; the texture/sampler
@@ -3074,6 +3091,28 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
             LLVMBuildICmp(t->b, LLVMIntSLT, lod, zero, ""), zero, lod, "");
       }
       emit_tex_array(t, tex, ux, vx, layer, lod);
+      return;
+   }
+
+   /* samplerCube: coord.xyz is the direction vector; the SW cube entry selects the
+    * face and projects. Handled before the 2D dispatch (a cube sample is still
+    * nir_texop_tex/txl). */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && !tex->is_array && u && v) {
+      LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "");
+      LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "");
+      LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      /* txl carries a float LOD; the cube entry takes an integer level (mip-nearest,
+       * single-level lands on 0 via mip_off clamp). Auto-LOD/base take level 0. */
+      LLVMValueRef lod = zero;
+      if (tex->op == nir_texop_txl && lod_int) {
+         LLVMValueRef lodf = LLVMBuildBitCast(t->b, lod_int, t->f32, "");
+         lod = LLVMBuildFPToSI(t->b,
+            LLVMBuildFAdd(t->b, lodf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "");
+         lod = LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntSLT, lod, zero, ""), zero, lod, "");
+      }
+      emit_tex_cube(t, tex, sc, tc, rc, lod);
       return;
    }
 
