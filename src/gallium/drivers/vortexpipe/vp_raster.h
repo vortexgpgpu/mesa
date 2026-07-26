@@ -100,6 +100,7 @@ struct vp_tex_params {
    uint32_t    mip_off[VX_TEX_LOD_MAX + 1];  /* per-LOD byte offset from base */
    uint32_t    compare_func;  /* shadow compare op (VX_OM_DEPTH_FUNC_*); 0 => none */
    uint32_t    format;      /* VX_TEX_FORMAT_* (depth formats for shadow); 0 => A8R8G8B8 */
+   uint32_t    swizzle;     /* view component map: r|g<<3|b<<6|a<<9 (0..3=RGBA, 4=0, 5=1) */
 };
 
 /* Run the WHOLE draw as one device-orchestrated command: the vertex shader

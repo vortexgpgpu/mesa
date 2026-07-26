@@ -721,8 +721,15 @@ vp_create_texture_handle(struct pipe_context *pipe,
    if (view && view->texture) {
       vp->cur_tex = view->texture;
       vp->cur_tex_first_level = view->u.tex.first_level;
-      vp_dbg("vortexpipe: TEX texture captured (%ux%u) base_level=%u",
-             vp->cur_tex->width0, vp->cur_tex->height0, vp->cur_tex_first_level);
+      /* Pack the view's component swizzle (PIPE_SWIZZLE_* 0..5) so the SW gather
+       * can remap the requested component to the mapped source channel. */
+      vp->cur_tex_swizzle = (view->swizzle_r & 0x7u)
+                          | ((view->swizzle_g & 0x7u) << 3)
+                          | ((view->swizzle_b & 0x7u) << 6)
+                          | ((view->swizzle_a & 0x7u) << 9);
+      vp_dbg("vortexpipe: TEX texture captured (%ux%u) base_level=%u swizzle=0x%x",
+             vp->cur_tex->width0, vp->cur_tex->height0, vp->cur_tex_first_level,
+             vp->cur_tex_swizzle);
       /* Record this texture's level-0 host base so a draw can match its FS tex
        * descriptor (lp_jit_texture.base) back to the resource — the per-draw
        * selection that lets >1 bound texture disambiguate. Dedup by resource. */
@@ -2048,6 +2055,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                tex.compare_func =
                   (vp->cur_sampler && vp->cur_sampler->compare_enable)
                      ? vp_vx_depth_func(vp->cur_sampler->compare_func) : 0u;
+               tex.swizzle = vp->cur_tex_swizzle;
                tex_used = true;
             }
          }
