@@ -2819,6 +2819,63 @@ emit_tex_sw_resolved(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
    return emit_tex_sw(t, u, v, lod, sw_filter);
 }
 
+/* textureLod: sample with an EXPLICIT lambda (float lod source) rather than the
+ * quad-gradient-derived rho. Same tap + mip resolution as emit_tex_sw_resolved,
+ * but driven by lambda directly: minified when lambda>0 (pick the min tap, else
+ * mag); mip-nearest level = round(lambda); mip-linear level = Q(FRAC) lambda for
+ * the SW sampler's floor+blend. `lam_bits` is the lod source's raw i32 (f32 bits). */
+static LLVMValueRef
+emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lam_bits)
+{
+   LLVMValueRef filt = emit_tex_filter_word(t);
+   LLVMValueRef zerof = LLVMConstReal(t->f32, 0.0);
+   LLVMValueRef lam = LLVMBuildBitCast(t->b, lam_bits, t->f32, "lambda");
+   LLVMValueRef minified = LLVMBuildFCmp(t->b, LLVMRealOGT, lam, zerof, "minified");
+   /* clamp lambda >= 0 for the level arithmetic (a magnified texel takes level 0). */
+   LLVMValueRef lam_c = LLVMBuildSelect(t->b, minified, lam, zerof, "lam_c");
+
+   /* tap: min (bit3) when minified, mag (bit0) otherwise. */
+   LLVMValueRef mag_tap = LLVMBuildAnd(t->b, filt, LLVMConstInt(t->i32, 1, false), "mag_tap");
+   LLVMValueRef min_tap = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, filt, LLVMConstInt(t->i32, 3, false), ""),
+      LLVMConstInt(t->i32, 1, false), "min_tap");
+   LLVMValueRef tap = LLVMBuildSelect(t->b, minified, min_tap, mag_tap, "tap");
+
+   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
+      LLVMConstInt(t->i32, 0, false), "mip_lin");
+
+   LLVMValueRef maxlod_i = LLVMConstInt(t->i32, VX_TEX_LOD_MAX, false);
+   /* mip-nearest: round(lambda) = floor(lambda + 0.5) (lambda >= 0 -> trunc). */
+   LLVMValueRef lod_near = LLVMBuildFPToSI(t->b,
+      LLVMBuildFAdd(t->b, lam_c, LLVMConstReal(t->f32, 0.5), ""), t->i32, "lod_near");
+   lod_near = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_near, maxlod_i, ""),
+                              maxlod_i, lod_near, "");
+   /* mip-linear: Q(VX_TEX_LOD_FRAC_BITS) fixed-point lambda. */
+   LLVMValueRef maxlod_q = LLVMConstInt(t->i32, VX_TEX_LOD_MAX << VX_TEX_LOD_FRAC_BITS, false);
+   LLVMValueRef lod_lin = LLVMBuildFPToSI(t->b,
+      LLVMBuildFMul(t->b, lam_c,
+         LLVMConstReal(t->f32, (double)(1u << VX_TEX_LOD_FRAC_BITS)), ""), t->i32, "lod_lin");
+   lod_lin = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_lin, maxlod_q, ""),
+                             maxlod_q, lod_lin, "");
+
+   LLVMValueRef lod = LLVMBuildSelect(t->b, mip_lin, lod_lin, lod_near, "lod");
+   /* A non-mipmapped sampler (mip-enable clear) has only level 0: force it, so
+    * an explicit lambda>0 never indexes a level the texture does not carry. */
+   LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
+      LLVMConstInt(t->i32, 0, false), "mip_en");
+   lod = LLVMBuildSelect(t->b, mip_en, lod, LLVMConstInt(t->i32, 0, false), "");
+   LLVMValueRef mip_bit = LLVMBuildSelect(t->b,
+      LLVMBuildAnd(t->b, minified, mip_lin, ""),
+      LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false),
+      LLVMConstInt(t->i32, 0, false), "");
+   LLVMValueRef sw_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+   return emit_tex_sw(t, u, v, lod, sw_filter);
+}
+
 /* Unpack a packed A8R8G8B8 texel into the tex def's components as floats [0,1]. */
 static void
 emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
@@ -2924,8 +2981,43 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       /* TEX-less device: software always. Resolves min/mag + mip like the HW-device
        * SW branch (a non-mipmapped sampler falls out as magnified -> base level). */
       texel = emit_tex_sw_resolved(t, ux, vx);
+   } else if (tex->op == nir_texop_txl) {
+      /* textureLod: sample the explicit lambda. On a HW-TEX device a mipmapped
+       * sampler routes to the SW sampler (which resolves the level from lambda);
+       * a non-mipmapped sampler stays on the HW path at level 0. mip-enable is a
+       * uniform descriptor bit, so the branch never diverges. */
+      LLVMValueRef lod_bits = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
+      if (t->sw_tex) {
+         texel = emit_tex_sw_lod(t, ux, vx, lod_bits);
+      } else {
+         LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
+            LLVMBuildAnd(t->b, emit_tex_filter_word(t),
+               LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
+            LLVMConstInt(t->i32, 0, false), "mip_en");
+         LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
+         LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "txl_sw");
+         LLVMBasicBlockRef bb_hw = LLVMAppendBasicBlockInContext(t->ctx, fn, "txl_hw");
+         LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "txl_merge");
+         LLVMBuildCondBr(t->b, mip_en, bb_sw, bb_hw);
+
+         LLVMPositionBuilderAtEnd(t->b, bb_sw);
+         LLVMValueRef texel_sw = emit_tex_sw_lod(t, ux, vx, lod_bits);
+         LLVMBasicBlockRef end_sw = LLVMGetInsertBlock(t->b);
+         LLVMBuildBr(t->b, bb_mg);
+
+         LLVMPositionBuilderAtEnd(t->b, bb_hw);
+         LLVMValueRef texel_hw = emit_tex_hw(t, ux, vx, LLVMConstInt(t->i32, 0, false));
+         LLVMBasicBlockRef end_hw = LLVMGetInsertBlock(t->b);
+         LLVMBuildBr(t->b, bb_mg);
+
+         LLVMPositionBuilderAtEnd(t->b, bb_mg);
+         texel = LLVMBuildPhi(t->b, t->i32, "texel");
+         LLVMValueRef vals[2] = { texel_sw, texel_hw };
+         LLVMBasicBlockRef bbs[2] = { end_sw, end_hw };
+         LLVMAddIncoming(texel, vals, bbs, 2);
+      }
    } else {
-      /* txl/txb: explicit LOD 0, no derivatives. */
+      /* txb (bias): base level for now (auto-lod + bias not yet). */
       LLVMValueRef z = LLVMConstInt(t->i32, 0, false);
       texel = t->sw_tex
          ? emit_tex_sw(t, ux, vx, z,
