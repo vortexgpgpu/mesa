@@ -60,12 +60,14 @@ namespace graphics = vortex::graphics;
 #endif
 
 /* sizeof(graphics::rast_prim_t): vec3e_t edges[3] (36B) + rast_attribs_t
- * {z,r,g,b,a,u,v,rhw} (8 planes x 12B = 96B) = 132B. The trailing rhw plane
- * (perspective 1/w) grew the record from 120B; this stride programs the RASTER
- * PBUF_STRIDE DCR, so it must match the device rast_prim_t exactly or the unit
- * reads primitive N>0 from the wrong offset (its edges alias the prior prim's
- * attribute planes). Keep in sync with VP_RAST_PRIM_STRIDE in vp_nir_to_llvm.c. */
-#define VP_RAST_PRIM_STRIDE 132
+ * {z,r,g,b,a,u,v,rhw,w0..w5} (14 planes x 12B = 168B) = 204B. The w0..w5 planes
+ * extend the varying interpolation past six scalars (samplerCube textureGrad
+ * carries 9); this stride programs the RASTER PBUF_STRIDE DCR, so it must match
+ * the device rast_prim_t exactly or the unit reads primitive N>0 from the wrong
+ * offset (its edges alias the prior prim's attribute planes). The RASTER unit
+ * reads only the leading edges, so the extra planes cost stride only, not HW.
+ * Keep in sync with VP_RAST_PRIM_STRIDE in vp_nir_to_llvm.c. */
+#define VP_RAST_PRIM_STRIDE 204
 
 /* Folded-in VS stage arg layout (mirrors vp_launch.c): arg slot 0 = VS output
  * buffer device address, slot 1 = attribute table indexed by VS input

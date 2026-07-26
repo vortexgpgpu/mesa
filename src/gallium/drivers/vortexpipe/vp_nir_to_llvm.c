@@ -85,15 +85,16 @@
 #define VP_TEX_OUT_SLOT         24
 
 /* vortex::graphics::rast_prim_t layout (sw/common/vx_gfx_abi.h, FIXEDPOINT):
- * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v,rhw}, each a
- * rast_attrib_t {x,y,z} of fixed24 (12B). r/g/b/a are the colour planes,
- * u/v the texcoord planes; rhw is the perspective 1/w plane (appended last,
- * so the z/r/g/b/a/u/v offsets below are unchanged). At w==1 the premultiplied
- * colour/uv planes equal the raw attributes and rhw is constant, so reading them
- * affinely is exact; the trailing rhw pushes the per-prim stride to 132B.
- * NOTE: duplicated as VP_RAST_PRIM_STRIDE in vp_raster.cpp (the DCR writer) —
- * keep the two in sync. */
-#define VP_RAST_PRIM_STRIDE 132
+ * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v,rhw,w0..w5}, each a
+ * rast_attrib_t {x,y,z} of fixed24 (12B). r/g/b/a/u/v/w0..w5 are the twelve
+ * generic varying planes (declaration-order [u,v,r,g,b,a,w0..w5]); rhw is the
+ * perspective 1/w plane. The w0..w5 planes are appended after rhw, so the
+ * z/r/g/b/a/u/v/rhw offsets below are unchanged. At w==1 the premultiplied
+ * varying planes equal the raw attributes and rhw is constant, so reading them
+ * affinely is exact; the fourteen attribute planes push the per-prim stride to
+ * 204B. NOTE: duplicated as VP_RAST_PRIM_STRIDE in vp_raster.cpp (the DCR
+ * writer) — keep the two in sync. */
+#define VP_RAST_PRIM_STRIDE 204
 #define VP_RAST_ATTR_Z       36
 #define VP_RAST_ATTR_R       48
 #define VP_RAST_ATTR_G       60
@@ -102,6 +103,12 @@
 #define VP_RAST_ATTR_U       96
 #define VP_RAST_ATTR_V      108
 #define VP_RAST_ATTR_RHW    120
+#define VP_RAST_ATTR_W0     132
+#define VP_RAST_ATTR_W1     144
+#define VP_RAST_ATTR_W2     156
+#define VP_RAST_ATTR_W3     168
+#define VP_RAST_ATTR_W4     180
+#define VP_RAST_ATTR_W5     192
 
 /* TEX unit: coordinates are S.23 fixed-point (VX_types.h VX_TEX_FXD_FRAC). */
 #define VP_TEX_FXD_FRAC      23
@@ -3793,14 +3800,17 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
                       LLVMValueRef in_addr,
                       LLVMValueRef dxq, LLVMValueRef dyq)
 {
-   /* The front end interpolates 6 scalar planes; expand_k packed the VS varyings
-    * into them in declaration order [u,v,r,g,b,a] (gfx_frontend_k.h). Read them
-    * back the same way: each FS input varying claims the next nc lanes, so a draw
-    * may carry any mix of varyings (e.g. a texcoord and a scalar lod) without the
-    * two colliding on one plane. */
-   static const unsigned lane[6] = {
-      VP_RAST_ATTR_U, VP_RAST_ATTR_V,
-      VP_RAST_ATTR_R, VP_RAST_ATTR_G, VP_RAST_ATTR_B, VP_RAST_ATTR_A };
+   /* The front end interpolates 12 scalar planes; expand_k packed the VS varyings
+    * into them in declaration order [u,v,r,g,b,a,w0..w5] (gfx_frontend_k.h). Read
+    * them back the same way: each FS input varying claims the next nc lanes, so a
+    * draw may carry any mix of varyings (a texcoord + a scalar lod, or a
+    * samplerCube textureGrad's coord + dPdx + dPdy = 9 scalars) without the planes
+    * colliding. Twelve planes are the [u,v,r,g,b,a] six plus w0..w5. */
+   static const unsigned lane[12] = {
+      VP_RAST_ATTR_U,  VP_RAST_ATTR_V,
+      VP_RAST_ATTR_R,  VP_RAST_ATTR_G,  VP_RAST_ATTR_B,  VP_RAST_ATTR_A,
+      VP_RAST_ATTR_W0, VP_RAST_ATTR_W1, VP_RAST_ATTR_W2,
+      VP_RAST_ATTR_W3, VP_RAST_ATTR_W4, VP_RAST_ATTR_W5 };
 
    /* Perspective recovery: setup premultiplied every colour/uv plane by 1/w and
     * carries a separate 1/w plane, so the true attribute is interp(a/w)/interp(1/w)
@@ -3822,7 +3832,7 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
          continue;
       unsigned nc = glsl_get_components(var->type);
       LLVMValueRef slot = addk(t, in_addr, (unsigned)t->vars[i].out_off);
-      for (unsigned c = 0; c < nc && li < 6u; c++, li++) {
+      for (unsigned c = 0; c < nc && li < 12u; c++, li++) {
          LLVMValueRef q = emit_interp(t, addk(t, prim, lane[li]), dxq, dyq);
          LLVMValueRef f = LLVMBuildFMul(t->b, emit_fixed_to_float(t, q, 24),
                                         inv_rhw, "");
