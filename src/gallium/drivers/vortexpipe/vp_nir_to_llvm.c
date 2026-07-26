@@ -2859,11 +2859,51 @@ emit_tex_sw_resolved(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
    return emit_tex_sw(t, u, v, lod, sw_filter);
 }
 
+/* Encode an EXPLICIT float lambda into the LOD value the SW sampler expects for
+ * the bound sampler's mip mode: Q(VX_TEX_LOD_FRAC_BITS) fixed-point when mip-linear
+ * (the sampler splits it into floor level + blend), else round(lambda) as an
+ * integer level; a non-mipmapped sampler (mip-enable clear) forces level 0. Shared
+ * by the 2D textureLod path and the array/cube entries (which read the same
+ * descriptor filter). `lam_bits` is the lod source's raw i32 (f32 bits). */
+static LLVMValueRef
+emit_encode_explicit_lod(struct vp_tr *t, LLVMValueRef lam_bits)
+{
+   LLVMValueRef filt = emit_tex_filter_word(t);
+   LLVMValueRef zerof = LLVMConstReal(t->f32, 0.0);
+   LLVMValueRef lam = LLVMBuildBitCast(t->b, lam_bits, t->f32, "lambda");
+   LLVMValueRef minified = LLVMBuildFCmp(t->b, LLVMRealOGT, lam, zerof, "minified");
+   LLVMValueRef lam_c = LLVMBuildSelect(t->b, minified, lam, zerof, "lam_c");
+
+   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
+      LLVMConstInt(t->i32, 0, false), "mip_lin");
+
+   LLVMValueRef maxlod_i = LLVMConstInt(t->i32, VX_TEX_LOD_MAX, false);
+   LLVMValueRef lod_near = LLVMBuildFPToSI(t->b,
+      LLVMBuildFAdd(t->b, lam_c, LLVMConstReal(t->f32, 0.5), ""), t->i32, "lod_near");
+   lod_near = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_near, maxlod_i, ""),
+                              maxlod_i, lod_near, "");
+   LLVMValueRef maxlod_q = LLVMConstInt(t->i32, VX_TEX_LOD_MAX << VX_TEX_LOD_FRAC_BITS, false);
+   LLVMValueRef lod_lin = LLVMBuildFPToSI(t->b,
+      LLVMBuildFMul(t->b, lam_c,
+         LLVMConstReal(t->f32, (double)(1u << VX_TEX_LOD_FRAC_BITS)), ""), t->i32, "lod_lin");
+   lod_lin = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_lin, maxlod_q, ""),
+                             maxlod_q, lod_lin, "");
+
+   LLVMValueRef lod = LLVMBuildSelect(t->b, mip_lin, lod_lin, lod_near, "lod");
+   LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
+      LLVMConstInt(t->i32, 0, false), "mip_en");
+   return LLVMBuildSelect(t->b, mip_en, lod, LLVMConstInt(t->i32, 0, false), "");
+}
+
 /* textureLod: sample with an EXPLICIT lambda (float lod source) rather than the
  * quad-gradient-derived rho. Same tap + mip resolution as emit_tex_sw_resolved,
  * but driven by lambda directly: minified when lambda>0 (pick the min tap, else
- * mag); mip-nearest level = round(lambda); mip-linear level = Q(FRAC) lambda for
- * the SW sampler's floor+blend. `lam_bits` is the lod source's raw i32 (f32 bits). */
+ * mag); the mip level is encoded by emit_encode_explicit_lod. `lam_bits` is the
+ * lod source's raw i32 (f32 bits). */
 static LLVMValueRef
 emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lam_bits)
 {
@@ -2871,8 +2911,6 @@ emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef la
    LLVMValueRef zerof = LLVMConstReal(t->f32, 0.0);
    LLVMValueRef lam = LLVMBuildBitCast(t->b, lam_bits, t->f32, "lambda");
    LLVMValueRef minified = LLVMBuildFCmp(t->b, LLVMRealOGT, lam, zerof, "minified");
-   /* clamp lambda >= 0 for the level arithmetic (a magnified texel takes level 0). */
-   LLVMValueRef lam_c = LLVMBuildSelect(t->b, minified, lam, zerof, "lam_c");
 
    /* tap: min (bit3) when minified, mag (bit0) otherwise. */
    LLVMValueRef mag_tap = LLVMBuildAnd(t->b, filt, LLVMConstInt(t->i32, 1, false), "mag_tap");
@@ -2886,28 +2924,7 @@ emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef la
          LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
       LLVMConstInt(t->i32, 0, false), "mip_lin");
 
-   LLVMValueRef maxlod_i = LLVMConstInt(t->i32, VX_TEX_LOD_MAX, false);
-   /* mip-nearest: round(lambda) = floor(lambda + 0.5) (lambda >= 0 -> trunc). */
-   LLVMValueRef lod_near = LLVMBuildFPToSI(t->b,
-      LLVMBuildFAdd(t->b, lam_c, LLVMConstReal(t->f32, 0.5), ""), t->i32, "lod_near");
-   lod_near = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_near, maxlod_i, ""),
-                              maxlod_i, lod_near, "");
-   /* mip-linear: Q(VX_TEX_LOD_FRAC_BITS) fixed-point lambda. */
-   LLVMValueRef maxlod_q = LLVMConstInt(t->i32, VX_TEX_LOD_MAX << VX_TEX_LOD_FRAC_BITS, false);
-   LLVMValueRef lod_lin = LLVMBuildFPToSI(t->b,
-      LLVMBuildFMul(t->b, lam_c,
-         LLVMConstReal(t->f32, (double)(1u << VX_TEX_LOD_FRAC_BITS)), ""), t->i32, "lod_lin");
-   lod_lin = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_lin, maxlod_q, ""),
-                             maxlod_q, lod_lin, "");
-
-   LLVMValueRef lod = LLVMBuildSelect(t->b, mip_lin, lod_lin, lod_near, "lod");
-   /* A non-mipmapped sampler (mip-enable clear) has only level 0: force it, so
-    * an explicit lambda>0 never indexes a level the texture does not carry. */
-   LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
-      LLVMBuildAnd(t->b, filt,
-         LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
-      LLVMConstInt(t->i32, 0, false), "mip_en");
-   lod = LLVMBuildSelect(t->b, mip_en, lod, LLVMConstInt(t->i32, 0, false), "");
+   LLVMValueRef lod = emit_encode_explicit_lod(t, lam_bits);
    LLVMValueRef mip_bit = LLVMBuildSelect(t->b,
       LLVMBuildAnd(t->b, minified, mip_lin, ""),
       LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false),
@@ -3094,18 +3111,11 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
       LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
       LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
-      /* Explicit-LOD (textureLod) carries a float LOD; the array entry takes an
-       * integer level (mip-nearest), so round it and clamp >= 0. A single-level
-       * array lands on level 0 via the descriptor's mip_off clamp. Auto-LOD/base
-       * take level 0. (Trilinear array is a follow-up.) */
-      LLVMValueRef lod = zero;
-      if (tex->op == nir_texop_txl && lod_int) {
-         LLVMValueRef lodf = LLVMBuildBitCast(t->b, lod_int, t->f32, "");
-         lod = LLVMBuildFPToSI(t->b,
-            LLVMBuildFAdd(t->b, lodf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "");
-         lod = LLVMBuildSelect(t->b,
-            LLVMBuildICmp(t->b, LLVMIntSLT, lod, zero, ""), zero, lod, "");
-      }
+      /* Explicit-LOD (textureLod) carries a float LOD; the array entry reads the
+       * descriptor filter, so encode the LOD the same way (mip-linear Q or
+       * mip-nearest level). Auto-LOD and base take level 0. */
+      LLVMValueRef lod = (tex->op == nir_texop_txl && lod_int)
+         ? emit_encode_explicit_lod(t, lod_int) : zero;
       emit_tex_array(t, tex, ux, vx, layer, lod);
       return;
    }
@@ -3119,16 +3129,11 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "");
       LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
       LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
-      /* txl carries a float LOD; the cube entry takes an integer level (mip-nearest,
-       * single-level lands on 0 via mip_off clamp). Auto-LOD/base take level 0. */
-      LLVMValueRef lod = zero;
-      if (tex->op == nir_texop_txl && lod_int) {
-         LLVMValueRef lodf = LLVMBuildBitCast(t->b, lod_int, t->f32, "");
-         lod = LLVMBuildFPToSI(t->b,
-            LLVMBuildFAdd(t->b, lodf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "");
-         lod = LLVMBuildSelect(t->b,
-            LLVMBuildICmp(t->b, LLVMIntSLT, lod, zero, ""), zero, lod, "");
-      }
+      /* txl carries a float LOD; the cube entry reads the descriptor filter, so
+       * encode the LOD the same way (mip-linear Q or mip-nearest level). Auto-LOD
+       * and base take level 0. */
+      LLVMValueRef lod = (tex->op == nir_texop_txl && lod_int)
+         ? emit_encode_explicit_lod(t, lod_int) : zero;
       emit_tex_cube(t, tex, sc, tc, rc, lod);
       return;
    }
