@@ -2876,18 +2876,13 @@ emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef la
    return emit_tex_sw(t, u, v, lod, sw_filter);
 }
 
-/* textureSize (also the intermediate emitted when textureGrad's txd is lowered to
- * a size query + explicit-LOD sample): the (width,height) of mip level `lod` from
- * the resident TEX descriptor -- no sample. The def is integer: component c =
- * max(dim >> lod, 1). A descriptor whose width/height is 0 is a power-of-two
- * texture (dims via logdim). */
+/* mip-0 {width,height} from the resident TEX descriptor, as i32. A descriptor
+ * whose width/height is 0 is a power-of-two texture; derive the dim from logdim. */
 static void
-emit_tex_size(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef lod_int)
+emit_tex_mip0_dims(struct vp_tr *t, LLVMValueRef *out_w, LLVMValueRef *out_h)
 {
-   LLVMValueRef lod = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
    LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
-   LLVMValueRef one  = LLVMConstInt(t->i32, 1, false);
-
    LLVMValueRef off_ld = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, logdim), false);
    LLVMValueRef logdim = LLVMBuildLoad2(t->b, t->i32,
       LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_ld, 1, ""), "logdim");
@@ -2897,14 +2892,25 @@ emit_tex_size(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef lod_int)
    LLVMValueRef off_h = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, height), false);
    LLVMValueRef h0 = LLVMBuildLoad2(t->b, t->i32,
       LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_h, 1, ""), "theight");
-
-   /* width/height 0 => POT texture: dim = 1 << (logdim field). */
    LLVMValueRef potw = LLVMBuildShl(t->b, one,
       LLVMBuildAnd(t->b, logdim, LLVMConstInt(t->i32, 0xffff, false), ""), "");
    LLVMValueRef poth = LLVMBuildShl(t->b, one,
       LLVMBuildLShr(t->b, logdim, LLVMConstInt(t->i32, 16, false), ""), "");
-   w0 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntNE, w0, zero, ""), w0, potw, "w0");
-   h0 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntNE, h0, zero, ""), h0, poth, "h0");
+   *out_w = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntNE, w0, zero, ""), w0, potw, "w0");
+   *out_h = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntNE, h0, zero, ""), h0, poth, "h0");
+}
+
+/* textureSize (also the intermediate emitted when textureGrad's txd is lowered to
+ * a size query + explicit-LOD sample): the (width,height) of mip level `lod` from
+ * the resident TEX descriptor -- no sample. The def is integer: component c =
+ * max(dim >> lod, 1). */
+static void
+emit_tex_size(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef lod_int)
+{
+   LLVMValueRef lod = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef one  = LLVMConstInt(t->i32, 1, false);
+   LLVMValueRef w0, h0;
+   emit_tex_mip0_dims(t, &w0, &h0);
 
    /* level dim = max(dim >> lod, 1). */
    LLVMValueRef wl = LLVMBuildLShr(t->b, w0, lod, "");
@@ -2946,12 +2952,16 @@ static void
 emit_tex(struct vp_tr *t, nir_tex_instr *tex)
 {
    LLVMValueRef u = NULL, v = NULL, lod_int = NULL;
+   LLVMValueRef off_x = NULL, off_y = NULL;
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       if (tex->src[i].src_type == nir_tex_src_coord) {
          u = ssa_get(t, tex->src[i].src.ssa->index, 0);
          v = ssa_get(t, tex->src[i].src.ssa->index, 1);
       } else if (tex->src[i].src_type == nir_tex_src_lod) {
          lod_int = ssa_get(t, tex->src[i].src.ssa->index, 0);
+      } else if (tex->src[i].src_type == nir_tex_src_offset) {
+         off_x = ssa_get(t, tex->src[i].src.ssa->index, 0);
+         off_y = ssa_get(t, tex->src[i].src.ssa->index, 1);
       }
    }
 
@@ -2964,7 +2974,10 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
          return;
       }
       LLVMValueRef lod = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
-      emit_tex_unpack(t, tex, emit_tex_fetch(t, u, v, lod));
+      /* texelFetchOffset: the offset is a texel delta added to the integer coord. */
+      LLVMValueRef x = off_x ? LLVMBuildAdd(t->b, u, off_x, "") : u;
+      LLVMValueRef y = off_y ? LLVMBuildAdd(t->b, v, off_y, "") : v;
+      emit_tex_unpack(t, tex, emit_tex_fetch(t, x, y, lod));
       return;
    }
 
@@ -2984,12 +2997,28 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       return;
    }
 
+   LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "uf");
+   LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "vf");
+
+   /* textureOffset: a constant texel offset added to the normalized coord as
+    * offset/dim (mip-0 dims -- deqp's offset cases sample the base level). */
+   if (off_x || off_y) {
+      LLVMValueRef w0, h0;
+      emit_tex_mip0_dims(t, &w0, &h0);
+      if (off_x)
+         uf = LLVMBuildFAdd(t->b, uf,
+            LLVMBuildFDiv(t->b, LLVMBuildSIToFP(t->b, off_x, t->f32, ""),
+                          LLVMBuildUIToFP(t->b, w0, t->f32, ""), ""), "uoff");
+      if (off_y)
+         vf = LLVMBuildFAdd(t->b, vf,
+            LLVMBuildFDiv(t->b, LLVMBuildSIToFP(t->b, off_y, t->f32, ""),
+                          LLVMBuildUIToFP(t->b, h0, t->f32, ""), ""), "voff");
+   }
+
    /* float UV -> the TEX unit's S.23 fixed-point coordinate. */
    LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
-   LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
-      LLVMBuildBitCast(t->b, u, t->f32, ""), scale, ""), t->i32, "");
-   LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
-      LLVMBuildBitCast(t->b, v, t->f32, ""), scale, ""), t->i32, "");
+   LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
+   LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
 
    /* Sample. Implicit-LOD `texture()` on a HW-TEX device: a mipmapped sampler
     * (texstate.filter mip-enable bit) routes to the SW sampler, which resolves the
