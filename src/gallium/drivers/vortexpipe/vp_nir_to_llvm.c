@@ -3060,11 +3060,25 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
          t->ok = false;
          return;
       }
+      LLVMValueRef guf = LLVMBuildBitCast(t->b, u, t->f32, "");
+      LLVMValueRef gvf = LLVMBuildBitCast(t->b, v, t->f32, "");
+      /* textureGatherOffset: a constant texel offset added to the coord as
+       * offset/dim (mip-0 dims), so the 2x2 footprint shifts by whole texels. */
+      if (off_x || off_y) {
+         LLVMValueRef w0, h0;
+         emit_tex_mip0_dims(t, &w0, &h0);
+         if (off_x)
+            guf = LLVMBuildFAdd(t->b, guf,
+               LLVMBuildFDiv(t->b, LLVMBuildSIToFP(t->b, off_x, t->f32, ""),
+                             LLVMBuildUIToFP(t->b, w0, t->f32, ""), ""), "");
+         if (off_y)
+            gvf = LLVMBuildFAdd(t->b, gvf,
+               LLVMBuildFDiv(t->b, LLVMBuildSIToFP(t->b, off_y, t->f32, ""),
+                             LLVMBuildUIToFP(t->b, h0, t->f32, ""), ""), "");
+      }
       LLVMValueRef gscale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
-      LLVMValueRef gux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
-         LLVMBuildBitCast(t->b, u, t->f32, ""), gscale, ""), t->i32, "");
-      LLVMValueRef gvx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
-         LLVMBuildBitCast(t->b, v, t->f32, ""), gscale, ""), t->i32, "");
+      LLVMValueRef gux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, guf, gscale, ""), t->i32, "");
+      LLVMValueRef gvx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, gvf, gscale, ""), t->i32, "");
       emit_tex_gather(t, tex, gux, gvx);
       return;
    }
