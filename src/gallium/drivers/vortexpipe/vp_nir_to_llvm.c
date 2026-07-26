@@ -2563,6 +2563,31 @@ emit_tex_fetch(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef lod
    return LLVMBuildCall2(t->b, fty, fn, a, 4, "texfetch");
 }
 
+/* textureGather: gfx_tex_gather_sw(&texstate[0], x, y, comp) -- channel `comp` of
+ * the 2x2 footprint at (x,y), base level, packed in GL gather order as bytes
+ * x | y<<8 | z<<16 | w<<24. Unpack to the def's vec4 as floats in [0,1]. */
+static void
+emit_tex_gather(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y)
+{
+   LLVMTypeRef params[4] = { t->ptr, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 4, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_gather_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_gather_sw", fty);
+   LLVMValueRef a[4] = { t->fs_texstate, x, y,
+                         LLVMConstInt(t->i32, tex->component, false) };
+   LLVMValueRef packed = LLVMBuildCall2(t->b, fty, fn, a, 4, "gather");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
+      LLVMValueRef byte = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, packed, LLVMConstInt(t->i32, c * 8, false), ""),
+         LLVMConstInt(t->i32, 0xff, false), "");
+      LLVMValueRef f = LLVMBuildFMul(t->b,
+         LLVMBuildUIToFP(t->b, byte, t->f32, ""),
+         LLVMConstReal(t->f32, 1.0 / 255.0), "");
+      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
+   }
+}
+
 /* ── RTU (ray-tracing unit) ops — ISA v2 window ABI ──────────────────
  * CUSTOM1 (opcode 43). vortex_rt_wtrace (funct3=7, funct2=0) issues one ray:
  * the per-trace config lane-packs into rs1 via wgather, the per-thread ray
@@ -2985,6 +3010,22 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
     * intermediate a lowered textureGrad emits to scale its gradients. */
    if (tex->op == nir_texop_txs) {
       emit_tex_size(t, tex, lod_int);
+      return;
+   }
+
+   /* textureGather: the 2x2 footprint's `comp` channel, base level, SW-only. */
+   if (tex->op == nir_texop_tg4) {
+      if (!u || !v) {
+         mesa_logw("vortexpipe: vp_nir_to_llvm: textureGather missing coord");
+         t->ok = false;
+         return;
+      }
+      LLVMValueRef gscale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+      LLVMValueRef gux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
+         LLVMBuildBitCast(t->b, u, t->f32, ""), gscale, ""), t->i32, "");
+      LLVMValueRef gvx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
+         LLVMBuildBitCast(t->b, v, t->f32, ""), gscale, ""), t->i32, "");
+      emit_tex_gather(t, tex, gux, gvx);
       return;
    }
 
