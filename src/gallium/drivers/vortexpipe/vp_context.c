@@ -566,6 +566,29 @@ vp_fs_num_color_outputs(struct nir_shader *nir)
    return n ? n : 1;
 }
 
+/* True if the fragment shader uses a texture op that always samples in software
+ * (textureGather, texelFetch, sampler2DShadow). Those go through the SW sampler,
+ * which addresses NPOT textures natively, so such an FS must be flagged sw_tex —
+ * otherwise the draw path drops an NPOT-textured draw to llvmpipe (the FF TEX unit
+ * is power-of-two only), which STRICT mode then refuses. */
+static bool
+vp_fs_uses_sw_texop(struct nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(blk, impl) {
+         nir_foreach_instr(instr, blk) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (tex->is_shadow || tex->op == nir_texop_tg4 ||
+                tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 /* The driver JIT-compiles the fragment shader at pipeline creation,
  * the same NIR -> LLVM -> .vxbin path the vertex/compute stages use
  * (a real GPU driver compiles every stage; nothing is prebuilt). */
@@ -591,6 +614,11 @@ vp_create_fs_state(struct pipe_context *pipe,
          vp_fs_num_color_outputs((struct nir_shader *)state->ir.nir);
       if (cso->fs_num_color > 1)
          cso->fs_routing.sw_om = true;
+      /* A gather/texelFetch/shadow FS samples in software (NPOT-capable); flag it
+       * sw_tex so the draw path keeps NPOT-textured draws on the device path
+       * instead of dropping them to llvmpipe. */
+      if (vp_fs_uses_sw_texop((struct nir_shader *)state->ir.nir))
+         cso->fs_routing.sw_tex = true;
       /* The set-0 descriptors the FS reaches (SSBO/UBO/AS) — recorded for
        * the descriptor-blob relocation the SSBO path needs (follow-up). */
       vp_scan_descriptors((struct nir_shader *)state->ir.nir,
