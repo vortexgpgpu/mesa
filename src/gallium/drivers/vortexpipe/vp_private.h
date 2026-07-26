@@ -329,6 +329,7 @@ struct vp_context {
     * binds the latest of each to TEX stage 0. cur_sampler points at
     * cur_sampler_store once a sampler has been seen. */
    struct pipe_resource  *cur_tex;        /* bound FS texture, or NULL */
+   unsigned               cur_tex_first_level; /* bound view's baseMipLevel */
    struct vp_sampler_cso *cur_sampler;    /* &cur_sampler_store, or NULL */
    struct vp_sampler_cso  cur_sampler_store;
    uint64_t (*lp_create_texture_handle)(struct pipe_context *,

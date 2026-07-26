@@ -692,8 +692,9 @@ vp_create_texture_handle(struct pipe_context *pipe,
    struct vp_context *vp = vp_reg_get(pipe);
    if (view && view->texture) {
       vp->cur_tex = view->texture;
-      vp_dbg("vortexpipe: TEX texture captured (%ux%u)",
-             vp->cur_tex->width0, vp->cur_tex->height0);
+      vp->cur_tex_first_level = view->u.tex.first_level;
+      vp_dbg("vortexpipe: TEX texture captured (%ux%u) base_level=%u",
+             vp->cur_tex->width0, vp->cur_tex->height0, vp->cur_tex_first_level);
       /* Record this texture's level-0 host base so a draw can match its FS tex
        * descriptor (lp_jit_texture.base) back to the resource — the per-draw
        * selection that lets >1 bound texture disambiguate. Dedup by resource. */
@@ -2033,6 +2034,26 @@ vp_draw_vbo(struct pipe_context *pipe,
             (void)vp_vx_tex_format(vp->cur_tex->format, &tex_bpp);
             drew = vp_tex_ensure(pipe, vp, vp->cur_tex, tw, th, tex.format,
                                  tex_bpp, &tex_dev, tex.mip_off);
+            /* Sampler-view baseMipLevel: re-base the (view-independent) resident
+             * chain so the shader's level 0 is resource level N. Offset the base to
+             * level N, make mip_off relative to it (level i -> resource level N+i),
+             * and report the base-level dims. Both the SW sampler and the HW TEX
+             * DCRs read these, so the two paths stay consistent. */
+            uint32_t base_lvl = vp->cur_tex_first_level;
+            if (drew && base_lvl > 0) {
+               if (base_lvl > (uint32_t)VX_TEX_LOD_MAX) {
+                  base_lvl = (uint32_t)VX_TEX_LOD_MAX;
+               }
+               uint32_t base_byte = tex.mip_off[base_lvl];
+               tex_dev += base_byte;
+               for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i) {
+                  uint32_t src = (base_lvl + i <= (uint32_t)VX_TEX_LOD_MAX)
+                               ? base_lvl + i : (uint32_t)VX_TEX_LOD_MAX;
+                  tex.mip_off[i] = tex.mip_off[src] - base_byte;
+               }
+               tex.width  = (tex.width  >> base_lvl) ? (tex.width  >> base_lvl) : 1u;
+               tex.height = (tex.height >> base_lvl) ? (tex.height >> base_lvl) : 1u;
+            }
          }
 
          /* A draw whose FS writes >1 colour output AND targets >1 bound
