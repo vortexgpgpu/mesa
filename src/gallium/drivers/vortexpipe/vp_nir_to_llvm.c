@@ -2876,6 +2876,48 @@ emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef la
    return emit_tex_sw(t, u, v, lod, sw_filter);
 }
 
+/* textureSize (also the intermediate emitted when textureGrad's txd is lowered to
+ * a size query + explicit-LOD sample): the (width,height) of mip level `lod` from
+ * the resident TEX descriptor -- no sample. The def is integer: component c =
+ * max(dim >> lod, 1). A descriptor whose width/height is 0 is a power-of-two
+ * texture (dims via logdim). */
+static void
+emit_tex_size(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef lod_int)
+{
+   LLVMValueRef lod = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef one  = LLVMConstInt(t->i32, 1, false);
+
+   LLVMValueRef off_ld = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, logdim), false);
+   LLVMValueRef logdim = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_ld, 1, ""), "logdim");
+   LLVMValueRef off_w = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, width), false);
+   LLVMValueRef w0 = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_w, 1, ""), "twidth");
+   LLVMValueRef off_h = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, height), false);
+   LLVMValueRef h0 = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_h, 1, ""), "theight");
+
+   /* width/height 0 => POT texture: dim = 1 << (logdim field). */
+   LLVMValueRef potw = LLVMBuildShl(t->b, one,
+      LLVMBuildAnd(t->b, logdim, LLVMConstInt(t->i32, 0xffff, false), ""), "");
+   LLVMValueRef poth = LLVMBuildShl(t->b, one,
+      LLVMBuildLShr(t->b, logdim, LLVMConstInt(t->i32, 16, false), ""), "");
+   w0 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntNE, w0, zero, ""), w0, potw, "w0");
+   h0 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntNE, h0, zero, ""), h0, poth, "h0");
+
+   /* level dim = max(dim >> lod, 1). */
+   LLVMValueRef wl = LLVMBuildLShr(t->b, w0, lod, "");
+   LLVMValueRef hl = LLVMBuildLShr(t->b, h0, lod, "");
+   wl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntULT, wl, one, ""), one, wl, "wl");
+   hl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntULT, hl, one, ""), one, hl, "hl");
+
+   /* A 2D-array adds a layer count the descriptor does not carry; report 1. */
+   LLVMValueRef dims[3] = { wl, hl, one };
+   for (unsigned c = 0; c < tex->def.num_components && c < 3; c++)
+      ssa_set(t, tex->def.index, c, dims[c]);
+}
+
 /* Unpack a packed A8R8G8B8 texel into the tex def's components as floats [0,1]. */
 static void
 emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
@@ -2923,6 +2965,13 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       }
       LLVMValueRef lod = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
       emit_tex_unpack(t, tex, emit_tex_fetch(t, u, v, lod));
+      return;
+   }
+
+   /* textureSize: a dimension query from the descriptor, no coord/sample. Also the
+    * intermediate a lowered textureGrad emits to scale its gradients. */
+   if (tex->op == nir_texop_txs) {
+      emit_tex_size(t, tex, lod_int);
       return;
    }
 
