@@ -2986,6 +2986,22 @@ emit_tex_shadow(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRe
       ssa_set(t, tex->def.index, c, res);
 }
 
+/* sampler2DArray: gfx_tex_sample_array_sw(&texstate[0], x, y, layer, lod) -- sample
+ * the integer `layer` slice at (x,y) of the given LOD, then unpack the A8R8G8B8
+ * texel to the def's vec4. The layer stride comes from the resident descriptor. */
+static void
+emit_tex_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y,
+               LLVMValueRef layer, LLVMValueRef lod)
+{
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_array_sw", fty);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y, layer, lod };
+   emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 5, "texarray"));
+}
+
 /* A NIR texture op: a 2D `texture()`/`textureLod()`/`textureBias()` sampling the
  * single bound texture (TEX stage 0), or `texelFetch()` (integer-coord fetch, no
  * filter). The interpolated texcoord is the coord source; the texture/sampler
@@ -3027,6 +3043,37 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
       LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
       emit_tex_shadow(t, tex, ux, vx, ref);
+      return;
+   }
+
+   /* sampler2DArray: coord.z is the array layer (round to nearest, clamp >= 0);
+    * sample that slice via the SW array entry (base + layer*layer_stride). Handled
+    * before the 2D dispatch since an array sample is still nir_texop_tex/txl. */
+   if (tex->is_array && tex->sampler_dim == GLSL_SAMPLER_DIM_2D && u && v) {
+      LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+      LLVMValueRef layer = LLVMBuildFPToSI(t->b,
+         LLVMBuildFAdd(t->b, zf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "layer");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      layer = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, layer, zero, ""), zero, layer, "");
+      LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "");
+      LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "");
+      LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+      LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
+      LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
+      /* Explicit-LOD (textureLod) carries a float LOD; the array entry takes an
+       * integer level (mip-nearest), so round it and clamp >= 0. A single-level
+       * array lands on level 0 via the descriptor's mip_off clamp. Auto-LOD/base
+       * take level 0. (Trilinear array is a follow-up.) */
+      LLVMValueRef lod = zero;
+      if (tex->op == nir_texop_txl && lod_int) {
+         LLVMValueRef lodf = LLVMBuildBitCast(t->b, lod_int, t->f32, "");
+         lod = LLVMBuildFPToSI(t->b,
+            LLVMBuildFAdd(t->b, lodf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "");
+         lod = LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntSLT, lod, zero, ""), zero, lod, "");
+      }
+      emit_tex_array(t, tex, ux, vx, layer, lod);
       return;
    }
 

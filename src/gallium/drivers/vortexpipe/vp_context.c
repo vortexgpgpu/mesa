@@ -580,7 +580,7 @@ vp_fs_uses_sw_texop(struct nir_shader *nir)
             if (instr->type != nir_instr_type_tex)
                continue;
             nir_tex_instr *tex = nir_instr_as_tex(instr);
-            if (tex->is_shadow || tex->op == nir_texop_tg4 ||
+            if (tex->is_shadow || tex->is_array || tex->op == nir_texop_tg4 ||
                 tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
                return true;
          }
@@ -1173,11 +1173,13 @@ static bool
 vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
               struct pipe_resource *res, uint32_t w, uint32_t h,
               uint32_t vx_format, uint32_t bpp,
-              uint64_t *tex_dev, uint32_t mip_off[VX_TEX_LOD_MAX + 1])
+              uint64_t *tex_dev, uint32_t mip_off[VX_TEX_LOD_MAX + 1],
+              uint32_t *layer_stride_out)
 {
    if (vp->rtex_buf && vp->rtex_res == res &&
        vp->rtex_w == w && vp->rtex_h == h) {
       memcpy(mip_off, vp->rtex_mipoff, sizeof(vp->rtex_mipoff));
+      *layer_stride_out = vp->rtex_layer_stride;
       return vx_buffer_address(vp->rtex_buf, tex_dev) == VX_SUCCESS;
    }
 
@@ -1189,11 +1191,14 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * has dims max(1, w>>l) x max(1, h>>l). mip_off carries the byte offsets;
     * levels past the resource's last are clamped to the smallest real level so
     * an over-large computed LOD still lands on valid texels. A single-level
-    * texture yields off 0 for every LOD (byte-identical to the old upload). */
+    * texture yields off 0 for every LOD (byte-identical to the old upload).
+    * A 2D-array texture stacks each layer's full mip chain (layer_stride bytes
+    * apart) so the SW sampler reaches layer L at base + L*layer_stride. */
    const uint32_t last = (res->last_level < (uint32_t)VX_TEX_LOD_MAX)
                        ? res->last_level : (uint32_t)VX_TEX_LOD_MAX;
    const bool is_depth = (vx_format == VX_TEX_FORMAT_D16 ||
                           vx_format == VX_TEX_FORMAT_D32F);
+   const uint32_t layers = (res->array_size > 1) ? res->array_size : 1u;
    uint32_t off_texels[VX_TEX_LOD_MAX + 1] = { 0 };
    uint32_t total = 0;
    for (uint32_t l = 0; l <= last; l++) {
@@ -1202,44 +1207,50 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
       off_texels[l] = total;
       total += wl * hl;
    }
+   const uint32_t layer_stride = total * bpp;   /* one layer's mip-chain bytes */
 
-   uint8_t *texbuf = malloc((size_t)total * bpp);
+   uint8_t *texbuf = malloc((size_t)layer_stride * layers);
    bool ok = texbuf != NULL;
-   for (uint32_t l = 0; ok && l <= last; l++) {
-      uint32_t wl = (w >> l) ? (w >> l) : 1u;
-      uint32_t hl = (h >> l) ? (h >> l) : 1u;
-      struct pipe_transfer *xfer = NULL;
-      uint8_t *map = pipe_texture_map(pipe, res, l, 0, PIPE_MAP_READ,
-                                      0, 0, wl, hl, &xfer);
-      if (!map) { ok = false; break; }
-      uint8_t *dst = texbuf + (size_t)off_texels[l] * bpp;
-      for (uint32_t y = 0; y < hl; y++) {
-         uint8_t *m = map + (size_t)y * xfer->stride;
-         if (is_depth) {
-            /* raw depth texels (D32F=4 B float, D16=2 B unorm) — no swizzle. */
-            memcpy(dst + (size_t)y * wl * bpp, m, (size_t)wl * bpp);
-         } else {
-            uint32_t *d32 = (uint32_t *)(dst + (size_t)y * wl * 4);
-            for (uint32_t x = 0; x < wl; x++) {
-               uint32_t r = m[x * 4 + 0], g = m[x * 4 + 1];
-               uint32_t b = m[x * 4 + 2], a = m[x * 4 + 3];
-               d32[x] = (a << 24) | (r << 16) | (g << 8) | b;
+   for (uint32_t layer = 0; ok && layer < layers; layer++) {
+      uint8_t *lbase = texbuf + (size_t)layer * layer_stride;
+      for (uint32_t l = 0; ok && l <= last; l++) {
+         uint32_t wl = (w >> l) ? (w >> l) : 1u;
+         uint32_t hl = (h >> l) ? (h >> l) : 1u;
+         struct pipe_transfer *xfer = NULL;
+         uint8_t *map = pipe_texture_map(pipe, res, l, layer, PIPE_MAP_READ,
+                                         0, 0, wl, hl, &xfer);
+         if (!map) { ok = false; break; }
+         uint8_t *dst = lbase + (size_t)off_texels[l] * bpp;
+         for (uint32_t y = 0; y < hl; y++) {
+            uint8_t *m = map + (size_t)y * xfer->stride;
+            if (is_depth) {
+               /* raw depth texels (D32F=4 B float, D16=2 B unorm) — no swizzle. */
+               memcpy(dst + (size_t)y * wl * bpp, m, (size_t)wl * bpp);
+            } else {
+               uint32_t *d32 = (uint32_t *)(dst + (size_t)y * wl * 4);
+               for (uint32_t x = 0; x < wl; x++) {
+                  uint32_t r = m[x * 4 + 0], g = m[x * 4 + 1];
+                  uint32_t b = m[x * 4 + 2], a = m[x * 4 + 3];
+                  d32[x] = (a << 24) | (r << 16) | (g << 8) | b;
+               }
             }
          }
+         pipe_texture_unmap(pipe, xfer);
       }
-      pipe_texture_unmap(pipe, xfer);
    }
 
    for (uint32_t l = 0; l <= (uint32_t)VX_TEX_LOD_MAX; l++)
       mip_off[l] = off_texels[l <= last ? l : last] * bpp;
 
    if (ok)
-      ok = vp_dev_upload(vp->dev, texbuf, (size_t)total * bpp,
+      ok = vp_dev_upload(vp->dev, texbuf, (size_t)layer_stride * layers,
                          &vp->rtex_buf, tex_dev);
    free(texbuf);
    if (!ok) return false;
    vp->rtex_res = res;
    vp->rtex_w = w; vp->rtex_h = h;
+   vp->rtex_layer_stride = (layers > 1) ? layer_stride : 0u;
+   *layer_stride_out = vp->rtex_layer_stride;
    memcpy(vp->rtex_mipoff, mip_off, sizeof(vp->rtex_mipoff));
    return true;
 }
@@ -2069,7 +2080,7 @@ vp_draw_vbo(struct pipe_context *pipe,
             uint32_t tex_bpp = 4;
             (void)vp_vx_tex_format(vp->cur_tex->format, &tex_bpp);
             drew = vp_tex_ensure(pipe, vp, vp->cur_tex, tw, th, tex.format,
-                                 tex_bpp, &tex_dev, tex.mip_off);
+                                 tex_bpp, &tex_dev, tex.mip_off, &tex.layer_stride);
             /* Sampler-view baseMipLevel: re-base the (view-independent) resident
              * chain so the shader's level 0 is resource level N. Offset the base to
              * level N, make mip_off relative to it (level i -> resource level N+i),

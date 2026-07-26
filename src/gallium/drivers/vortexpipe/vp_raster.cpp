@@ -532,6 +532,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          texstate.format = tex->format ? tex->format : VX_TEX_FORMAT_A8R8G8B8;
          texstate.compare_func = tex->compare_func;
          texstate.swizzle = tex->swizzle;
+         texstate.layer_stride = tex->layer_stride;
          /* Descriptor-only filter bits (the FS reads them; they never reach the HW
           * TEX_FILTER DCR below): mag tap (bit0, from tex->filter), min tap (bit3),
           * mip-linear (bit1) and mip-enable (bit2). A mipmapped sampler routes to

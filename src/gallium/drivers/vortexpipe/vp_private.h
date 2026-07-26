@@ -276,6 +276,7 @@ struct vp_context {
    /* Per-LOD byte offset into rtex_buf (mip 0 at [0]); the whole mip chain is
     * uploaded contiguously so the TEX unit can address any selected level. */
    uint32_t              rtex_mipoff[VX_TEX_LOD_MAX + 1];
+   uint32_t              rtex_layer_stride;   /* bytes per array layer (0 = single 2D) */
    /* Sampled-texture identity map: every texture that gets a bindless handle
     * (create_texture_handle) is recorded here as (resource, level-0 host base).
     * A draw reads its FS tex descriptor's lp_jit_texture.base and matches it to
