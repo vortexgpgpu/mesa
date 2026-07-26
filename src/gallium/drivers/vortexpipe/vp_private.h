@@ -160,6 +160,8 @@ struct vp_sampler_cso {
    uint32_t wrap_v;
    bool     mip_enable;        /* sampler reaches a non-base level (max_lod > 0.5) */
    bool     mip_linear;        /* mip mode is LINEAR (trilinear) rather than nearest */
+   bool     compare_enable;    /* PIPE_TEX_COMPARE_R_TO_TEXTURE (sampler2DShadow) */
+   uint32_t compare_func;      /* raw PIPE_FUNC_* (mapped to VX at draw time) */
 };
 
 /* Captured vertex-input layout. The VS kernel fetches one thread's

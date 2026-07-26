@@ -726,6 +726,11 @@ vp_create_texture_handle(struct pipe_context *pipe,
       vp->cur_sampler_store.mip_enable = (state->max_lod > 0.5f);
       vp->cur_sampler_store.mip_linear =
          (state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR);
+      /* sampler2DShadow: capture the depth-compare mode + op (mapped to the VX
+       * compare enum at draw time, where vp_vx_depth_func is in scope). */
+      vp->cur_sampler_store.compare_enable =
+         (state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE);
+      vp->cur_sampler_store.compare_func = state->compare_func;
       vp->cur_sampler = &vp->cur_sampler_store;
       vp_dbg("vortexpipe: TEX sampler captured mag=%u min=%u wrap=%u,%u mip_enable=%u mip_linear=%u",
              vp->cur_sampler->filter, vp->cur_sampler->min_filter,
@@ -1100,12 +1105,38 @@ vp_fb_ensure_mrt(struct pipe_context *pipe, struct vp_context *vp,
    return true;
 }
 
+/* Map a sampled resource's pipe_format to the VX TEX format the SW sampler
+ * decodes, plus its bytes-per-texel. Depth resources (sampler2DShadow) upload
+ * their real depth values; everything else is read back as A8R8G8B8 (4 B).
+ * *bpp is the source per-texel size to copy from the mapped level. */
+static uint32_t
+vp_vx_tex_format(enum pipe_format pf, uint32_t *bpp)
+{
+   switch (pf) {
+   case PIPE_FORMAT_Z32_FLOAT:   /* tightly-packed float depth */
+      if (bpp) *bpp = 4;
+      return VX_TEX_FORMAT_D32F;
+   case PIPE_FORMAT_Z16_UNORM:   /* 16-bit unorm depth */
+      if (bpp) *bpp = 2;
+      return VX_TEX_FORMAT_D16;
+   /* Combined depth/stencil (Z32_FLOAT_S8X24, Z24_UNORM_S8) has an interleaved
+    * stride the tight per-texel copy below can't reproduce; leave it as a
+    * follow-up rather than mis-decode it. */
+   default:
+      if (bpp) *bpp = 4;
+      return VX_TEX_FORMAT_A8R8G8B8;
+   }
+}
+
 /* Ensure the bound texture is uploaded + resident, keyed by its resource. The
- * mip-0 image is read back to a tight A8R8G8B8 host buffer and uploaded once;
- * a re-bind of the same resource reuses it. Returns the device address. */
+ * mip chain is read back to a tight host buffer and uploaded once; a re-bind of
+ * the same resource reuses it. A colour resource is packed to A8R8G8B8; a depth
+ * resource (vx_format D16/D32F) copies its raw depth texels so a shadow sampler
+ * can compare at full precision. Returns the device address. */
 static bool
 vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
               struct pipe_resource *res, uint32_t w, uint32_t h,
+              uint32_t vx_format, uint32_t bpp,
               uint64_t *tex_dev, uint32_t mip_off[VX_TEX_LOD_MAX + 1])
 {
    if (vp->rtex_buf && vp->rtex_res == res &&
@@ -1125,6 +1156,8 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * texture yields off 0 for every LOD (byte-identical to the old upload). */
    const uint32_t last = (res->last_level < (uint32_t)VX_TEX_LOD_MAX)
                        ? res->last_level : (uint32_t)VX_TEX_LOD_MAX;
+   const bool is_depth = (vx_format == VX_TEX_FORMAT_D16 ||
+                          vx_format == VX_TEX_FORMAT_D32F);
    uint32_t off_texels[VX_TEX_LOD_MAX + 1] = { 0 };
    uint32_t total = 0;
    for (uint32_t l = 0; l <= last; l++) {
@@ -1134,7 +1167,7 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
       total += wl * hl;
    }
 
-   uint32_t *texbuf = malloc((size_t)total * 4);
+   uint8_t *texbuf = malloc((size_t)total * bpp);
    bool ok = texbuf != NULL;
    for (uint32_t l = 0; ok && l <= last; l++) {
       uint32_t wl = (w >> l) ? (w >> l) : 1u;
@@ -1143,23 +1176,29 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
       uint8_t *map = pipe_texture_map(pipe, res, l, 0, PIPE_MAP_READ,
                                       0, 0, wl, hl, &xfer);
       if (!map) { ok = false; break; }
-      uint32_t *dst = texbuf + off_texels[l];
+      uint8_t *dst = texbuf + (size_t)off_texels[l] * bpp;
       for (uint32_t y = 0; y < hl; y++) {
          uint8_t *m = map + (size_t)y * xfer->stride;
-         for (uint32_t x = 0; x < wl; x++) {
-            uint32_t r = m[x * 4 + 0], g = m[x * 4 + 1];
-            uint32_t b = m[x * 4 + 2], a = m[x * 4 + 3];
-            dst[(size_t)y * wl + x] = (a << 24) | (r << 16) | (g << 8) | b;
+         if (is_depth) {
+            /* raw depth texels (D32F=4 B float, D16=2 B unorm) — no swizzle. */
+            memcpy(dst + (size_t)y * wl * bpp, m, (size_t)wl * bpp);
+         } else {
+            uint32_t *d32 = (uint32_t *)(dst + (size_t)y * wl * 4);
+            for (uint32_t x = 0; x < wl; x++) {
+               uint32_t r = m[x * 4 + 0], g = m[x * 4 + 1];
+               uint32_t b = m[x * 4 + 2], a = m[x * 4 + 3];
+               d32[x] = (a << 24) | (r << 16) | (g << 8) | b;
+            }
          }
       }
       pipe_texture_unmap(pipe, xfer);
    }
 
    for (uint32_t l = 0; l <= (uint32_t)VX_TEX_LOD_MAX; l++)
-      mip_off[l] = off_texels[l <= last ? l : last] * 4u;
+      mip_off[l] = off_texels[l <= last ? l : last] * bpp;
 
    if (ok)
-      ok = vp_dev_upload(vp->dev, texbuf, (size_t)total * 4,
+      ok = vp_dev_upload(vp->dev, texbuf, (size_t)total * bpp,
                          &vp->rtex_buf, tex_dev);
    free(texbuf);
    if (!ok) return false;
@@ -1974,6 +2013,12 @@ vp_draw_vbo(struct pipe_context *pipe,
                                                 : false;
                tex.mip_linear = vp->cur_sampler ? vp->cur_sampler->mip_linear
                                                 : false;
+               /* sampler2DShadow: resolve the depth format + compare op so the SW
+                * sampler reads real depth and compares against the shader's ref. */
+               tex.format = vp_vx_tex_format(vp->cur_tex->format, NULL);
+               tex.compare_func =
+                  (vp->cur_sampler && vp->cur_sampler->compare_enable)
+                     ? vp_vx_depth_func(vp->cur_sampler->compare_func) : 0u;
                tex_used = true;
             }
          }
@@ -1983,9 +2028,12 @@ vp_draw_vbo(struct pipe_context *pipe,
           * framebuffer round-trip or texture re-upload. */
          uint64_t color_dev = 0, depth_dev = 0, tex_dev = 0;
          bool drew = vp_fb_ensure(pipe, vp, w, h, &om, &color_dev, &depth_dev);
-         if (drew && tex_used)
-            drew = vp_tex_ensure(pipe, vp, vp->cur_tex, tw, th, &tex_dev,
-                                 tex.mip_off);
+         if (drew && tex_used) {
+            uint32_t tex_bpp = 4;
+            (void)vp_vx_tex_format(vp->cur_tex->format, &tex_bpp);
+            drew = vp_tex_ensure(pipe, vp, vp->cur_tex, tw, th, tex.format,
+                                 tex_bpp, &tex_dev, tex.mip_off);
+         }
 
          /* A draw whose FS writes >1 colour output AND targets >1 bound
           * attachment renders each attachment into its own resident buffer and

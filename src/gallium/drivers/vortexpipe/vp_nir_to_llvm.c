@@ -2966,20 +2966,43 @@ emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
    }
 }
 
+/* sampler2DShadow: gfx_tex_shadow_sw(&texstate[0], x, y, ref_bits, filter) --
+ * sample the depth texture at (x,y), compare each tap against ref with the
+ * descriptor's compare_func, and return the 0..1 result as a float bit-pattern
+ * (0/1 point, PCF fraction for a bilinear sampler). The result is a scalar float,
+ * so write it directly to every def component (bypassing the ARGB unpack). */
+static void
+emit_tex_shadow(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y,
+                LLVMValueRef ref_bits)
+{
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_sw", fty);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y, ref_bits, emit_tex_filter_word(t) };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 5, "shadow");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
+      ssa_set(t, tex->def.index, c, res);
+}
+
 /* A NIR texture op: a 2D `texture()`/`textureLod()`/`textureBias()` sampling the
  * single bound texture (TEX stage 0), or `texelFetch()` (integer-coord fetch, no
  * filter). The interpolated texcoord is the coord source; the texture/sampler
  * deref sources are fixed-function (TEX DCRs). For implicit-LOD `tex`, the mip
  * level is derived from the quad's coordinate gradients; explicit-LOD/bias take
  * level 0 (no bias arithmetic yet). The result vec4 is the unpacked A8R8G8B8
- * texel as four floats in [0,1]. */
+ * texel as four floats in [0,1]. A sampler2DShadow op returns a single depth-
+ * compare float instead (emit_tex_shadow). */
 static void
 emit_tex(struct vp_tr *t, nir_tex_instr *tex)
 {
    LLVMValueRef u = NULL, v = NULL, lod_int = NULL;
-   LLVMValueRef off_x = NULL, off_y = NULL;
+   LLVMValueRef off_x = NULL, off_y = NULL, cmp = NULL;
+   unsigned coord_ssa = 0;
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       if (tex->src[i].src_type == nir_tex_src_coord) {
+         coord_ssa = tex->src[i].src.ssa->index;
          u = ssa_get(t, tex->src[i].src.ssa->index, 0);
          v = ssa_get(t, tex->src[i].src.ssa->index, 1);
       } else if (tex->src[i].src_type == nir_tex_src_lod) {
@@ -2987,7 +3010,24 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       } else if (tex->src[i].src_type == nir_tex_src_offset) {
          off_x = ssa_get(t, tex->src[i].src.ssa->index, 0);
          off_y = ssa_get(t, tex->src[i].src.ssa->index, 1);
+      } else if (tex->src[i].src_type == nir_tex_src_comparator) {
+         cmp = ssa_get(t, tex->src[i].src.ssa->index, 0);
       }
+   }
+
+   /* sampler2DShadow: the depth-compare reference is the comparator src, or, when
+    * a lowering folds it in, coord component 2. Sample the depth texture, compare
+    * against ref per the sampler's compareOp, and return the 0..1 result (scalar).
+    * A shadow op is still nir_texop_tex/txl, so handle it before that dispatch. */
+   if (tex->is_shadow && u && v) {
+      LLVMValueRef ref = cmp ? cmp : ssa_get(t, coord_ssa, 2);
+      LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "uf");
+      LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "vf");
+      LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+      LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
+      LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
+      emit_tex_shadow(t, tex, ux, vx, ref);
+      return;
    }
 
    /* texelFetch: integer (x,y,lod), no wrap/filter/mip -- the coord and lod are

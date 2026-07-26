@@ -527,7 +527,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i)
             texstate.mip_off[i] = tex->mip_off[i];
          texstate.logdim = (vp_log2u(tex->height) << 16) | vp_log2u(tex->width);
-         texstate.format = VX_TEX_FORMAT_A8R8G8B8;
+         /* Depth formats (sampler2DShadow) carry the real VX format so the SW
+          * sampler reads/compares raw depth; colour textures stay A8R8G8B8. */
+         texstate.format = tex->format ? tex->format : VX_TEX_FORMAT_A8R8G8B8;
+         texstate.compare_func = tex->compare_func;
          /* Descriptor-only filter bits (the FS reads them; they never reach the HW
           * TEX_FILTER DCR below): mag tap (bit0, from tex->filter), min tap (bit3),
           * mip-linear (bit1) and mip-enable (bit2). A mipmapped sampler routes to
