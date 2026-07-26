@@ -2563,6 +2563,21 @@ emit_tex_fetch(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef lod
    return LLVMBuildCall2(t->b, fty, fn, a, 4, "texfetch");
 }
 
+/* texelFetch on a 2D array: gfx_tex_fetch_array_sw(&texstate[0], x, y, layer, lod)
+ * -- exact texel of integer `layer` slice, no wrap/filter/mip. */
+static LLVMValueRef
+emit_tex_fetch_array(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y,
+                     LLVMValueRef layer, LLVMValueRef lod)
+{
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_array_sw", fty);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y, layer, lod };
+   return LLVMBuildCall2(t->b, fty, fn, a, 5, "texfetcharr");
+}
+
 /* textureGather: gfx_tex_gather_sw(&texstate[0], x, y, comp) -- channel `comp` of
  * the 2x2 footprint at (x,y), base level, packed in GL gather order as bytes
  * x | y<<8 | z<<16 | w<<24. Unpack to the def's vec4 as floats in [0,1]. */
@@ -3066,7 +3081,8 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    /* sampler2DArray: coord.z is the array layer (round to nearest, clamp >= 0);
     * sample that slice via the SW array entry (base + layer*layer_stride). Handled
     * before the 2D dispatch since an array sample is still nir_texop_tex/txl. */
-   if (tex->is_array && tex->sampler_dim == GLSL_SAMPLER_DIM_2D && u && v) {
+   if (tex->is_array && tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+       tex->op != nir_texop_txf && u && v) {
       LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
       LLVMValueRef layer = LLVMBuildFPToSI(t->b,
          LLVMBuildFAdd(t->b, zf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "layer");
@@ -3097,7 +3113,8 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    /* samplerCube: coord.xyz is the direction vector; the SW cube entry selects the
     * face and projects. Handled before the 2D dispatch (a cube sample is still
     * nir_texop_tex/txl). */
-   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && !tex->is_array && u && v) {
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && !tex->is_array &&
+       tex->op != nir_texop_txf && u && v) {
       LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "");
       LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "");
       LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
@@ -3128,7 +3145,13 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       /* texelFetchOffset: the offset is a texel delta added to the integer coord. */
       LLVMValueRef x = off_x ? LLVMBuildAdd(t->b, u, off_x, "") : u;
       LLVMValueRef y = off_y ? LLVMBuildAdd(t->b, v, off_y, "") : v;
-      emit_tex_unpack(t, tex, emit_tex_fetch(t, x, y, lod));
+      if (tex->is_array) {
+         /* 2D array: coord.z is the integer layer slice. */
+         LLVMValueRef layer = ssa_get(t, coord_ssa, 2);
+         emit_tex_unpack(t, tex, emit_tex_fetch_array(t, x, y, layer, lod));
+      } else {
+         emit_tex_unpack(t, tex, emit_tex_fetch(t, x, y, lod));
+      }
       return;
    }
 
