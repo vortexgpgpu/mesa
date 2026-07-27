@@ -3124,9 +3124,12 @@ emit_tex_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc, LLVMValueRef
    emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 5, "texcube"));
 }
 
-/* sampler3D: sample at S.23 (u,v,w). Compute the nearest mip level from the u,v
+/* sampler3D: sample at S.23 (u,v,w). Compute the signed LOD lambda from the u,v
  * gradient (bias + clamp + mip-enable gate, like the 2D auto-LOD path); the min/mag
- * tap is resolved from the same lambda. The sampler picks the depth slice from w
+ * tap is resolved from the same lambda. A mip-linear sampler passes the Q8 lambda
+ * with the mip-linear bit set so the sampler blends the two bracketing levels
+ * (full trilinear = 2 levels x 2 slices x bilinear); otherwise it passes the
+ * rounded integer level (nearest-mip). The sampler picks the depth slice from w
  * (nearest slice, or a linear blend of the two bracketing slices on a linear tap).
  * A non-mipmapped sampler forces level 0 (the single-level base-LOD path). */
 static void
@@ -3163,6 +3166,10 @@ emit_tex_3d(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef u, LLVMValueRef v,
       LLVMBuildAnd(t->b, filt,
          LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
       zero32, "mip_en");
+   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
+      zero32, "mip_lin");
    lam = LLVMBuildSelect(t->b, mip_en, lam, zero32, "");
    /* nearest mip level = round(lambda). */
    LLVMValueRef level = LLVMBuildAShr(t->b,
@@ -3177,13 +3184,23 @@ emit_tex_3d(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef u, LLVMValueRef v,
       LLVMConstInt(t->i32, 1, false), "min_tap");
    LLVMValueRef tap = LLVMBuildSelect(t->b, minified, min_tap, mag_tap, "tap");
 
+   /* Inter-level blend only for a minified fragment of a mip-linear sampler with a
+    * real mip chain: pass the Q8 lambda + the mip-linear bit so the sampler blends
+    * two levels; otherwise the rounded integer level with a tap-only filter. */
+   LLVMValueRef mip_active = LLVMBuildAnd(t->b, LLVMBuildAnd(t->b, minified, mip_lin, ""),
+                                          mip_en, "mip_active");
+   LLVMValueRef lod = LLVMBuildSelect(t->b, mip_active, lam, level, "lod");
+   LLVMValueRef mip_bit = LLVMBuildSelect(t->b, mip_active,
+      LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), zero32, "");
+   LLVMValueRef sw_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+
    LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
    LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
    LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_3d_sw");
    if (!fn) {
       fn = LLVMAddFunction(t->mod, "gfx_tex_sample_3d_sw", fty);
    }
-   LLVMValueRef a[6] = { t->fs_texstate, u, v, w, level, tap };
+   LLVMValueRef a[6] = { t->fs_texstate, u, v, w, lod, sw_filter };
    emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 6, "tex3d"));
 }
 
