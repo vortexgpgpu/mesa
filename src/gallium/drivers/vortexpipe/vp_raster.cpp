@@ -535,14 +535,21 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          texstate.compare_func = tex->compare_func;
          texstate.swizzle = tex->swizzle;
          texstate.layer_stride = tex->layer_stride;
+         texstate.min_lod  = tex->min_lod;
+         texstate.max_lod  = tex->max_lod;
+         texstate.lod_bias = tex->lod_bias;
          /* Descriptor-only filter bits (the FS reads them; they never reach the HW
           * TEX_FILTER DCR below): mag tap (bit0, from tex->filter), min tap (bit3),
-          * mip-linear (bit1) and mip-enable (bit2). A mipmapped sampler routes to
-          * the SW sampler, which resolves min-vs-mag per fragment from these. */
+          * mip-linear (bit1), mip-enable (bit2) and NPOT (bit4). A mipmapped OR
+          * non-power-of-two sampler routes to the SW sampler, which resolves
+          * min-vs-mag per fragment from these and addresses NPOT by width/height. */
+         const bool tex_pot = tex->width && tex->height
+            && !(tex->width & (tex->width - 1u)) && !(tex->height & (tex->height - 1u));
          texstate.filter = tex->filter
             | (tex->min_filter == VX_TEX_FILTER_BILINEAR ? GFX_SW_TEX_FILTER_MIN_BILINEAR : 0u)
             | (tex->mip_linear ? VX_TEX_FILTER_MIP_LINEAR : 0u)
-            | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u);
+            | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u)
+            | (tex_pot ? 0u : GFX_SW_TEX_FILTER_NPOT);
          texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
          /* Carry the mip-0 integer dims so the SW sampler can address NPOT
           * textures (multiply addressing). POT textures leave width==1<<logdim
@@ -836,8 +843,28 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_RASTER_TILE_COUNT,  num_bins);
       DCRW(VX_DCR_RASTER_PBUF_ADDR,   (uint32_t)(prim_dev / 64));
       DCRW(VX_DCR_RASTER_PBUF_STRIDE, VP_RAST_PRIM_STRIDE);
-      DCRW(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
-      DCRW(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
+      /* Scissor to the viewport's screen rect so an offset/partial viewport
+       * rasters only within its rectangle (the device applies the vp scale/bias
+       * transform, but the coverage walk must be clamped to the vp rect too). A
+       * full-framebuffer viewport yields [0,W]x[0,H] — identical to the old
+       * hardcoded scissor. rect = bias ± |scale|, clamped to the framebuffer. */
+      float asx = vp_sx < 0 ? -vp_sx : vp_sx, asy = vp_sy < 0 ? -vp_sy : vp_sy;
+      int32_t sxmin = (int32_t)(vp_tx - asx + 0.5f), sxmax = (int32_t)(vp_tx + asx + 0.5f);
+      int32_t symin = (int32_t)(vp_ty - asy + 0.5f), symax = (int32_t)(vp_ty + asy + 0.5f);
+      if (sxmin < 0) {
+         sxmin = 0;
+      }
+      if (sxmax > (int32_t)width) {
+         sxmax = (int32_t)width;
+      }
+      if (symin < 0) {
+         symin = 0;
+      }
+      if (symax > (int32_t)height) {
+         symax = (int32_t)height;
+      }
+      DCRW(VX_DCR_RASTER_SCISSOR_X,   ((uint32_t)sxmax << 16) | (uint32_t)sxmin);
+      DCRW(VX_DCR_RASTER_SCISSOR_Y,   ((uint32_t)symax << 16) | (uint32_t)symin);
       /* Arm the fragment work distributor: FS entry PC + device args pointer.
        * The RASTER unit injects a fragment warp per covered quad only
        * when FRAG_ENTRY is non-zero — without this the grid-less FS never runs. */

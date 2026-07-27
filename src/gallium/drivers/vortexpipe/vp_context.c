@@ -26,6 +26,7 @@
 
 #include "pipe/p_state.h"     /* full struct pipe_compute_state */
 #include "util/format/u_formats.h"  /* PIPE_FORMAT_* */
+#include "util/format/u_format.h"   /* util_format_read_4ub (source-format decode) */
 #include "util/blend.h"             /* PIPE_BLENDFACTOR_*, PIPE_BLEND_* */
 #include "util/hash_table.h"
 #include "util/simple_mtx.h"
@@ -769,6 +770,30 @@ vp_create_texture_handle(struct pipe_context *pipe,
       vp->cur_sampler_store.compare_enable =
          (state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE);
       vp->cur_sampler_store.compare_func = state->compare_func;
+      /* LOD clamp/bias in Q(VX_TEX_LOD_FRAC_BITS). The FS applies
+       * λ = clamp(λ + bias, min_lod, max_lod) before level selection. Clamp the
+       * bounds to the addressable LOD range (Vulkan's default maxLod is ~1000). */
+      {
+         const float lod_q = (float)(1 << VX_TEX_LOD_FRAC_BITS);
+         const float lod_max = (float)VX_TEX_LOD_MAX;
+         float lmax = state->max_lod < 0.0f ? 0.0f : state->max_lod;
+         float lmin = state->min_lod < 0.0f ? 0.0f : state->min_lod;
+         if (lmax > lod_max) {
+            lmax = lod_max;
+         }
+         if (lmin > lod_max) {
+            lmin = lod_max;
+         }
+         /* A pathologically large app bias is bounded to the addressable range so
+          * the fixed-point conversion cannot overflow (the in-shader clamp caps it
+          * anyway). */
+         float lbias = state->lod_bias;
+         if (lbias >  lod_max) { lbias =  lod_max; }
+         if (lbias < -lod_max) { lbias = -lod_max; }
+         vp->cur_sampler_store.max_lod  = (uint32_t)(lmax * lod_q + 0.5f);
+         vp->cur_sampler_store.min_lod  = (uint32_t)(lmin * lod_q + 0.5f);
+         vp->cur_sampler_store.lod_bias = (int32_t)(lbias * lod_q);
+      }
       vp->cur_sampler = &vp->cur_sampler_store;
       vp_dbg("vortexpipe: TEX sampler captured mag=%u min=%u wrap=%u,%u mip_enable=%u mip_linear=%u",
              vp->cur_sampler->filter, vp->cur_sampler->min_filter,
@@ -1212,7 +1237,9 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
    const uint32_t layer_stride = total * bpp;   /* one layer's mip-chain bytes */
 
    uint8_t *texbuf = malloc((size_t)layer_stride * layers);
-   bool ok = texbuf != NULL;
+   /* Scratch row for decoding a source-format row to R8G8B8A8 (colour path). */
+   uint8_t *rowbuf = is_depth ? NULL : malloc((size_t)w * 4);
+   bool ok = texbuf != NULL && (is_depth || rowbuf != NULL);
    for (uint32_t layer = 0; ok && layer < layers; layer++) {
       uint8_t *lbase = texbuf + (size_t)layer * layer_stride;
       for (uint32_t l = 0; ok && l <= last; l++) {
@@ -1229,10 +1256,16 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
                /* raw depth texels (D32F=4 B float, D16=2 B unorm) — no swizzle. */
                memcpy(dst + (size_t)y * wl * bpp, m, (size_t)wl * bpp);
             } else {
+               /* Decode this source row (any colour pipe_format) to R8G8B8A8,
+                * then repack to the VX A8R8G8B8 texel order. Reading `m` as raw
+                * RGBA8 would corrupt every non-RGBA8 format (packed 16-bit, BGRA,
+                * …), which pipe_texture_map returns in the resource's own layout. */
+               util_format_read_4ub(res->format, rowbuf, (unsigned)wl * 4,
+                                     m, xfer->stride, 0, 0, wl, 1);
                uint32_t *d32 = (uint32_t *)(dst + (size_t)y * wl * 4);
                for (uint32_t x = 0; x < wl; x++) {
-                  uint32_t r = m[x * 4 + 0], g = m[x * 4 + 1];
-                  uint32_t b = m[x * 4 + 2], a = m[x * 4 + 3];
+                  uint32_t r = rowbuf[x * 4 + 0], g = rowbuf[x * 4 + 1];
+                  uint32_t b = rowbuf[x * 4 + 2], a = rowbuf[x * 4 + 3];
                   d32[x] = (a << 24) | (r << 16) | (g << 8) | b;
                }
             }
@@ -1248,6 +1281,7 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
       ok = vp_dev_upload(vp->dev, texbuf, (size_t)layer_stride * layers,
                          &vp->rtex_buf, tex_dev);
    free(texbuf);
+   free(rowbuf);
    if (!ok) return false;
    vp->rtex_res = res;
    vp->rtex_w = w; vp->rtex_h = h;
@@ -1939,21 +1973,11 @@ vp_draw_vbo(struct pipe_context *pipe,
                    "compiled for SW texturing — skipping hardware RASTER+OM path");
          gfx_hw = false;
       }
-      /* NPOT textures cannot be addressed by the FF TEX unit (power-of-two
-       * only); they are sampled by the SW multiply-addressing path, which needs
-       * an FS compiled for sw_tex (FF vx_tex4 iff POT, else SW). A
-       * bound NPOT texture on a HW-TEX FS therefore drops to llvmpipe; on a
-       * sw_tex FS the device path samples it in software. */
-      if (gfx_hw && tex_needed && !fs_sw_tex && vp->cur_tex) {
-         uint32_t tw = vp->cur_tex->width0, th = vp->cur_tex->height0;
-         bool pot = tw && th && !(tw & (tw - 1)) && !(th & (th - 1));
-         if (!pot) {
-            mesa_logw("vortexpipe: draw_vbo: NPOT texture %ux%u needs the SW "
-                      "sampler (FS compiled for HW TEX) — skipping hardware path",
-                      tw, th);
-            gfx_hw = false;
-         }
-      }
+      /* NPOT textures cannot be addressed by the FF vx_tex4 unit (power-of-two
+       * only). A HW-TEX texture()/textureLod/textureBias FS routes an NPOT texture
+       * to its co-compiled SW sampler at runtime (the GFX_SW_TEX_FILTER_NPOT bit
+       * drives the same emit_tex branch a mipmapped sampler takes), so an
+       * NPOT-textured draw stays on the device path — no llvmpipe drop. */
       /* Viewport transform for the device front end. Gallium already reduced
        * the app's VkViewport to window-space scale/translate (captured in
        * set_viewport_states); forward slot 0 so the device setup maps
@@ -1961,37 +1985,20 @@ vp_draw_vbo(struct pipe_context *pipe,
        * flips the signed-area face-cull sign correctly. Unset => the default
        * full-framebuffer y-down transform.
        *
-       * The device bbox-clamp + scissor are still full-framebuffer, so only a
-       * viewport whose rect equals the full framebuffer [0,W]x[0,H] (in either
-       * Y direction — the y-flip case) renders correctly; an offset / partial /
-       * scaled viewport would raster outside its intended rect. Those fall out
-       * of the HW path and take the VS-on-Vortex + llvmpipe fallback (which
-       * applies the viewport itself) — or, under MESA_VORTEX_STRICT, fail
-       * rather than mis-render. Follow-up: plumb a viewport-derived scissor
-       * + bbox clamp so offset/partial viewports run on the device too. */
+       * The device now scissors the coverage walk to the viewport's screen rect
+       * (vp_raster_draw derives it from the scale/bias), so offset / partial /
+       * scaled viewports raster only within their rectangle and run on the device
+       * too — no llvmpipe fallback. A full-framebuffer viewport yields the [0,W]x
+       * [0,H] scissor, unchanged. */
       float vp_sx = 0.5f * (float)vp->fb_width,  vp_tx = 0.5f * (float)vp->fb_width;
       float vp_sy = 0.5f * (float)vp->fb_height, vp_ty = 0.5f * (float)vp->fb_height;
-      bool vp_full_fb = true;
       if (vp->vp_valid) {
          vp_sx = vp->vp_scale_x; vp_tx = vp->vp_trans_x;
          vp_sy = vp->vp_scale_y; vp_ty = vp->vp_trans_y;
-         const float W = (float)vp->fb_width, H = (float)vp->fb_height;
-         const float eps = 0.5f;
-         float asx = vp_sx < 0 ? -vp_sx : vp_sx, asy = vp_sy < 0 ? -vp_sy : vp_sy;
-         float dtx = vp_tx - 0.5f * W, dty = vp_ty - 0.5f * H;
-         dtx = dtx < 0 ? -dtx : dtx; dty = dty < 0 ? -dty : dty;
-         /* rect = bias ± |scale|; full-fb iff it spans exactly [0,W]x[0,H]. */
-         vp_full_fb = (asx > 0.5f * W - eps) && (asx < 0.5f * W + eps) && dtx < eps
-                   && (asy > 0.5f * H - eps) && (asy < 0.5f * H + eps) && dty < eps;
-         if (!vp_full_fb)
-            mesa_logw("vortexpipe: draw_vbo: non-full-framebuffer viewport "
-                      "(scale=(%g,%g) translate=(%g,%g), fb=%ux%u) unsupported "
-                      "on the device front end (W3) — using the llvmpipe path",
-                      vp_sx, vp_sy, vp_tx, vp_ty, vp->fb_width, vp->fb_height);
       }
 
       bool hw_path = vin_ok && !sw_raster && gfx_hw && fs && fs->vxbin &&
-                     vp->fb_color && vp->fb_width && vp->fb_height && vp_full_fb;
+                     vp->fb_color && vp->fb_width && vp->fb_height;
 
       /* Vortex hardware raster + OM path: the VS is folded into the draw —
        * vp_raster_draw runs it as stage 0, so the whole VS→setup→bin→FF→FS
@@ -2062,6 +2069,11 @@ vp_draw_vbo(struct pipe_context *pipe,
                                                 : false;
                tex.mip_linear = vp->cur_sampler ? vp->cur_sampler->mip_linear
                                                 : false;
+               /* LOD clamp/bias (Q8). No sampler => identity clamp [0, LOD_MAX]. */
+               tex.min_lod  = vp->cur_sampler ? vp->cur_sampler->min_lod : 0u;
+               tex.max_lod  = vp->cur_sampler ? vp->cur_sampler->max_lod
+                                              : ((uint32_t)VX_TEX_LOD_MAX << VX_TEX_LOD_FRAC_BITS);
+               tex.lod_bias = vp->cur_sampler ? vp->cur_sampler->lod_bias : 0;
                /* sampler2DShadow: resolve the depth format + compare op so the SW
                 * sampler reads real depth and compares against the shader's ref. */
                tex.format = vp_vx_tex_format(vp->cur_tex->format, NULL);
