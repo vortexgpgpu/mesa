@@ -1223,14 +1223,16 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * texture yields off 0 for every LOD (byte-identical to the old upload).
     * A 2D-array texture stacks each layer's full mip chain (layer_stride bytes
     * apart) so the SW sampler reaches layer L at base + L*layer_stride. */
-   const uint32_t last = (res->last_level < (uint32_t)VX_TEX_LOD_MAX)
-                       ? res->last_level : (uint32_t)VX_TEX_LOD_MAX;
+   /* A 3D texture's depth slices stack like array layers (the pipe_texture_map
+    * z argument selects the slice). Base level only: a 3D mip chain halves the
+    * depth per level, so this per-slice layout does not model it, and mapping a
+    * higher level would index slices past that level's reduced depth. */
+   const bool is_3d = (res->target == PIPE_TEXTURE_3D);
+   const uint32_t last = is_3d ? 0u
+                       : ((res->last_level < (uint32_t)VX_TEX_LOD_MAX)
+                          ? res->last_level : (uint32_t)VX_TEX_LOD_MAX);
    const bool is_depth = (vx_format == VX_TEX_FORMAT_D16 ||
                           vx_format == VX_TEX_FORMAT_D32F);
-   /* A 3D texture's depth slices stack like array layers (the pipe_texture_map
-    * z argument selects the slice). Single-level only here -- a 3D mip chain
-    * halves the depth per level, which this per-slice layout does not model. */
-   const bool is_3d = (res->target == PIPE_TEXTURE_3D);
    const uint32_t layers = is_3d ? (res->depth0 ? res->depth0 : 1u)
                                  : (res->array_size > 1 ? res->array_size : 1u);
    uint32_t off_texels[VX_TEX_LOD_MAX + 1] = { 0 };
