@@ -3091,6 +3091,23 @@ emit_tex_shadow(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRe
       ssa_set(t, tex->def.index, c, res);
 }
 
+/* sampler2DArrayShadow: like emit_tex_shadow, but the integer `layer` selects the
+ * array slice before the depth compare (gfx_tex_shadow_array_sw). */
+static void
+emit_tex_shadow_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x,
+                      LLVMValueRef y, LLVMValueRef layer, LLVMValueRef ref_bits)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_array_sw", fty);
+   LLVMValueRef a[6] = { t->fs_texstate, x, y, layer, ref_bits, emit_tex_filter_word(t) };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 6, "shadowarray");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
+      ssa_set(t, tex->def.index, c, res);
+}
+
 /* sampler2DArray: gfx_tex_sample_array_sw(&texstate[0], x, y, layer, lod) -- sample
  * the integer `layer` slice at (x,y) of the given LOD, then unpack the A8R8G8B8
  * texel to the def's vec4. The layer stride comes from the resident descriptor. */
@@ -3241,6 +3258,28 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
               LLVMConstReal(t->f32, (double)(1 << VX_TEX_LOD_FRAC_BITS)), ""),
            t->i32, "bias_q8")
       : NULL;
+
+   /* sampler2DArrayShadow: coord.z is the array layer, the comparator src (or, when
+    * folded into the coord, component 3) is the reference. Select the layer slice,
+    * then compare. Handled before the plain 2D-shadow branch (which drops the
+    * layer) and before the array-colour branch (which drops the compare). */
+   if (tex->is_shadow && tex->is_array &&
+       tex->sampler_dim == GLSL_SAMPLER_DIM_2D && u && v) {
+      LLVMValueRef ref = cmp ? cmp : ssa_get(t, coord_ssa, 3);
+      LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+      LLVMValueRef layer = LLVMBuildFPToSI(t->b,
+         LLVMBuildFAdd(t->b, zf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "layer");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      layer = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, layer, zero, ""), zero, layer, "");
+      LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "uf");
+      LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "vf");
+      LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+      LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
+      LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
+      emit_tex_shadow_array(t, tex, ux, vx, layer, ref);
+      return;
+   }
 
    /* sampler2DShadow: the depth-compare reference is the comparator src, or, when
     * a lowering folds it in, coord component 2. Sample the depth texture, compare
