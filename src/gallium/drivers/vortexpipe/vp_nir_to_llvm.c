@@ -2610,6 +2610,31 @@ emit_tex_gather(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRe
    }
 }
 
+/* textureGatherCmp: compare each of the 2x2 depth taps against ref_bits and
+ * return the vec4 of 0/1 results (gfx_tex_gather_cmp_sw packs 0xff/0x00 per tap;
+ * the /255 unpack yields 0.0/1.0, matching the colour gather). */
+static void
+emit_tex_gather_cmp(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x,
+                    LLVMValueRef y, LLVMValueRef ref_bits)
+{
+   LLVMTypeRef params[4] = { t->ptr, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 4, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_gather_cmp_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_gather_cmp_sw", fty);
+   LLVMValueRef a[4] = { t->fs_texstate, x, y, ref_bits };
+   LLVMValueRef packed = LLVMBuildCall2(t->b, fty, fn, a, 4, "gathercmp");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
+      LLVMValueRef byte = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, packed, LLVMConstInt(t->i32, c * 8, false), ""),
+         LLVMConstInt(t->i32, 0xff, false), "");
+      LLVMValueRef f = LLVMBuildFMul(t->b,
+         LLVMBuildUIToFP(t->b, byte, t->f32, ""),
+         LLVMConstReal(t->f32, 1.0 / 255.0), "");
+      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
+   }
+}
+
 /* ── RTU (ray-tracing unit) ops — ISA v2 window ABI ──────────────────
  * CUSTOM1 (opcode 43). vortex_rt_wtrace (funct3=7, funct2=0) issues one ray:
  * the per-trace config lane-packs into rs1 via wgather, the per-thread ray
@@ -3424,7 +3449,12 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef gscale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
       LLVMValueRef gux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, guf, gscale, ""), t->i32, "");
       LLVMValueRef gvx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, gvf, gscale, ""), t->i32, "");
-      emit_tex_gather(t, tex, gux, gvx);
+      /* textureGatherCmp (sampler2DShadow): compare each tap against the reference
+       * instead of reading a colour channel. */
+      if (tex->is_shadow)
+         emit_tex_gather_cmp(t, tex, gux, gvx, cmp ? cmp : ssa_get(t, coord_ssa, 2));
+      else
+         emit_tex_gather(t, tex, gux, gvx);
       return;
    }
 
