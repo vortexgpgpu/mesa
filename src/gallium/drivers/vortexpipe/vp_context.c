@@ -1193,6 +1193,30 @@ vp_vx_tex_format(enum pipe_format pf, uint32_t *bpp)
    }
 }
 
+/* Decode one mapped slice (wl x hl) into the tight device buffer at `dst`: depth
+ * texels are copied raw, colour rows are decoded from the resource format to the
+ * VX A8R8G8B8 texel order (rowbuf is wl*4 scratch). */
+static void
+vp_decode_slice(uint8_t *dst, const uint8_t *map, unsigned src_stride,
+                uint32_t wl, uint32_t hl, uint32_t bpp, bool is_depth,
+                uint8_t *rowbuf, enum pipe_format fmt)
+{
+   for (uint32_t y = 0; y < hl; y++) {
+      const uint8_t *m = map + (size_t)y * src_stride;
+      if (is_depth) {
+         memcpy(dst + (size_t)y * wl * bpp, m, (size_t)wl * bpp);
+      } else {
+         util_format_read_4ub(fmt, rowbuf, (unsigned)wl * 4, m, src_stride, 0, 0, wl, 1);
+         uint32_t *d32 = (uint32_t *)(dst + (size_t)y * wl * 4);
+         for (uint32_t x = 0; x < wl; x++) {
+            uint32_t r = rowbuf[x * 4 + 0], g = rowbuf[x * 4 + 1];
+            uint32_t b = rowbuf[x * 4 + 2], a = rowbuf[x * 4 + 3];
+            d32[x] = (a << 24) | (r << 16) | (g << 8) | b;
+         }
+      }
+   }
+}
+
 /* Ensure the bound texture is uploaded + resident, keyed by its resource. The
  * mip chain is read back to a tight host buffer and uploaded once; a re-bind of
  * the same resource reuses it. A colour resource is packed to A8R8G8B8; a depth
@@ -1223,18 +1247,63 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * texture yields off 0 for every LOD (byte-identical to the old upload).
     * A 2D-array texture stacks each layer's full mip chain (layer_stride bytes
     * apart) so the SW sampler reaches layer L at base + L*layer_stride. */
-   /* A 3D texture's depth slices stack like array layers (the pipe_texture_map
-    * z argument selects the slice). Base level only: a 3D mip chain halves the
-    * depth per level, so this per-slice layout does not model it, and mapping a
-    * higher level would index slices past that level's reduced depth. */
    const bool is_3d = (res->target == PIPE_TEXTURE_3D);
-   const uint32_t last = is_3d ? 0u
-                       : ((res->last_level < (uint32_t)VX_TEX_LOD_MAX)
-                          ? res->last_level : (uint32_t)VX_TEX_LOD_MAX);
+   const uint32_t last = (res->last_level < (uint32_t)VX_TEX_LOD_MAX)
+                       ? res->last_level : (uint32_t)VX_TEX_LOD_MAX;
    const bool is_depth = (vx_format == VX_TEX_FORMAT_D16 ||
                           vx_format == VX_TEX_FORMAT_D32F);
-   const uint32_t layers = is_3d ? (res->depth0 ? res->depth0 : 1u)
-                                 : (res->array_size > 1 ? res->array_size : 1u);
+   /* Scratch row for decoding a source-format row to R8G8B8A8 (colour path). */
+   uint8_t *rowbuf = is_depth ? NULL : malloc((size_t)w * 4);
+
+   if (is_3d) {
+      /* Per-level, all-slices layout: level l holds max(depth>>l,1) slices of
+       * (w>>l)x(h>>l), so mip_off[l] is the level's byte base and slice z of the
+       * level lives at mip_off[l] + z*(w>>l)*(h>>l)*bpp. Halving the depth per
+       * level is why a 3D chain cannot use the per-slice array layout; the SW
+       * sampler derives the per-level slice size from the dims. */
+      uint32_t level_off[VX_TEX_LOD_MAX + 1] = { 0 };
+      uint32_t total = 0;
+      for (uint32_t l = 0; l <= last; l++) {
+         uint32_t wl = (w >> l) ? (w >> l) : 1u;
+         uint32_t hl = (h >> l) ? (h >> l) : 1u;
+         uint32_t dl = (res->depth0 >> l) ? (res->depth0 >> l) : 1u;
+         level_off[l] = total;
+         total += wl * hl * dl;
+      }
+      const size_t bytes = (size_t)total * bpp;
+      uint8_t *texbuf = malloc(bytes);
+      bool ok = texbuf != NULL && (is_depth || rowbuf != NULL);
+      for (uint32_t l = 0; ok && l <= last; l++) {
+         uint32_t wl = (w >> l) ? (w >> l) : 1u;
+         uint32_t hl = (h >> l) ? (h >> l) : 1u;
+         uint32_t dl = (res->depth0 >> l) ? (res->depth0 >> l) : 1u;
+         for (uint32_t z = 0; ok && z < dl; z++) {
+            struct pipe_transfer *xfer = NULL;
+            uint8_t *map = pipe_texture_map(pipe, res, l, z, PIPE_MAP_READ,
+                                            0, 0, wl, hl, &xfer);
+            if (!map) { ok = false; break; }
+            uint8_t *dst = texbuf + ((size_t)level_off[l] + (size_t)z * wl * hl) * bpp;
+            vp_decode_slice(dst, map, xfer->stride, wl, hl, bpp, is_depth,
+                            rowbuf, res->format);
+            pipe_texture_unmap(pipe, xfer);
+         }
+      }
+      for (uint32_t l = 0; l <= (uint32_t)VX_TEX_LOD_MAX; l++)
+         mip_off[l] = level_off[l <= last ? l : last] * bpp;
+      if (ok)
+         ok = vp_dev_upload(vp->dev, texbuf, bytes, &vp->rtex_buf, tex_dev);
+      free(texbuf);
+      free(rowbuf);
+      if (!ok) return false;
+      vp->rtex_res = res;
+      vp->rtex_w = w; vp->rtex_h = h;
+      vp->rtex_layer_stride = 0u;   /* 3D derives per-level slice sizes from dims */
+      *layer_stride_out = 0u;
+      memcpy(vp->rtex_mipoff, mip_off, sizeof(vp->rtex_mipoff));
+      return true;
+   }
+
+   const uint32_t layers = (res->array_size > 1) ? res->array_size : 1u;
    uint32_t off_texels[VX_TEX_LOD_MAX + 1] = { 0 };
    uint32_t total = 0;
    for (uint32_t l = 0; l <= last; l++) {
@@ -1246,8 +1315,6 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
    const uint32_t layer_stride = total * bpp;   /* one layer's mip-chain bytes */
 
    uint8_t *texbuf = malloc((size_t)layer_stride * layers);
-   /* Scratch row for decoding a source-format row to R8G8B8A8 (colour path). */
-   uint8_t *rowbuf = is_depth ? NULL : malloc((size_t)w * 4);
    bool ok = texbuf != NULL && (is_depth || rowbuf != NULL);
    for (uint32_t layer = 0; ok && layer < layers; layer++) {
       uint8_t *lbase = texbuf + (size_t)layer * layer_stride;
@@ -1259,26 +1326,8 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
                                          0, 0, wl, hl, &xfer);
          if (!map) { ok = false; break; }
          uint8_t *dst = lbase + (size_t)off_texels[l] * bpp;
-         for (uint32_t y = 0; y < hl; y++) {
-            uint8_t *m = map + (size_t)y * xfer->stride;
-            if (is_depth) {
-               /* raw depth texels (D32F=4 B float, D16=2 B unorm) — no swizzle. */
-               memcpy(dst + (size_t)y * wl * bpp, m, (size_t)wl * bpp);
-            } else {
-               /* Decode this source row (any colour pipe_format) to R8G8B8A8,
-                * then repack to the VX A8R8G8B8 texel order. Reading `m` as raw
-                * RGBA8 would corrupt every non-RGBA8 format (packed 16-bit, BGRA,
-                * …), which pipe_texture_map returns in the resource's own layout. */
-               util_format_read_4ub(res->format, rowbuf, (unsigned)wl * 4,
-                                     m, xfer->stride, 0, 0, wl, 1);
-               uint32_t *d32 = (uint32_t *)(dst + (size_t)y * wl * 4);
-               for (uint32_t x = 0; x < wl; x++) {
-                  uint32_t r = rowbuf[x * 4 + 0], g = rowbuf[x * 4 + 1];
-                  uint32_t b = rowbuf[x * 4 + 2], a = rowbuf[x * 4 + 3];
-                  d32[x] = (a << 24) | (r << 16) | (g << 8) | b;
-               }
-            }
-         }
+         vp_decode_slice(dst, map, xfer->stride, wl, hl, bpp, is_depth,
+                         rowbuf, res->format);
          pipe_texture_unmap(pipe, xfer);
       }
    }
