@@ -3108,6 +3108,23 @@ emit_tex_shadow_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x,
       ssa_set(t, tex->def.index, c, res);
 }
 
+/* samplerCubeShadow: the (sc,tc,rc) direction picks the face + projects; compare
+ * against ref at that face's slice (gfx_tex_shadow_cube_sw). */
+static void
+emit_tex_shadow_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
+                     LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef ref_bits)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_cube_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_cube_sw", fty);
+   LLVMValueRef a[6] = { t->fs_texstate, sc, tc, rc, ref_bits, emit_tex_filter_word(t) };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 6, "shadowcube");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
+      ssa_set(t, tex->def.index, c, res);
+}
+
 /* sampler2DArray: gfx_tex_sample_array_sw(&texstate[0], x, y, layer, lod) -- sample
  * the integer `layer` slice at (x,y) of the given LOD, then unpack the A8R8G8B8
  * texel to the def's vec4. The layer stride comes from the resident descriptor. */
@@ -3278,6 +3295,19 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
       LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
       emit_tex_shadow_array(t, tex, ux, vx, layer, ref);
+      return;
+   }
+
+   /* samplerCubeShadow: coord.xyz is the direction vector, the comparator src (or
+    * folded coord component 3) is the reference. Select the face + project, then
+    * compare. Handled before the plain 2D-shadow branch and the cube-colour branch. */
+   if (tex->is_shadow && tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
+       !tex->is_array && u && v) {
+      LLVMValueRef ref = cmp ? cmp : ssa_get(t, coord_ssa, 3);
+      LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "sc");
+      LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "tc");
+      LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "rc");
+      emit_tex_shadow_cube(t, tex, sc, tc, rc, ref);
       return;
    }
 
