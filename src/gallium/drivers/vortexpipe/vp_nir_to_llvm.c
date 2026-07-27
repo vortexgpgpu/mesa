@@ -3183,6 +3183,22 @@ emit_tex_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc, LLVMValueRef
    emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 5, "texcube"));
 }
 
+/* samplerCubeArray: `array_index` selects the cube, (sc,tc,rc) the face; the SW
+ * entry addresses the slice array_index*6 + face. */
+static void
+emit_tex_cube_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
+                    LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef array_index,
+                    LLVMValueRef lod)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_cube_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_cube_array_sw", fty);
+   LLVMValueRef a[6] = { t->fs_texstate, sc, tc, rc, array_index, lod };
+   emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 6, "texcubearray"));
+}
+
 /* sampler3D: sample at S.23 (u,v,w). Compute the signed LOD lambda from the u,v
  * gradient (bias + clamp + mip-enable gate, like the 2D auto-LOD path); the min/mag
  * tap is resolved from the same lambda. A mip-linear sampler passes the Q8 lambda
@@ -3391,6 +3407,26 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef lod = (tex->op == nir_texop_txl && lod_int)
          ? emit_encode_explicit_lod(t, lod_int) : zero;
       emit_tex_cube(t, tex, sc, tc, rc, lod);
+      return;
+   }
+
+   /* samplerCubeArray: coord.xyz is the direction, coord.w the array index. The
+    * SW entry addresses the slice array_index*6 + face. Handled before the plain
+    * cube (which requires !is_array) and the 2D dispatch. */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array &&
+       !tex->is_shadow && tex->op != nir_texop_txf && u && v) {
+      LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "");
+      LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "");
+      LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+      LLVMValueRef wf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 3), t->f32, "");
+      LLVMValueRef idx = LLVMBuildFPToSI(t->b,
+         LLVMBuildFAdd(t->b, wf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "cubeidx");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      idx = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, idx, zero, ""), zero, idx, "");
+      LLVMValueRef lod = (tex->op == nir_texop_txl && lod_int)
+         ? emit_encode_explicit_lod(t, lod_int) : zero;
+      emit_tex_cube_array(t, tex, sc, tc, rc, idx, lod);
       return;
    }
 
