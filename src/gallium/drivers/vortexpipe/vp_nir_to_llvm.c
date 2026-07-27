@@ -3124,6 +3124,33 @@ emit_tex_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc, LLVMValueRef
    emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 5, "texcube"));
 }
 
+/* sampler3D: sample at S.23 (u,v,w). The min/mag tap is resolved per fragment from
+ * the 2D gradient (single-level, base LOD); the sampler blends the two bracketing
+ * depth slices on a linear tap, or picks the nearest slice otherwise. */
+static void
+emit_tex_3d(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef u, LLVMValueRef v,
+            LLVMValueRef w)
+{
+   LLVMValueRef filt = emit_tex_filter_word(t);
+   LLVMValueRef rho = emit_tex_grad_rho(t, u, v);
+   LLVMValueRef one_fxd = LLVMConstInt(t->i64, (uint64_t)1 << VP_TEX_FXD_FRAC, false);
+   LLVMValueRef minified = LLVMBuildICmp(t->b, LLVMIntUGT, rho, one_fxd, "minified");
+   LLVMValueRef mag_tap = LLVMBuildAnd(t->b, filt, LLVMConstInt(t->i32, 1, false), "mag_tap");
+   LLVMValueRef min_tap = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, filt, LLVMConstInt(t->i32, 3, false), ""),
+      LLVMConstInt(t->i32, 1, false), "min_tap");
+   LLVMValueRef tap = LLVMBuildSelect(t->b, minified, min_tap, mag_tap, "tap");
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_3d_sw");
+   if (!fn) {
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_3d_sw", fty);
+   }
+   LLVMValueRef a[6] = { t->fs_texstate, u, v, w,
+                         LLVMConstInt(t->i32, 0, false), tap };
+   emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 6, "tex3d"));
+}
+
 /* A NIR texture op: a 2D `texture()`/`textureLod()`/`textureBias()` sampling the
  * single bound texture (TEX stage 0), or `texelFetch()` (integer-coord fetch, no
  * filter). The interpolated texcoord is the coord source; the texture/sampler
@@ -3310,6 +3337,14 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
    LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
    LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
+
+   /* sampler3D: the third coordinate selects the depth slice (SW-sampled). */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_3D && !tex->is_array) {
+      LLVMValueRef wf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "wf");
+      LLVMValueRef wx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, wf, scale, ""), t->i32, "");
+      emit_tex_3d(t, tex, ux, vx, wx);
+      return;
+   }
 
    /* Sample. Implicit-LOD `texture()` on a HW-TEX device: a mipmapped sampler
     * (texstate.filter mip-enable bit) routes to the SW sampler, which resolves the

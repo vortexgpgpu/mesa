@@ -158,6 +158,7 @@ struct vp_sampler_cso {
    uint32_t min_filter;        /* VX_TEX_FILTER_* -- the min (minification) tap */
    uint32_t wrap_u;            /* VX_TEX_WRAP_* */
    uint32_t wrap_v;
+   uint32_t wrap_w;            /* VX_TEX_WRAP_* for the 3D depth (r) axis */
    bool     mip_enable;        /* sampler reaches a non-base level (max_lod > 0.5) */
    bool     mip_linear;        /* mip mode is LINEAR (trilinear) rather than nearest */
    bool     compare_enable;    /* PIPE_TEX_COMPARE_R_TO_TEXTURE (sampler2DShadow) */

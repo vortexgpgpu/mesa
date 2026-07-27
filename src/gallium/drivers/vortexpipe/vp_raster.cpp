@@ -538,6 +538,8 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          texstate.min_lod  = tex->min_lod;
          texstate.max_lod  = tex->max_lod;
          texstate.lod_bias = tex->lod_bias;
+         texstate.depth    = tex->depth;
+         texstate.wrap_w   = tex->wrap_w;
          /* Descriptor-only filter bits (the FS reads them; they never reach the HW
           * TEX_FILTER DCR below): mag tap (bit0, from tex->filter), min tap (bit3),
           * mip-linear (bit1), mip-enable (bit2) and NPOT (bit4). A mipmapped OR

@@ -583,6 +583,7 @@ vp_fs_uses_sw_texop(struct nir_shader *nir)
             nir_tex_instr *tex = nir_instr_as_tex(instr);
             if (tex->is_shadow || tex->is_array ||
                 tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ||
+                tex->sampler_dim == GLSL_SAMPLER_DIM_3D ||
                 tex->op == nir_texop_tg4 ||
                 tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
                return true;
@@ -757,6 +758,7 @@ vp_create_texture_handle(struct pipe_context *pipe,
       vp->cur_sampler_store.min_filter = vp_vx_filter(state->min_img_filter);
       vp->cur_sampler_store.wrap_u = vp_vx_wrap(state->wrap_s);
       vp->cur_sampler_store.wrap_v = vp_vx_wrap(state->wrap_t);
+      vp->cur_sampler_store.wrap_w = vp_vx_wrap(state->wrap_r);
       /* Vulkan has no "disable mipmapping" flag; a non-mipmapped NEAREST/LINEAR
        * sampler is expressed as max_lod == 0.25, which clamps the LOD so only the
        * base level is ever read. A level >= 1 is reachable only when max_lod > 0.5
@@ -1225,7 +1227,12 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
                        ? res->last_level : (uint32_t)VX_TEX_LOD_MAX;
    const bool is_depth = (vx_format == VX_TEX_FORMAT_D16 ||
                           vx_format == VX_TEX_FORMAT_D32F);
-   const uint32_t layers = (res->array_size > 1) ? res->array_size : 1u;
+   /* A 3D texture's depth slices stack like array layers (the pipe_texture_map
+    * z argument selects the slice). Single-level only here -- a 3D mip chain
+    * halves the depth per level, which this per-slice layout does not model. */
+   const bool is_3d = (res->target == PIPE_TEXTURE_3D);
+   const uint32_t layers = is_3d ? (res->depth0 ? res->depth0 : 1u)
+                                 : (res->array_size > 1 ? res->array_size : 1u);
    uint32_t off_texels[VX_TEX_LOD_MAX + 1] = { 0 };
    uint32_t total = 0;
    for (uint32_t l = 0; l <= last; l++) {
@@ -2063,6 +2070,12 @@ vp_draw_vbo(struct pipe_context *pipe,
                                             : VX_TEX_WRAP_CLAMP;
                tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
                                             : VX_TEX_WRAP_CLAMP;
+               tex.wrap_w = vp->cur_sampler ? vp->cur_sampler->wrap_w
+                                            : VX_TEX_WRAP_CLAMP;
+               /* sampler3D: depth-slice count drives the third-coordinate slice
+                * selection; 0 for any non-3D texture (2D/array/cube). */
+               tex.depth = (vp->cur_tex->target == PIPE_TEXTURE_3D)
+                              ? vp->cur_tex->depth0 : 0u;
                tex.min_filter = vp->cur_sampler ? vp->cur_sampler->min_filter
                                                 : VX_TEX_FILTER_POINT;
                tex.mip_enable = vp->cur_sampler ? vp->cur_sampler->mip_enable

@@ -105,6 +105,8 @@ struct vp_tex_params {
    uint32_t    min_lod;     /* sampler LOD clamp lower bound, Q(VX_TEX_LOD_FRAC_BITS) */
    uint32_t    max_lod;     /* sampler LOD clamp upper bound, Q(VX_TEX_LOD_FRAC_BITS) */
    int32_t     lod_bias;    /* sampler LOD bias, signed Q(VX_TEX_LOD_FRAC_BITS) */
+   uint32_t    depth;       /* mip-0 depth-slice count (sampler3D); 0 => not 3D */
+   uint32_t    wrap_w;      /* VX_TEX_WRAP_* for the 3D depth (r) axis */
 };
 
 /* Run the WHOLE draw as one device-orchestrated command: the vertex shader
