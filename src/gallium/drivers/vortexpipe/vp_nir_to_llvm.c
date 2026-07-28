@@ -3150,6 +3150,25 @@ emit_tex_shadow_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
       ssa_set(t, tex->def.index, c, res);
 }
 
+/* samplerCubeArrayShadow: array_index selects the cube, (sc,tc,rc) the face;
+ * compare against ref at slice array_index*6 + face. */
+static void
+emit_tex_shadow_cube_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
+                           LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef array_index,
+                           LLVMValueRef ref_bits)
+{
+   LLVMTypeRef params[7] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 7, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_cube_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_cube_array_sw", fty);
+   LLVMValueRef a[7] = { t->fs_texstate, sc, tc, rc, array_index, ref_bits,
+                         emit_tex_filter_word(t) };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 7, "shadowcubearray");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
+      ssa_set(t, tex->def.index, c, res);
+}
+
 /* sampler2DArray: gfx_tex_sample_array_sw(&texstate[0], x, y, layer, lod) -- sample
  * the integer `layer` slice at (x,y) of the given LOD, then unpack the A8R8G8B8
  * texel to the def's vec4. The layer stride comes from the resident descriptor. */
@@ -3336,6 +3355,24 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
       LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
       emit_tex_shadow_array(t, tex, ux, vx, layer, ref);
+      return;
+   }
+
+   /* samplerCubeArrayShadow: coord.xyz is the direction, coord.w the array index,
+    * the comparator src the reference. Select the face + project, then compare at
+    * slice array_index*6 + face. Handled before the plain cube-shadow (!is_array). */
+   if (tex->is_shadow && tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
+       tex->is_array && u && v) {
+      LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "sc");
+      LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "tc");
+      LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "rc");
+      LLVMValueRef wf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 3), t->f32, "");
+      LLVMValueRef idx = LLVMBuildFPToSI(t->b,
+         LLVMBuildFAdd(t->b, wf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "cubeidx");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      idx = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, idx, zero, ""), zero, idx, "");
+      emit_tex_shadow_cube_array(t, tex, sc, tc, rc, idx, cmp);
       return;
    }
 

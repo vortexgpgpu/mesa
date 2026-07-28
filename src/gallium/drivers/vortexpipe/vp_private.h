@@ -336,6 +336,8 @@ struct vp_context {
    struct pipe_resource  *cur_tex;        /* bound FS texture, or NULL */
    unsigned               cur_tex_first_level; /* bound view's baseMipLevel */
    uint32_t               cur_tex_swizzle;     /* bound view's packed component map */
+   unsigned               cur_tex_target;      /* bound view's target (PIPE_TEXTURE_*) */
+   unsigned               cur_tex_layers;      /* bound view's array-layer count */
    struct vp_sampler_cso *cur_sampler;    /* &cur_sampler_store, or NULL */
    struct vp_sampler_cso  cur_sampler_store;
    uint64_t (*lp_create_texture_handle)(struct pipe_context *,

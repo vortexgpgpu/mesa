@@ -725,6 +725,12 @@ vp_create_texture_handle(struct pipe_context *pipe,
    if (view && view->texture) {
       vp->cur_tex = view->texture;
       vp->cur_tex_first_level = view->u.tex.first_level;
+      /* The cube-ness of a cube/cube-array sampler lives on the view, not the
+       * resource (lavapipe backs a cube with a 2D-array resource). Capture the
+       * view target + layer count so the SW cube-array layer clamp knows the
+       * cube count (last-first+1)/6. */
+      vp->cur_tex_target = view->target;
+      vp->cur_tex_layers = view->u.tex.last_layer - view->u.tex.first_layer + 1u;
       /* Pack the view's component swizzle (PIPE_SWIZZLE_* 0..5) so the SW gather
        * can remap the requested component to the mapped source channel. */
       vp->cur_tex_swizzle = (view->swizzle_r & 0x7u)
@@ -2124,9 +2130,14 @@ vp_draw_vbo(struct pipe_context *pipe,
                tex.wrap_w = vp->cur_sampler ? vp->cur_sampler->wrap_w
                                             : VX_TEX_WRAP_CLAMP;
                /* sampler3D: depth-slice count drives the third-coordinate slice
-                * selection; 0 for any non-3D texture (2D/array/cube). */
+                * selection. samplerCubeArray: the cube count bounds the array-layer
+                * clamp (selectLayer). 0 for any other texture (2D/array/plain cube).
+                * Cube-ness rides on the view target, not the resource. */
                tex.depth = (vp->cur_tex->target == PIPE_TEXTURE_3D)
-                              ? vp->cur_tex->depth0 : 0u;
+                              ? vp->cur_tex->depth0
+                         : (vp->cur_tex_target == PIPE_TEXTURE_CUBE_ARRAY)
+                              ? (vp->cur_tex_layers / 6u)
+                              : 0u;
                tex.min_filter = vp->cur_sampler ? vp->cur_sampler->min_filter
                                                 : VX_TEX_FILTER_POINT;
                tex.mip_enable = vp->cur_sampler ? vp->cur_sampler->mip_enable
