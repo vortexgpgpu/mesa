@@ -3392,8 +3392,9 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    /* sampler2DShadow: the depth-compare reference is the comparator src, or, when
     * a lowering folds it in, coord component 2. Sample the depth texture, compare
     * against ref per the sampler's compareOp, and return the 0..1 result (scalar).
-    * A shadow op is still nir_texop_tex/txl, so handle it before that dispatch. */
-   if (tex->is_shadow && u && v) {
+    * A shadow op is still nir_texop_tex/txl, so handle it before that dispatch. A
+    * textureGatherCmp (tg4) is a 2x2 gather, not a single compare -- fall through. */
+   if (tex->is_shadow && tex->op != nir_texop_tg4 && u && v) {
       LLVMValueRef ref = cmp ? cmp : ssa_get(t, coord_ssa, 2);
       LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "uf");
       LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "vf");
