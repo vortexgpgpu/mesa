@@ -2778,8 +2778,22 @@ emit_umax64(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b)
    return LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntUGT, a, b, ""), a, b, "");
 }
 
-/* The lane quad's max texel-space gradient rho (S.FXD_FRAC fixed-point, i64):
- * max over the four |du|,|dv| gradients scaled by the log2 dims. log2(rho) - FXD_FRAC
+/* Gradient-vector length sqrt(a^2 + b^2) of two orthogonal texel-space components.
+ * Computed in f32 (the FPU fsqrt.s) rather than i128 integer arithmetic: the LOD
+ * only needs ~log2(rho), so f32's precision is ample, and this is exact to the
+ * tolerance rather than a max+min approximation (which perturbs the trilinear blend). */
+static LLVMValueRef
+emit_grad_len(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b)
+{
+   LLVMValueRef af = LLVMBuildUIToFP(t->b, a, t->f32, "");
+   LLVMValueRef bf = LLVMBuildUIToFP(t->b, b, t->f32, "");
+   LLVMValueRef sq = LLVMBuildFAdd(t->b, LLVMBuildFMul(t->b, af, af, ""),
+                                   LLVMBuildFMul(t->b, bf, bf, ""), "");
+   return LLVMBuildFPToUI(t->b, emit_fsqrt(t, sq), t->i64, "grad_len");
+}
+
+/* The lane quad's texel-space gradient rho (S.FXD_FRAC fixed-point, i64): the max
+ * over the two screen directions of the gradient-vector length. log2(rho) - FXD_FRAC
  * is lambda. logw/logh come from the resident TEX descriptor (fs_texstate) because the
  * TEX DCRs are host-write-only; quad neighbours arrive through the quad-scoped SHFL
  * (bfly), so this must run with the whole quad active. */
@@ -2801,9 +2815,16 @@ emit_tex_grad_rho(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
    LLVMValueRef uh = emit_shfl(t, 6, u, bch), uv = emit_shfl(t, 6, u, bcv);
    LLVMValueRef vh = emit_shfl(t, 6, v, bch), vv = emit_shfl(t, 6, v, bcv);
 
-   return emit_umax64(t,
-      emit_umax64(t, emit_lod_grad(t, u, uh, logw), emit_lod_grad(t, u, uv, logw)),
-      emit_umax64(t, emit_lod_grad(t, v, vh, logh), emit_lod_grad(t, v, vv, logh)));
+   /* rho = max over the two screen directions (x = horizontal neighbour, y =
+    * vertical) of the gradient-vector length sqrt((du*W)^2 + (dv*H)^2), not the
+    * per-axis max of the four components. The per-axis max underestimates a
+    * diagonal gradient (du and dv varying together) by up to sqrt(2) ~ 0.5 LOD,
+    * which exceeds the deqp mipmap tolerance. */
+   LLVMValueRef gux = emit_lod_grad(t, u, uh, logw);
+   LLVMValueRef guy = emit_lod_grad(t, u, uv, logw);
+   LLVMValueRef gvx = emit_lod_grad(t, v, vh, logh);
+   LLVMValueRef gvy = emit_lod_grad(t, v, vv, logh);
+   return emit_umax64(t, emit_grad_len(t, gux, gvx), emit_grad_len(t, guy, gvy));
 }
 
 /* Load the resident TEX descriptor's filter word (fs_texstate). */
