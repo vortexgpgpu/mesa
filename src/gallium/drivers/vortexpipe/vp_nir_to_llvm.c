@@ -3126,15 +3126,15 @@ emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
  * so write it directly to every def component (bypassing the ARGB unpack). */
 static void
 emit_tex_shadow(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y,
-                LLVMValueRef ref_bits)
+                LLVMValueRef ref_bits, LLVMValueRef lod)
 {
-   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
-   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
    LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_sw");
    if (!fn)
       fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_sw", fty);
-   LLVMValueRef a[5] = { t->fs_texstate, x, y, ref_bits, emit_tex_filter_word(t) };
-   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 5, "shadow");
+   LLVMValueRef a[6] = { t->fs_texstate, x, y, ref_bits, emit_tex_filter_word(t), lod };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 6, "shadow");
    for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
       ssa_set(t, tex->def.index, c, res);
 }
@@ -3143,15 +3143,17 @@ emit_tex_shadow(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRe
  * array slice before the depth compare (gfx_tex_shadow_array_sw). */
 static void
 emit_tex_shadow_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x,
-                      LLVMValueRef y, LLVMValueRef layer, LLVMValueRef ref_bits)
+                      LLVMValueRef y, LLVMValueRef layer, LLVMValueRef ref_bits,
+                      LLVMValueRef lod)
 {
-   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
-   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMTypeRef params[7] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 7, false);
    LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_array_sw");
    if (!fn)
       fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_array_sw", fty);
-   LLVMValueRef a[6] = { t->fs_texstate, x, y, layer, ref_bits, emit_tex_filter_word(t) };
-   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 6, "shadowarray");
+   LLVMValueRef a[7] = { t->fs_texstate, x, y, layer, ref_bits,
+                         emit_tex_filter_word(t), lod };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 7, "shadowarray");
    for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
       ssa_set(t, tex->def.index, c, res);
 }
@@ -3160,15 +3162,17 @@ emit_tex_shadow_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x,
  * against ref at that face's slice (gfx_tex_shadow_cube_sw). */
 static void
 emit_tex_shadow_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
-                     LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef ref_bits)
+                     LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef ref_bits,
+                     LLVMValueRef lod)
 {
-   LLVMTypeRef params[6] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32 };
-   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMTypeRef params[7] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 7, false);
    LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_cube_sw");
    if (!fn)
       fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_cube_sw", fty);
-   LLVMValueRef a[6] = { t->fs_texstate, sc, tc, rc, ref_bits, emit_tex_filter_word(t) };
-   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 6, "shadowcube");
+   LLVMValueRef a[7] = { t->fs_texstate, sc, tc, rc, ref_bits,
+                         emit_tex_filter_word(t), lod };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 7, "shadowcube");
    for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
       ssa_set(t, tex->def.index, c, res);
 }
@@ -3178,16 +3182,17 @@ emit_tex_shadow_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
 static void
 emit_tex_shadow_cube_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
                            LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef array_index,
-                           LLVMValueRef ref_bits)
+                           LLVMValueRef ref_bits, LLVMValueRef lod)
 {
-   LLVMTypeRef params[7] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32, t->i32 };
-   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 7, false);
+   LLVMTypeRef params[8] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32, t->i32,
+                             t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 8, false);
    LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_cube_array_sw");
    if (!fn)
       fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_cube_array_sw", fty);
-   LLVMValueRef a[7] = { t->fs_texstate, sc, tc, rc, array_index, ref_bits,
-                         emit_tex_filter_word(t) };
-   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 7, "shadowcubearray");
+   LLVMValueRef a[8] = { t->fs_texstate, sc, tc, rc, array_index, ref_bits,
+                         emit_tex_filter_word(t), lod };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 8, "shadowcubearray");
    for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
       ssa_set(t, tex->def.index, c, res);
 }
@@ -3359,6 +3364,14 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
            t->i32, "bias_q8")
       : NULL;
 
+   /* Shadow mip level: textureLod / textureGrad (lowered to txl) carry an explicit
+    * LOD; encode it as the colour path does (mip-nearest level or mip-linear Q,
+    * gated by the sampler's mip-enable). texture()/textureProj sample the base
+    * level (auto-LOD shadow is magnified in the demanded tests). */
+   LLVMValueRef shadow_lod = (tex->op == nir_texop_txl && lod_int)
+      ? emit_encode_explicit_lod(t, lod_int)
+      : LLVMConstInt(t->i32, 0, false);
+
    /* sampler2DArrayShadow: coord.z is the array layer, the comparator src (or, when
     * folded into the coord, component 3) is the reference. Select the layer slice,
     * then compare. Handled before the plain 2D-shadow branch (which drops the
@@ -3377,7 +3390,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
       LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
       LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
-      emit_tex_shadow_array(t, tex, ux, vx, layer, ref);
+      emit_tex_shadow_array(t, tex, ux, vx, layer, ref, shadow_lod);
       return;
    }
 
@@ -3395,7 +3408,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
       idx = LLVMBuildSelect(t->b,
          LLVMBuildICmp(t->b, LLVMIntSLT, idx, zero, ""), zero, idx, "");
-      emit_tex_shadow_cube_array(t, tex, sc, tc, rc, idx, cmp);
+      emit_tex_shadow_cube_array(t, tex, sc, tc, rc, idx, cmp, shadow_lod);
       return;
    }
 
@@ -3408,7 +3421,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "sc");
       LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "tc");
       LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "rc");
-      emit_tex_shadow_cube(t, tex, sc, tc, rc, ref);
+      emit_tex_shadow_cube(t, tex, sc, tc, rc, ref, shadow_lod);
       return;
    }
 
@@ -3424,7 +3437,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
       LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
       LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
-      emit_tex_shadow(t, tex, ux, vx, ref);
+      emit_tex_shadow(t, tex, ux, vx, ref, shadow_lod);
       return;
    }
 
