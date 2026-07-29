@@ -151,6 +151,7 @@ struct vp_tr {
    LLVMValueRef   scratch_base; /* iptr addr of the scratch alloca, or NULL */
    LLVMBasicBlockRef entry;     /* function entry block (alloca home) */
    LLVMValueRef   tex_f32_slot; /* float[4] the float texture ABI writes, or NULL */
+   LLVMValueRef   tex_i32_slot; /* int32[4] the integer texture ABI writes, or NULL */
    /* SSA map: [def index][component] -> iN value (bit pattern).
     * For a deref instr, component 0 holds the iptr byte address. */
    LLVMValueRef  *val;
@@ -2594,6 +2595,42 @@ emit_tex_fetch_f32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef
    return out;
 }
 
+/* The int32[4] slot the integer texture ABI writes through; entry-block allocated
+ * and reused for the same reason as tex_f32_scratch. */
+static LLVMValueRef
+tex_i32_scratch(struct vp_tr *t)
+{
+   if (!t->tex_i32_slot) {
+      LLVMBasicBlockRef cur = LLVMGetInsertBlock(t->b);
+      LLVMValueRef first = LLVMGetFirstInstruction(t->entry);
+      if (first)
+         LLVMPositionBuilderBefore(t->b, first);
+      else
+         LLVMPositionBuilderAtEnd(t->b, t->entry);
+      t->tex_i32_slot = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4), "texel_i32");
+      LLVMPositionBuilderAtEnd(t->b, cur);
+   }
+   return t->tex_i32_slot;
+}
+
+/* texelFetch for an integer sampler: gfx_tex_fetch_i32(&texstate[0], x, y, lod,
+ * layer, out) -- the texel's four channels as raw 0..255 values. Returns the
+ * scratch slot the callee filled. */
+static LLVMValueRef
+emit_tex_fetch_i32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y,
+                   LLVMValueRef lod, LLVMValueRef layer)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->ptr };
+   LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_i32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_i32", fty);
+   LLVMValueRef out = tex_i32_scratch(t);
+   LLVMValueRef a[6] = { t->fs_texstate, x, y, lod, layer, out };
+   LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+   return out;
+}
+
 /* texelFetch on a 2D array returning floats: the layer selects the slice, the
  * channels come back as gfx_tex_fetch_f32's do. */
 static LLVMValueRef
@@ -3108,12 +3145,15 @@ emit_tex_size(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef lod_int)
 }
 
 /* Write a sampled vec4 to the def, applying the view's component swizzle. `chan`
- * holds the four source channels (R,G,B,A) as floats. Output component c takes
- * source channel map (0..3 = R/G/B/A), or a constant 0.0 (map 4) / 1.0 (map 5) --
- * those two stay literals, so a VK_COMPONENT_SWIZZLE_ONE returns 1.0 whatever the
- * texel holds. Identity (1672) is a passthrough. */
+ * holds the four source channels (R,G,B,A) as i32 bit patterns, and `czero`/`cone`
+ * are the swizzle's constant arms in the same encoding -- a float sampler passes
+ * bitcast 0.0/1.0, an integer sampler passes 0/1. Output component c takes source
+ * channel map (0..3 = R/G/B/A), or a constant (map 4 -> czero, map 5 -> cone);
+ * those stay literals, so a VK_COMPONENT_SWIZZLE_ONE returns one whatever the texel
+ * holds. Identity (1672) is a passthrough. */
 static void
-emit_tex_swizzle_store(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef chan[4])
+emit_tex_swizzle_store(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef chan[4],
+                       LLVMValueRef czero, LLVMValueRef cone)
 {
    LLVMValueRef swz = emit_tex_swizzle_word(t);
    for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
@@ -3123,15 +3163,23 @@ emit_tex_swizzle_store(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef chan[4]
       LLVMValueRef is0 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 0, false), "");
       LLVMValueRef is1 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 1, false), "");
       LLVMValueRef is2 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 2, false), "");
-      LLVMValueRef f = LLVMBuildSelect(t->b, is0, chan[0],
+      LLVMValueRef v = LLVMBuildSelect(t->b, is0, chan[0],
                        LLVMBuildSelect(t->b, is1, chan[1],
                        LLVMBuildSelect(t->b, is2, chan[2], chan[3], ""), ""), "src_chan");
       LLVMValueRef is4 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 4, false), "");
       LLVMValueRef is5 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 5, false), "");
-      f = LLVMBuildSelect(t->b, is4, LLVMConstReal(t->f32, 0.0), f, "");
-      f = LLVMBuildSelect(t->b, is5, LLVMConstReal(t->f32, 1.0), f, "");
-      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
+      v = LLVMBuildSelect(t->b, is4, czero, v, "");
+      v = LLVMBuildSelect(t->b, is5, cone, v, "");
+      ssa_set(t, tex->def.index, c, v);
    }
+}
+
+/* The swizzle constants for a float sampler: 0.0 and 1.0 as i32 bit patterns. */
+static void
+tex_swizzle_float_consts(struct vp_tr *t, LLVMValueRef *czero, LLVMValueRef *cone)
+{
+   *czero = LLVMBuildBitCast(t->b, LLVMConstReal(t->f32, 0.0), t->i32, "");
+   *cone  = LLVMBuildBitCast(t->b, LLVMConstReal(t->f32, 1.0), t->i32, "");
 }
 
 /* Unpack a float[4] scratch slot (emit_tex_fetch_f32) to the def's vec4. The
@@ -3145,9 +3193,38 @@ emit_tex_unpack_f32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out)
       LLVMValueRef idx[2] = { LLVMConstInt(t->i32, 0, false),
                               LLVMConstInt(t->i32, s, false) };
       LLVMValueRef p = LLVMBuildGEP2(t->b, LLVMArrayType(t->f32, 4), out, idx, 2, "");
-      chan[s] = LLVMBuildLoad2(t->b, t->f32, p, "texel_f");
+      chan[s] = LLVMBuildBitCast(t->b,
+         LLVMBuildLoad2(t->b, t->f32, p, "texel_f"), t->i32, "");
    }
-   emit_tex_swizzle_store(t, tex, chan);
+   LLVMValueRef czero, cone;
+   tex_swizzle_float_consts(t, &czero, &cone);
+   emit_tex_swizzle_store(t, tex, chan, czero, cone);
+}
+
+/* Unpack an int32[4] scratch slot (emit_tex_fetch_i32) to an integer sampler's
+ * def. The channels arrive as raw 0..255 bytes: a signed sampler reinterprets each
+ * as int8 (the stored value spans -128..127), an unsigned one takes it as-is. No
+ * scaling -- the shader's own vec4() cast converts. */
+static void
+emit_tex_unpack_i32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out,
+                    bool is_signed)
+{
+   LLVMValueRef chan[4];
+   for (unsigned s = 0; s < 4; s++) {
+      LLVMValueRef idx[2] = { LLVMConstInt(t->i32, 0, false),
+                              LLVMConstInt(t->i32, s, false) };
+      LLVMValueRef p = LLVMBuildGEP2(t->b, LLVMArrayType(t->i32, 4), out, idx, 2, "");
+      LLVMValueRef v = LLVMBuildLoad2(t->b, t->i32, p, "texel_i");
+      if (is_signed) {
+         /* byte -> int8: (v ^ 0x80) - 0x80 */
+         v = LLVMBuildSub(t->b,
+            LLVMBuildXor(t->b, v, LLVMConstInt(t->i32, 0x80, false), ""),
+            LLVMConstInt(t->i32, 0x80, false), "sext8");
+      }
+      chan[s] = v;
+   }
+   emit_tex_swizzle_store(t, tex, chan, LLVMConstInt(t->i32, 0, false),
+                          LLVMConstInt(t->i32, 1, false));
 }
 
 /* Unpack a packed A8R8G8B8 texel into the tex def's components as floats [0,1]. */
@@ -3168,8 +3245,12 @@ emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
    LLVMValueRef c1 = LLVMConstReal(t->f32, 1.0 / 255.0);
    LLVMValueRef chan[4];
    for (unsigned s = 0; s < 4; s++)
-      chan[s] = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte[s], t->f32, ""), c1, "");
-   emit_tex_swizzle_store(t, tex, chan);
+      chan[s] = LLVMBuildBitCast(t->b,
+         LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte[s], t->f32, ""), c1, ""),
+         t->i32, "");
+   LLVMValueRef czero, cone;
+   tex_swizzle_float_consts(t, &czero, &cone);
+   emit_tex_swizzle_store(t, tex, chan, czero, cone);
 }
 
 /* sampler2DShadow: gfx_tex_shadow_sw(&texstate[0], x, y, ref_bits, filter) --
@@ -3569,12 +3650,19 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       /* texelFetchOffset: the offset is a texel delta added to the integer coord. */
       LLVMValueRef x = off_x ? LLVMBuildAdd(t->b, u, off_x, "") : u;
       LLVMValueRef y = off_y ? LLVMBuildAdd(t->b, v, off_y, "") : v;
-      /* Float channels, so a float-format texel keeps its real magnitude (its range
-       * is not [0,1]); a non-float format decodes to the same [0,1] channels the
-       * packed-ARGB unpack yields. */
-      if (tex->is_array) {
-         /* 2D array: coord.z is the integer layer slice. */
-         LLVMValueRef layer = ssa_get(t, coord_ssa, 2);
+      /* 2D array: coord.z is the integer layer slice. */
+      LLVMValueRef layer = tex->is_array ? ssa_get(t, coord_ssa, 2)
+                                         : LLVMConstInt(t->i32, 0, false);
+      /* An isampler/usampler must yield the stored integer; everything else takes
+       * the float path, where a float-format texel keeps its real magnitude (its
+       * range is not [0,1]) and a non-float format decodes to the same [0,1]
+       * channels the packed-ARGB unpack yields. Branch on the base type only --
+       * the size bits are not guaranteed. */
+      nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+      if (base == nir_type_int || base == nir_type_uint) {
+         emit_tex_unpack_i32(t, tex, emit_tex_fetch_i32(t, x, y, lod, layer),
+                             base == nir_type_int);
+      } else if (tex->is_array) {
          emit_tex_unpack_f32(t, tex, emit_tex_fetch_array_f32(t, x, y, layer, lod));
       } else {
          emit_tex_unpack_f32(t, tex, emit_tex_fetch_f32(t, x, y, lod));

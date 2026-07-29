@@ -1232,9 +1232,21 @@ vp_vx_tex_format(enum pipe_format pf, uint32_t *bpp)
    }
 }
 
+/* True for the integer colour formats whose texels this driver can carry: one byte
+ * per channel in R,G,B,A order, which is the VX A8R8G8B8 byte layout after the
+ * pack below. Their values are the bytes themselves, so they must not go through
+ * util_format_read_4ub -- a pure-integer format has no 8-unorm unpack (the
+ * function pointer is NULL) and normalising an integer texel is meaningless. */
+static bool
+vp_is_int8_rgba(enum pipe_format pf)
+{
+   return pf == PIPE_FORMAT_R8G8B8A8_SINT || pf == PIPE_FORMAT_R8G8B8A8_UINT;
+}
+
 /* Decode one mapped slice (wl x hl) into the tight device buffer at `dst`: `raw`
- * texels (depth and float) are copied verbatim, colour rows are decoded from the
- * resource format to the VX A8R8G8B8 texel order (rowbuf is wl*4 scratch). */
+ * texels (depth and float) are copied verbatim, integer texels are packed from
+ * their bytes, and other colour rows are decoded from the resource format to the
+ * VX A8R8G8B8 texel order (rowbuf is wl*4 scratch). */
 static void
 vp_decode_slice(uint8_t *dst, const uint8_t *map, unsigned src_stride,
                 uint32_t wl, uint32_t hl, uint32_t bpp, bool raw,
@@ -1242,7 +1254,13 @@ vp_decode_slice(uint8_t *dst, const uint8_t *map, unsigned src_stride,
 {
    for (uint32_t y = 0; y < hl; y++) {
       const uint8_t *m = map + (size_t)y * src_stride;
-      if (raw) {
+      if (!raw && vp_is_int8_rgba(fmt)) {
+         uint32_t *d32 = (uint32_t *)(dst + (size_t)y * wl * 4);
+         for (uint32_t x = 0; x < wl; x++) {
+            d32[x] = ((uint32_t)m[x * 4 + 3] << 24) | ((uint32_t)m[x * 4 + 0] << 16)
+                   | ((uint32_t)m[x * 4 + 1] << 8)  |  (uint32_t)m[x * 4 + 2];
+         }
+      } else if (raw) {
          memcpy(dst + (size_t)y * wl * bpp, m, (size_t)wl * bpp);
       } else {
          util_format_read_4ub(fmt, rowbuf, (unsigned)wl * 4, m, src_stride, 0, 0, wl, 1);
@@ -2153,6 +2171,16 @@ vp_draw_vbo(struct pipe_context *pipe,
          /* Select the per-draw sampled texture from the FS descriptor (multi-
           * texture); no-op when the FS has no bindless handle. */
          vp_resolve_tex_from_desc(pipe, vp, fs);
+         /* An integer texture this driver cannot carry must leave the device path
+          * before the upload: util_format_read_4ub has no 8-unorm unpack for a
+          * pure-integer format and would call through a NULL pointer. The test sits
+          * after the per-draw resolve so it sees the texture this draw samples. */
+         if (vp->cur_tex && util_format_is_pure_integer(vp->cur_tex->format) &&
+             !vp_is_int8_rgba(vp->cur_tex->format)) {
+            vp_unmap_vertex_input(pipe, vxfers, vin.num_bufs);
+            if (ibuf)  vx_buffer_release(ibuf);
+            goto llvmpipe;
+         }
          if (vp->cur_tex) {
             tw = vp->cur_tex->width0;
             th = vp->cur_tex->height0;
