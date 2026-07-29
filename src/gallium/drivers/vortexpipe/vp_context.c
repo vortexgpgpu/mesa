@@ -1187,7 +1187,14 @@ vp_fb_ensure_mrt(struct pipe_context *pipe, struct vp_context *vp,
 /* Map a sampled resource's pipe_format to the VX TEX format the SW sampler
  * decodes, plus its bytes-per-texel. Depth resources (sampler2DShadow) upload
  * their real depth values; everything else is read back as A8R8G8B8 (4 B).
- * *bpp is the source per-texel size to copy from the mapped level. */
+ * *bpp is the source per-texel size to copy from the mapped level.
+ *
+ * Float formats carry their own VX format so their texels upload verbatim: their
+ * value range is not [0,1] (a half channel spans +/-1e3), so decoding them to
+ * 8-bit unorm would clamp every texel to 0.0 or 1.0 and destroy the range. Only
+ * the formats whose byte layout matches the sampler's decode are listed; any
+ * other float format (packed 11_11_10, shared-exponent, 3-channel) keeps the
+ * A8R8G8B8 decode. */
 static uint32_t
 vp_vx_tex_format(enum pipe_format pf, uint32_t *bpp)
 {
@@ -1198,6 +1205,24 @@ vp_vx_tex_format(enum pipe_format pf, uint32_t *bpp)
    case PIPE_FORMAT_Z16_UNORM:   /* 16-bit unorm depth */
       if (bpp) *bpp = 2;
       return VX_TEX_FORMAT_D16;
+   case PIPE_FORMAT_R16_FLOAT:
+      if (bpp) *bpp = 2;
+      return VX_TEX_FORMAT_R16F;
+   case PIPE_FORMAT_R16G16_FLOAT:
+      if (bpp) *bpp = 4;
+      return VX_TEX_FORMAT_RG16F;
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+      if (bpp) *bpp = 8;
+      return VX_TEX_FORMAT_RGBA16F;
+   case PIPE_FORMAT_R32_FLOAT:
+      if (bpp) *bpp = 4;
+      return VX_TEX_FORMAT_R32F;
+   case PIPE_FORMAT_R32G32_FLOAT:
+      if (bpp) *bpp = 8;
+      return VX_TEX_FORMAT_RG32F;
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      if (bpp) *bpp = 16;
+      return VX_TEX_FORMAT_RGBA32F;
    /* Combined depth/stencil (Z32_FLOAT_S8X24, Z24_UNORM_S8) has an interleaved
     * stride the tight per-texel copy below can't reproduce; leave it as a
     * follow-up rather than mis-decode it. */
@@ -1207,17 +1232,17 @@ vp_vx_tex_format(enum pipe_format pf, uint32_t *bpp)
    }
 }
 
-/* Decode one mapped slice (wl x hl) into the tight device buffer at `dst`: depth
- * texels are copied raw, colour rows are decoded from the resource format to the
- * VX A8R8G8B8 texel order (rowbuf is wl*4 scratch). */
+/* Decode one mapped slice (wl x hl) into the tight device buffer at `dst`: `raw`
+ * texels (depth and float) are copied verbatim, colour rows are decoded from the
+ * resource format to the VX A8R8G8B8 texel order (rowbuf is wl*4 scratch). */
 static void
 vp_decode_slice(uint8_t *dst, const uint8_t *map, unsigned src_stride,
-                uint32_t wl, uint32_t hl, uint32_t bpp, bool is_depth,
+                uint32_t wl, uint32_t hl, uint32_t bpp, bool raw,
                 uint8_t *rowbuf, enum pipe_format fmt)
 {
    for (uint32_t y = 0; y < hl; y++) {
       const uint8_t *m = map + (size_t)y * src_stride;
-      if (is_depth) {
+      if (raw) {
          memcpy(dst + (size_t)y * wl * bpp, m, (size_t)wl * bpp);
       } else {
          util_format_read_4ub(fmt, rowbuf, (unsigned)wl * 4, m, src_stride, 0, 0, wl, 1);
@@ -1233,9 +1258,9 @@ vp_decode_slice(uint8_t *dst, const uint8_t *map, unsigned src_stride,
 
 /* Ensure the bound texture is uploaded + resident, keyed by its resource. The
  * mip chain is read back to a tight host buffer and uploaded once; a re-bind of
- * the same resource reuses it. A colour resource is packed to A8R8G8B8; a depth
- * resource (vx_format D16/D32F) copies its raw depth texels so a shadow sampler
- * can compare at full precision. Returns the device address. */
+ * the same resource reuses it. An FF-format colour resource is packed to
+ * A8R8G8B8; anything the SW sampler decodes itself (depth, float) copies its raw
+ * texels. Returns the device address. */
 static bool
 vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
               struct pipe_resource *res, uint32_t w, uint32_t h,
@@ -1264,10 +1289,15 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
    const bool is_3d = (res->target == PIPE_TEXTURE_3D);
    const uint32_t last = (res->last_level < (uint32_t)VX_TEX_LOD_MAX)
                        ? res->last_level : (uint32_t)VX_TEX_LOD_MAX;
-   const bool is_depth = (vx_format == VX_TEX_FORMAT_D16 ||
-                          vx_format == VX_TEX_FORMAT_D32F);
+   /* Every format above the FF set is decoded by the SW sampler from the source
+    * bytes, so it uploads verbatim: depth compares at full precision, and a float
+    * texture keeps a range that would not survive an 8-bit unorm decode. This is
+    * the same test that routes the texture to the SW sampler, so a texture can
+    * never be uploaded as decoded ARGB while its descriptor claims another
+    * format. */
+   const bool is_raw = (vx_format > (uint32_t)VX_TEX_FORMAT_FF_MAX);
    /* Scratch row for decoding a source-format row to R8G8B8A8 (colour path). */
-   uint8_t *rowbuf = is_depth ? NULL : malloc((size_t)w * 4);
+   uint8_t *rowbuf = is_raw ? NULL : malloc((size_t)w * 4);
 
    if (is_3d) {
       /* Per-level, all-slices layout: level l holds max(depth>>l,1) slices of
@@ -1286,7 +1316,7 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
       }
       const size_t bytes = (size_t)total * bpp;
       uint8_t *texbuf = malloc(bytes);
-      bool ok = texbuf != NULL && (is_depth || rowbuf != NULL);
+      bool ok = texbuf != NULL && (is_raw || rowbuf != NULL);
       for (uint32_t l = 0; ok && l <= last; l++) {
          uint32_t wl = (w >> l) ? (w >> l) : 1u;
          uint32_t hl = (h >> l) ? (h >> l) : 1u;
@@ -1297,7 +1327,7 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
                                             0, 0, wl, hl, &xfer);
             if (!map) { ok = false; break; }
             uint8_t *dst = texbuf + ((size_t)level_off[l] + (size_t)z * wl * hl) * bpp;
-            vp_decode_slice(dst, map, xfer->stride, wl, hl, bpp, is_depth,
+            vp_decode_slice(dst, map, xfer->stride, wl, hl, bpp, is_raw,
                             rowbuf, res->format);
             pipe_texture_unmap(pipe, xfer);
          }
@@ -1329,7 +1359,7 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
    const uint32_t layer_stride = total * bpp;   /* one layer's mip-chain bytes */
 
    uint8_t *texbuf = malloc((size_t)layer_stride * layers);
-   bool ok = texbuf != NULL && (is_depth || rowbuf != NULL);
+   bool ok = texbuf != NULL && (is_raw || rowbuf != NULL);
    for (uint32_t layer = 0; ok && layer < layers; layer++) {
       uint8_t *lbase = texbuf + (size_t)layer * layer_stride;
       for (uint32_t l = 0; ok && l <= last; l++) {
@@ -1340,7 +1370,7 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
                                          0, 0, wl, hl, &xfer);
          if (!map) { ok = false; break; }
          uint8_t *dst = lbase + (size_t)off_texels[l] * bpp;
-         vp_decode_slice(dst, map, xfer->stride, wl, hl, bpp, is_depth,
+         vp_decode_slice(dst, map, xfer->stride, wl, hl, bpp, is_raw,
                          rowbuf, res->format);
          pipe_texture_unmap(pipe, xfer);
       }

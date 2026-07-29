@@ -150,6 +150,7 @@ struct vp_tr {
    unsigned       scratch_size;
    LLVMValueRef   scratch_base; /* iptr addr of the scratch alloca, or NULL */
    LLVMBasicBlockRef entry;     /* function entry block (alloca home) */
+   LLVMValueRef   tex_f32_slot; /* float[4] the float texture ABI writes, or NULL */
    /* SSA map: [def index][component] -> iN value (bit pattern).
     * For a deref instr, component 0 holds the iptr byte address. */
    LLVMValueRef  *val;
@@ -2556,33 +2557,58 @@ emit_tex_hw(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lod)
    return LLVMBuildCall2(t->b, fnty, ia, a, 3, "texel");
 }
 
-/* texelFetch: gfx_tex_fetch_sw(&texstate[0], x, y, lod) -- the exact texel at
- * integer (x,y) of integer lod, no wrap/filter/mip. Returns packed A8R8G8B8. */
+/* The float[4] slot the float-returning texture ABI writes through. Allocated once
+ * in the entry block and reused: an alloca built at the emit site would be dynamic,
+ * growing the stack on every trip of a loop containing the fetch. The slot is dead
+ * across calls -- each fetch fills all four channels before they are read. */
 static LLVMValueRef
-emit_tex_fetch(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef lod)
+tex_f32_scratch(struct vp_tr *t)
 {
-   LLVMTypeRef params[4] = { t->ptr, t->i32, t->i32, t->i32 };
-   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 4, false);
-   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_sw");
-   if (!fn)
-      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_sw", fty);
-   LLVMValueRef a[4] = { t->fs_texstate, x, y, lod };
-   return LLVMBuildCall2(t->b, fty, fn, a, 4, "texfetch");
+   if (!t->tex_f32_slot) {
+      LLVMBasicBlockRef cur = LLVMGetInsertBlock(t->b);
+      LLVMValueRef first = LLVMGetFirstInstruction(t->entry);
+      if (first)
+         LLVMPositionBuilderBefore(t->b, first);
+      else
+         LLVMPositionBuilderAtEnd(t->b, t->entry);
+      t->tex_f32_slot = LLVMBuildAlloca(t->b, LLVMArrayType(t->f32, 4), "texel_f32");
+      LLVMPositionBuilderAtEnd(t->b, cur);
+   }
+   return t->tex_f32_slot;
 }
 
-/* texelFetch on a 2D array: gfx_tex_fetch_array_sw(&texstate[0], x, y, layer, lod)
- * -- exact texel of integer `layer` slice, no wrap/filter/mip. */
+/* texelFetch returning floats: gfx_tex_fetch_f32(&texstate[0], x, y, lod, out) --
+ * the exact texel at integer (x,y) of integer lod, decoded to four float channels
+ * in RGBA order. Returns the scratch slot the callee filled. */
 static LLVMValueRef
-emit_tex_fetch_array(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y,
-                     LLVMValueRef layer, LLVMValueRef lod)
+emit_tex_fetch_f32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef lod)
 {
-   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
-   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
-   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_array_sw");
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->ptr };
+   LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_f32");
    if (!fn)
-      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_array_sw", fty);
-   LLVMValueRef a[5] = { t->fs_texstate, x, y, layer, lod };
-   return LLVMBuildCall2(t->b, fty, fn, a, 5, "texfetcharr");
+      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_f32", fty);
+   LLVMValueRef out = tex_f32_scratch(t);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y, lod, out };
+   LLVMBuildCall2(t->b, fty, fn, a, 5, "");
+   return out;
+}
+
+/* texelFetch on a 2D array returning floats: the layer selects the slice, the
+ * channels come back as gfx_tex_fetch_f32's do. */
+static LLVMValueRef
+emit_tex_fetch_array_f32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y,
+                         LLVMValueRef layer, LLVMValueRef lod)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->ptr };
+   LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_array_f32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_array_f32", fty);
+   LLVMValueRef out = tex_f32_scratch(t);
+   LLVMValueRef a[6] = { t->fs_texstate, x, y, layer, lod, out };
+   LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+   return out;
 }
 
 /* textureGather: gfx_tex_gather_sw(&texstate[0], x, y, comp) -- channel `comp` of
@@ -3081,6 +3107,49 @@ emit_tex_size(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef lod_int)
       ssa_set(t, tex->def.index, c, dims[c]);
 }
 
+/* Write a sampled vec4 to the def, applying the view's component swizzle. `chan`
+ * holds the four source channels (R,G,B,A) as floats. Output component c takes
+ * source channel map (0..3 = R/G/B/A), or a constant 0.0 (map 4) / 1.0 (map 5) --
+ * those two stay literals, so a VK_COMPONENT_SWIZZLE_ONE returns 1.0 whatever the
+ * texel holds. Identity (1672) is a passthrough. */
+static void
+emit_tex_swizzle_store(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef chan[4])
+{
+   LLVMValueRef swz = emit_tex_swizzle_word(t);
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
+      LLVMValueRef map = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, swz, LLVMConstInt(t->i32, c * 3, false), ""),
+         LLVMConstInt(t->i32, 0x7, false), "map");
+      LLVMValueRef is0 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 0, false), "");
+      LLVMValueRef is1 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 1, false), "");
+      LLVMValueRef is2 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 2, false), "");
+      LLVMValueRef f = LLVMBuildSelect(t->b, is0, chan[0],
+                       LLVMBuildSelect(t->b, is1, chan[1],
+                       LLVMBuildSelect(t->b, is2, chan[2], chan[3], ""), ""), "src_chan");
+      LLVMValueRef is4 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 4, false), "");
+      LLVMValueRef is5 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 5, false), "");
+      f = LLVMBuildSelect(t->b, is4, LLVMConstReal(t->f32, 0.0), f, "");
+      f = LLVMBuildSelect(t->b, is5, LLVMConstReal(t->f32, 1.0), f, "");
+      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
+   }
+}
+
+/* Unpack a float[4] scratch slot (emit_tex_fetch_f32) to the def's vec4. The
+ * channels are already the sampled values -- no /255 -- so a float-format texel
+ * keeps its real magnitude. */
+static void
+emit_tex_unpack_f32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out)
+{
+   LLVMValueRef chan[4];
+   for (unsigned s = 0; s < 4; s++) {
+      LLVMValueRef idx[2] = { LLVMConstInt(t->i32, 0, false),
+                              LLVMConstInt(t->i32, s, false) };
+      LLVMValueRef p = LLVMBuildGEP2(t->b, LLVMArrayType(t->f32, 4), out, idx, 2, "");
+      chan[s] = LLVMBuildLoad2(t->b, t->f32, p, "texel_f");
+   }
+   emit_tex_swizzle_store(t, tex, chan);
+}
+
 /* Unpack a packed A8R8G8B8 texel into the tex def's components as floats [0,1]. */
 static void
 emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
@@ -3093,30 +3162,14 @@ emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
          LLVMBuildLShr(t->b, texel, LLVMConstInt(t->i32, shift[s], false), ""),
          LLVMConstInt(t->i32, 0xff, false), "");
 
-   /* Apply the view's component swizzle: output component c takes source channel
-    * map (0..3 = R/G/B/A), or a constant 0.0 (map 4) / 1.0 (map 5). Identity
-    * (1672) selects R,G,B,A unchanged, so a non-swizzled view is a passthrough. */
-   LLVMValueRef swz = emit_tex_swizzle_word(t);
+   /* Scale each channel to [0,1], then swizzle. The multiply-by-reciprocal (not a
+    * divide) is what the SW sampler's float decode also uses, so the two unpacks
+    * agree bit-for-bit on a non-float format. */
    LLVMValueRef c1 = LLVMConstReal(t->f32, 1.0 / 255.0);
-   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
-      LLVMValueRef map = LLVMBuildAnd(t->b,
-         LLVMBuildLShr(t->b, swz, LLVMConstInt(t->i32, c * 3, false), ""),
-         LLVMConstInt(t->i32, 0x7, false), "map");
-      /* select source byte: map==0->R, 1->G, 2->B, else A. */
-      LLVMValueRef is0 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 0, false), "");
-      LLVMValueRef is1 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 1, false), "");
-      LLVMValueRef is2 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 2, false), "");
-      LLVMValueRef sb = LLVMBuildSelect(t->b, is0, byte[0],
-                        LLVMBuildSelect(t->b, is1, byte[1],
-                        LLVMBuildSelect(t->b, is2, byte[2], byte[3], ""), ""), "src_byte");
-      LLVMValueRef f = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, sb, t->f32, ""), c1, "");
-      /* map 4 -> 0.0, map 5 -> 1.0 override the channel select. */
-      LLVMValueRef is4 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 4, false), "");
-      LLVMValueRef is5 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 5, false), "");
-      f = LLVMBuildSelect(t->b, is4, LLVMConstReal(t->f32, 0.0), f, "");
-      f = LLVMBuildSelect(t->b, is5, LLVMConstReal(t->f32, 1.0), f, "");
-      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
-   }
+   LLVMValueRef chan[4];
+   for (unsigned s = 0; s < 4; s++)
+      chan[s] = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte[s], t->f32, ""), c1, "");
+   emit_tex_swizzle_store(t, tex, chan);
 }
 
 /* sampler2DShadow: gfx_tex_shadow_sw(&texstate[0], x, y, ref_bits, filter) --
@@ -3516,12 +3569,15 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       /* texelFetchOffset: the offset is a texel delta added to the integer coord. */
       LLVMValueRef x = off_x ? LLVMBuildAdd(t->b, u, off_x, "") : u;
       LLVMValueRef y = off_y ? LLVMBuildAdd(t->b, v, off_y, "") : v;
+      /* Float channels, so a float-format texel keeps its real magnitude (its range
+       * is not [0,1]); a non-float format decodes to the same [0,1] channels the
+       * packed-ARGB unpack yields. */
       if (tex->is_array) {
          /* 2D array: coord.z is the integer layer slice. */
          LLVMValueRef layer = ssa_get(t, coord_ssa, 2);
-         emit_tex_unpack(t, tex, emit_tex_fetch_array(t, x, y, layer, lod));
+         emit_tex_unpack_f32(t, tex, emit_tex_fetch_array_f32(t, x, y, layer, lod));
       } else {
-         emit_tex_unpack(t, tex, emit_tex_fetch(t, x, y, lod));
+         emit_tex_unpack_f32(t, tex, emit_tex_fetch_f32(t, x, y, lod));
       }
       return;
    }
@@ -3627,13 +3683,15 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    LLVMValueRef texel;
    if (tex->op == nir_texop_tex && !t->sw_tex) {
       LLVMValueRef filt = emit_tex_filter_word(t);
-      /* Route to the SW sampler when the sampler is mipmapped OR the texture is
-       * NPOT (the FF vx_tex4 unit is POT-only); otherwise the fast HW path. Both
-       * are uniform descriptor bits, so the branch never diverges. */
+      /* Route to the SW sampler when the sampler is mipmapped, the texture is
+       * NPOT (the FF vx_tex4 unit is POT-only) or its format is above the FF set
+       * (the FF unit has no decoder or texel stride for it); otherwise the fast HW
+       * path. All are uniform descriptor bits, so the branch never diverges. */
       LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
          LLVMBuildAnd(t->b, filt,
             LLVMConstInt(t->i32,
-               GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT, false), ""),
+               GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
+               GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
          LLVMConstInt(t->i32, 0, false), "tex_use_sw");
       LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
       LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_sw");
@@ -3669,11 +3727,13 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       if (t->sw_tex) {
          texel = emit_tex_sw_lod(t, ux, vx, lod_bits);
       } else {
-         /* SW sampler when mipmapped OR NPOT (FF vx_tex4 is POT-only); else HW. */
+         /* SW sampler when mipmapped, NPOT (FF vx_tex4 is POT-only) or an
+          * extended format (no FF decoder for it); else HW. */
          LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
             LLVMBuildAnd(t->b, emit_tex_filter_word(t),
                LLVMConstInt(t->i32,
-                  GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT, false), ""),
+                  GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
+                  GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
             LLVMConstInt(t->i32, 0, false), "txl_use_sw");
          LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
          LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "txl_sw");
@@ -3699,17 +3759,18 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       }
    } else {
       /* txb (textureBias): auto-LOD from the quad gradient plus the shader bias.
-       * Route like texture(): a mipmapped OR NPOT sampler resolves in SW (auto-LOD
-       * + bias + min/mag tap), else the fast HW path at the base level (a bias on a
-       * non-mipmapped sampler has no other level to reach). mip-enable/NPOT are
-       * uniform descriptor bits, so the branch never diverges (derivatives safe). */
+       * Route like texture(): a mipmapped, NPOT or extended-format sampler resolves
+       * in SW (auto-LOD + bias + min/mag tap), else the fast HW path at the base
+       * level (a bias on a non-mipmapped sampler has no other level to reach). The
+       * routing bits are uniform, so the branch never diverges (derivatives safe). */
       if (t->sw_tex) {
          texel = emit_tex_sw_resolved(t, ux, vx, bias_q8);
       } else {
          LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
             LLVMBuildAnd(t->b, emit_tex_filter_word(t),
                LLVMConstInt(t->i32,
-                  GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT, false), ""),
+                  GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
+                  GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
             LLVMConstInt(t->i32, 0, false), "txb_use_sw");
          LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
          LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "txb_sw");

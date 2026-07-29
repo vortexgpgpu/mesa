@@ -542,16 +542,20 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          texstate.wrap_w   = tex->wrap_w;
          /* Descriptor-only filter bits (the FS reads them; they never reach the HW
           * TEX_FILTER DCR below): mag tap (bit0, from tex->filter), min tap (bit3),
-          * mip-linear (bit1), mip-enable (bit2) and NPOT (bit4). A mipmapped OR
-          * non-power-of-two sampler routes to the SW sampler, which resolves
-          * min-vs-mag per fragment from these and addresses NPOT by width/height. */
+          * mip-linear (bit1), mip-enable (bit2), NPOT (bit4) and extended format
+          * (bit5). A mipmapped, non-power-of-two OR extended-format sampler routes
+          * to the SW sampler, which resolves min-vs-mag per fragment from these,
+          * addresses NPOT by width/height, and decodes the extended formats the FF
+          * unit has neither a decoder nor a texel stride for. */
          const bool tex_pot = tex->width && tex->height
             && !(tex->width & (tex->width - 1u)) && !(tex->height & (tex->height - 1u));
          texstate.filter = tex->filter
             | (tex->min_filter == VX_TEX_FILTER_BILINEAR ? GFX_SW_TEX_FILTER_MIN_BILINEAR : 0u)
             | (tex->mip_linear ? VX_TEX_FILTER_MIP_LINEAR : 0u)
             | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u)
-            | (tex_pot ? 0u : GFX_SW_TEX_FILTER_NPOT);
+            | (tex_pot ? 0u : GFX_SW_TEX_FILTER_NPOT)
+            | (texstate.format > (uint32_t)VX_TEX_FORMAT_FF_MAX
+                  ? GFX_SW_TEX_FILTER_EXT_FORMAT : 0u);
          texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
          /* Carry the mip-0 integer dims so the SW sampler can address NPOT
           * textures (multiply addressing). POT textures leave width==1<<logdim
@@ -909,9 +913,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_OM_APERTURE_DEPTH_ONLY,   0);
       }
 
-      /* TEX unit (stage 0): the texels are residency-cached at tex_dev
-       * (A8R8G8B8); program the sampler. Untextured draws (tex_dev==0) leave
-       * TEX state alone. SW-textured draws (sw_tex) skip the FF TEX config —
+      /* TEX unit (stage 0): the texels are residency-cached at tex_dev (A8R8G8B8
+       * for the FF formats this path serves); program the sampler. Untextured
+       * draws (tex_dev==0) leave TEX state alone. SW-textured draws (sw_tex)
+       * skip the FF TEX config —
        * the FS samples in software from the resident descriptor (argblk[1]). */
       if (tex_dev && tex && !sw_tex) {
          uint32_t logw = vp_log2u(tex->width);
