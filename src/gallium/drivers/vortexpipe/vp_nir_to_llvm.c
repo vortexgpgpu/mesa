@@ -2615,15 +2615,17 @@ emit_tex_gather(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRe
  * the /255 unpack yields 0.0/1.0, matching the colour gather). */
 static void
 emit_tex_gather_cmp(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x,
-                    LLVMValueRef y, LLVMValueRef ref_bits)
+                    LLVMValueRef y, LLVMValueRef ref_bits, LLVMValueRef layer)
 {
-   LLVMTypeRef params[4] = { t->ptr, t->i32, t->i32, t->i32 };
-   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 4, false);
-   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_gather_cmp_sw");
+   unsigned n = layer ? 5 : 4;
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, n, false);
+   const char *name = layer ? "gfx_tex_gather_cmp_array_sw" : "gfx_tex_gather_cmp_sw";
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, name);
    if (!fn)
-      fn = LLVMAddFunction(t->mod, "gfx_tex_gather_cmp_sw", fty);
-   LLVMValueRef a[4] = { t->fs_texstate, x, y, ref_bits };
-   LLVMValueRef packed = LLVMBuildCall2(t->b, fty, fn, a, 4, "gathercmp");
+      fn = LLVMAddFunction(t->mod, name, fty);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y, ref_bits, layer };
+   LLVMValueRef packed = LLVMBuildCall2(t->b, fty, fn, a, n, "gathercmp");
    for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
       LLVMValueRef byte = LLVMBuildAnd(t->b,
          LLVMBuildLShr(t->b, packed, LLVMConstInt(t->i32, c * 8, false), ""),
@@ -3340,7 +3342,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
     * folded into the coord, component 3) is the reference. Select the layer slice,
     * then compare. Handled before the plain 2D-shadow branch (which drops the
     * layer) and before the array-colour branch (which drops the compare). */
-   if (tex->is_shadow && tex->is_array &&
+   if (tex->is_shadow && tex->is_array && tex->op != nir_texop_tg4 &&
        tex->sampler_dim == GLSL_SAMPLER_DIM_2D && u && v) {
       LLVMValueRef ref = cmp ? cmp : ssa_get(t, coord_ssa, 3);
       LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
@@ -3409,7 +3411,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
     * sample that slice via the SW array entry (base + layer*layer_stride). Handled
     * before the 2D dispatch since an array sample is still nir_texop_tex/txl. */
    if (tex->is_array && tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
-       tex->op != nir_texop_txf && u && v) {
+       tex->op != nir_texop_txf && tex->op != nir_texop_tg4 && u && v) {
       LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
       LLVMValueRef layer = LLVMBuildFPToSI(t->b,
          LLVMBuildFAdd(t->b, zf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "layer");
@@ -3523,10 +3525,19 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       LLVMValueRef gscale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
       LLVMValueRef gux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, guf, gscale, ""), t->i32, "");
       LLVMValueRef gvx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, gvf, gscale, ""), t->i32, "");
-      /* textureGatherCmp (sampler2DShadow): compare each tap against the reference
-       * instead of reading a colour channel. */
+      LLVMValueRef glayer = NULL;
+      if (tex->is_array) {
+         LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+         LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+         glayer = LLVMBuildFPToSI(t->b,
+            LLVMBuildFAdd(t->b, zf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "glayer");
+         glayer = LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntSLT, glayer, zero, ""), zero, glayer, "");
+      }
+      /* textureGatherCmp (sampler2DShadow): compare each tap against the reference. */
       if (tex->is_shadow)
-         emit_tex_gather_cmp(t, tex, gux, gvx, cmp ? cmp : ssa_get(t, coord_ssa, 2));
+         emit_tex_gather_cmp(t, tex, gux, gvx,
+            cmp ? cmp : ssa_get(t, coord_ssa, tex->is_array ? 3 : 2), glayer);
       else
          emit_tex_gather(t, tex, gux, gvx);
       return;

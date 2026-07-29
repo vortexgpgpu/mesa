@@ -289,6 +289,8 @@ struct vp_context {
 #define VP_MAX_TEX_HANDLES 32
    const void           *txh_base[VP_MAX_TEX_HANDLES];
    struct pipe_resource *txh_res[VP_MAX_TEX_HANDLES];
+   unsigned              txh_target[VP_MAX_TEX_HANDLES];
+   unsigned              txh_layers[VP_MAX_TEX_HANDLES];
    unsigned              txh_count;
    /* Output-merger state (depth-stencil-alpha + blend). */
    struct vp_dsa_cso   *cur_dsa;

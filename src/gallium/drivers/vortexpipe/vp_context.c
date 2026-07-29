@@ -752,8 +752,11 @@ vp_create_texture_handle(struct pipe_context *pipe,
          const void *base = pipe_texture_map(pipe, res, 0, 0, PIPE_MAP_READ,
                                              0, 0, res->width0, res->height0, &xfer);
          if (base) {
-            vp->txh_base[vp->txh_count] = base;
-            vp->txh_res[vp->txh_count]  = res;
+            vp->txh_base[vp->txh_count]   = base;
+            vp->txh_res[vp->txh_count]    = res;
+            vp->txh_target[vp->txh_count] = view->target;
+            vp->txh_layers[vp->txh_count] =
+               view->u.tex.last_layer - view->u.tex.first_layer + 1u;
             vp->txh_count++;
             pipe_texture_unmap(pipe, xfer);
          }
@@ -838,7 +841,12 @@ vp_resolve_tex_from_desc(struct pipe_context *pipe, struct vp_context *vp,
    memcpy(&base, blob + vp->fs_cbuf_off[ci] + fs->tex_desc_offset, sizeof base);
    pipe_buffer_unmap(pipe, xfer);
    for (unsigned i = 0; i < vp->txh_count; i++)
-      if (vp->txh_base[i] == base) { vp->cur_tex = vp->txh_res[i]; break; }
+      if (vp->txh_base[i] == base) {
+         vp->cur_tex        = vp->txh_res[i];
+         vp->cur_tex_target = vp->txh_target[i];
+         vp->cur_tex_layers = vp->txh_layers[i];
+         break;
+      }
 }
 
 /* ---- graphics: vertex input ---------------------------------------- *
@@ -2137,6 +2145,9 @@ vp_draw_vbo(struct pipe_context *pipe,
                               ? vp->cur_tex->depth0
                          : (vp->cur_tex_target == PIPE_TEXTURE_CUBE_ARRAY)
                               ? (vp->cur_tex_layers / 6u)
+                         : (vp->cur_tex_target == PIPE_TEXTURE_2D_ARRAY ||
+                            vp->cur_tex_target == PIPE_TEXTURE_1D_ARRAY)
+                              ? vp->cur_tex_layers
                               : 0u;
                tex.min_filter = vp->cur_sampler ? vp->cur_sampler->min_filter
                                                 : VX_TEX_FILTER_POINT;

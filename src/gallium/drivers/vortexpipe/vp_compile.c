@@ -231,7 +231,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
        * baremetal link has no __assert_func, so compile assertions out. */
       snprintf(gfx_seg, sizeof gfx_seg,
          "-std=c++17 -DNDEBUG -D__VORTEX__ -DGFX_SW_DIVERGENCE_OK "
-         "-mllvm -vortex-divergence-max-bbs=512 "
+         "-mllvm -vortex-divergence-max-bbs=65536 "
          "-I%s/sw/gfx -I%s/sw/common -I%s/third_party -I%s/sw %s/sw/gfx/gfx_sw_abi.cpp",
          vh, vh, vh, bd, vh);
    }
