@@ -2574,7 +2574,14 @@ emit_om_aperture_load(struct vp_tr *t, LLVMValueRef arg)
       t->om_ap_xbits = t->om_ap_ybits = t->om_ap_shift = NULL;
       return;
    }
+   /* The aperture word is a packed 32-bit geometry field, not a pointer, so
+    * force it to i32: emit_arg_i32 returns pointer-width (i64 at XLEN=64) and the
+    * unpack below is all i32 arithmetic. Without this the ap_xbits/ybits/shift
+    * ands and the shl shift-amounts mix i64 with i32 and the FS module fails LLVM
+    * verification, silently dropping the fragment stage onto llvmpipe. */
    LLVMValueRef w = emit_arg_i32(t, arg, GFX_FS_ARG_APERTURE);
+   if (LLVMTypeOf(w) != t->i32)
+      w = LLVMBuildTrunc(t->b, w, t->i32, "ap_word");
    LLVMValueRef m8 = LLVMConstInt(t->i32, 0xffu, false);
    t->om_ap_xbits = LLVMBuildAnd(t->b, w, m8, "ap_xbits");
    t->om_ap_ybits = LLVMBuildAnd(t->b,
