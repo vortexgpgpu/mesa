@@ -3571,75 +3571,32 @@ emit_tex_cube_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
    emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 6, "texcubearray"));
 }
 
-/* sampler3D: sample at S.23 (u,v,w). Compute the signed LOD lambda from the u,v
- * gradient (bias + clamp + mip-enable gate, like the 2D auto-LOD path); the min/mag
- * tap is resolved from the same lambda. A mip-linear sampler passes the Q8 lambda
- * with the mip-linear bit set so the sampler blends the two bracketing levels
- * (full trilinear = 2 levels x 2 slices x bilinear); otherwise it passes the
- * rounded integer level (nearest-mip). The sampler picks the depth slice from w
- * (nearest slice, or a linear blend of the two bracketing slices on a linear tap).
- * A non-mipmapped sampler forces level 0 (the single-level base-LOD path). */
+/* sampler3D: sample at S.23 (u,v,w). The LOD and the min/mag tap come from the
+ * shared resolvers, so a 3D sample follows the same lambda rules as a 2D one. A
+ * mip-linear sampler passes the Q8 lambda with the mip-linear bit set so the sampler
+ * blends the two bracketing levels (full trilinear = 2 levels x 2 slices x bilinear);
+ * otherwise it passes the rounded integer level (nearest-mip). The sampler picks the
+ * depth slice from w (nearest slice, or a linear blend of the two bracketing slices
+ * on a linear tap). A non-mipmapped sampler forces level 0.
+ *
+ * The auto-LOD lambda still comes from the u,v gradient alone, so a volume whose
+ * depth axis is the steepest gradient picks too low a level. */
 static void
 emit_tex_3d(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef u, LLVMValueRef v,
-            LLVMValueRef w)
+            LLVMValueRef w, LLVMValueRef lod_bits, LLVMValueRef bias_q8)
 {
-   LLVMValueRef filt = emit_tex_filter_word(t);
-   LLVMValueRef zero64 = LLVMConstInt(t->i64, 0, false);
-   LLVMValueRef zero32 = LLVMConstInt(t->i32, 0, false);
-
-   /* Continuous signed LOD lambda (Q(VX_TEX_LOD_FRAC_BITS)) from the u,v gradient. */
-   LLVMValueRef rho = emit_tex_grad_rho(t, u, v);
-   LLVMValueRef msb = LLVMBuildSub(t->b, LLVMConstInt(t->i64, 63, false),
-                                   emit_ctlz64(t, rho), "msb");
-   LLVMValueRef one_msb = LLVMBuildShl(t->b, LLVMConstInt(t->i64, 1, false), msb, "");
-   LLVMValueRef ip = LLVMBuildShl(t->b,
-      LLVMBuildSub(t->b, msb, LLVMConstInt(t->i64, VP_TEX_FXD_FRAC, false), ""),
-      LLVMConstInt(t->i64, VX_TEX_LOD_FRAC_BITS, false), "");
-   LLVMValueRef mant = LLVMBuildAnd(t->b, rho,
-      LLVMBuildSub(t->b, one_msb, LLVMConstInt(t->i64, 1, false), ""), "");
-   LLVMValueRef fp = LLVMBuildLShr(t->b,
-      LLVMBuildShl(t->b, mant, LLVMConstInt(t->i64, VX_TEX_LOD_FRAC_BITS, false), ""),
-      msb, "");
-   LLVMValueRef lam64 = LLVMBuildAdd(t->b, ip, fp, "lambda_q8");
-   lam64 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntEQ, rho, zero64, ""),
-      LLVMConstInt(t->i64, (uint64_t)(int64_t)(-(64 << VX_TEX_LOD_FRAC_BITS)), true),
-      lam64, "");
-
-   LLVMValueRef lam_b = LLVMBuildAdd(t->b, LLVMBuildTrunc(t->b, lam64, t->i32, ""),
-                                     emit_tex_lod_bias(t), "lam_biased");
-   LLVMValueRef minified = LLVMBuildICmp(t->b, LLVMIntSGT, lam_b, zero32, "minified");
-   LLVMValueRef lam = emit_tex_lod_clamp(t, lam_b);
-   LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
-      LLVMBuildAnd(t->b, filt,
-         LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
-      zero32, "mip_en");
-   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
-      LLVMBuildAnd(t->b, filt,
-         LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
-      zero32, "mip_lin");
-   lam = LLVMBuildSelect(t->b, mip_en, lam, zero32, "");
-   /* nearest mip level = round(lambda). */
-   LLVMValueRef level = LLVMBuildAShr(t->b,
-      LLVMBuildAdd(t->b, lam,
-         LLVMConstInt(t->i32, 1 << (VX_TEX_LOD_FRAC_BITS - 1), false), ""),
-      LLVMConstInt(t->i32, VX_TEX_LOD_FRAC_BITS, false), "level");
-
-   /* tap: min (bit3) when minified, mag (bit0) otherwise. */
-   LLVMValueRef mag_tap = LLVMBuildAnd(t->b, filt, LLVMConstInt(t->i32, 1, false), "mag_tap");
-   LLVMValueRef min_tap = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, filt, LLVMConstInt(t->i32, 3, false), ""),
-      LLVMConstInt(t->i32, 1, false), "min_tap");
-   LLVMValueRef tap = LLVMBuildSelect(t->b, minified, min_tap, mag_tap, "tap");
-
-   /* Inter-level blend only for a minified fragment of a mip-linear sampler with a
-    * real mip chain: pass the Q8 lambda + the mip-linear bit so the sampler blends
-    * two levels; otherwise the rounded integer level with a tap-only filter. */
-   LLVMValueRef mip_active = LLVMBuildAnd(t->b, LLVMBuildAnd(t->b, minified, mip_lin, ""),
-                                          mip_en, "mip_active");
-   LLVMValueRef lod = LLVMBuildSelect(t->b, mip_active, lam, level, "lod");
-   LLVMValueRef mip_bit = LLVMBuildSelect(t->b, mip_active,
-      LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), zero32, "");
-   LLVMValueRef sw_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+   /* Resolve the mip level and per-fragment tap exactly as the 2D path does -- same
+    * op-to-resolver mapping as emit_tex_sw_arm -- so every sampler shape derives its
+    * LOD through one implementation. textureLod takes the explicit lambda; texture()
+    * and textureBias take the quad gradient, the latter adding the shader bias. */
+   LLVMValueRef lod, sw_filter;
+   if (tex->op == nir_texop_txl) {
+      emit_tex_resolve_explicit_lod(t, lod_bits, &lod, &sw_filter);
+   } else {
+      emit_tex_resolve_auto_lod(t, u, v,
+                                tex->op == nir_texop_txb ? bias_q8 : NULL,
+                                &lod, &sw_filter);
+   }
 
    /* A float sampler takes the four-float form (see emit_tex_array); a 3D sample is
     * always software, so there is no second arm to merge. The lambda and tap above
@@ -3961,11 +3918,15 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
    LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
 
+   /* The explicit-LOD source, as the raw f32 bits every LOD resolver expects; an op
+    * without one never reads it. */
+   LLVMValueRef lod_bits = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
+
    /* sampler3D: the third coordinate selects the depth slice (SW-sampled). */
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_3D && !tex->is_array) {
       LLVMValueRef wf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "wf");
       LLVMValueRef wx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, wf, scale, ""), t->i32, "");
-      emit_tex_3d(t, tex, ux, vx, wx);
+      emit_tex_3d(t, tex, ux, vx, wx, lod_bits, bias_q8);
       return;
    }
 
@@ -3982,7 +3943,6 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
     * for an integer sampler, whose formats are all 8-bit and FF. The carrier follows
     * the sampler's static result type, so only one form is ever emitted. */
    const bool as_f32 = !tex_dest_is_int(tex);
-   LLVMValueRef lod_bits = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
 
    if (t->sw_tex) {
       /* TEX-less device: software always. The SW arm resolves min/mag + mip itself
