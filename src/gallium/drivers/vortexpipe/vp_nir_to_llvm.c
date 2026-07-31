@@ -3182,6 +3182,32 @@ tex_swizzle_float_consts(struct vp_tr *t, LLVMValueRef *czero, LLVMValueRef *con
    *cone  = LLVMBuildBitCast(t->b, LLVMConstReal(t->f32, 1.0), t->i32, "");
 }
 
+/* Write four stored bytes to an integer sampler's def as the raw values they hold:
+ * a signed sampler reinterprets each as int8 (the stored value spans -128..127), an
+ * unsigned one takes it as-is. No normalisation -- an isampler/usampler yields the
+ * stored integer and the shader's own vec4() cast converts.
+ *
+ * Exact only because the integer formats reach the sampler as VX_TEX_FORMAT_A8R8G8B8
+ * (vp_vx_tex_format), whose decode preserves every byte. Giving them their own VX
+ * format above VX_TEX_FORMAT_FF_MAX would break this silently -- TexDecodeExtended's
+ * default arm returns a=0xff, rgb=0. */
+static void
+emit_tex_store_int8_chan(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef byte[4],
+                         bool is_signed)
+{
+   LLVMValueRef chan[4];
+   for (unsigned s = 0; s < 4; s++) {
+      /* byte -> int8: (v ^ 0x80) - 0x80 */
+      chan[s] = is_signed
+         ? LLVMBuildSub(t->b,
+              LLVMBuildXor(t->b, byte[s], LLVMConstInt(t->i32, 0x80, false), ""),
+              LLVMConstInt(t->i32, 0x80, false), "sext8")
+         : byte[s];
+   }
+   emit_tex_swizzle_store(t, tex, chan, LLVMConstInt(t->i32, 0, false),
+                          LLVMConstInt(t->i32, 1, false));
+}
+
 /* Unpack a float[4] scratch slot (emit_tex_fetch_f32) to the def's vec4. The
  * channels are already the sampled values -- no /255 -- so a float-format texel
  * keeps its real magnitude. */
@@ -3202,32 +3228,25 @@ emit_tex_unpack_f32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out)
 }
 
 /* Unpack an int32[4] scratch slot (emit_tex_fetch_i32) to an integer sampler's
- * def. The channels arrive as raw 0..255 bytes: a signed sampler reinterprets each
- * as int8 (the stored value spans -128..127), an unsigned one takes it as-is. No
- * scaling -- the shader's own vec4() cast converts. */
+ * def. The channels arrive as the raw 0..255 stored bytes. */
 static void
 emit_tex_unpack_i32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out,
                     bool is_signed)
 {
-   LLVMValueRef chan[4];
+   LLVMValueRef byte[4];
    for (unsigned s = 0; s < 4; s++) {
       LLVMValueRef idx[2] = { LLVMConstInt(t->i32, 0, false),
                               LLVMConstInt(t->i32, s, false) };
       LLVMValueRef p = LLVMBuildGEP2(t->b, LLVMArrayType(t->i32, 4), out, idx, 2, "");
-      LLVMValueRef v = LLVMBuildLoad2(t->b, t->i32, p, "texel_i");
-      if (is_signed) {
-         /* byte -> int8: (v ^ 0x80) - 0x80 */
-         v = LLVMBuildSub(t->b,
-            LLVMBuildXor(t->b, v, LLVMConstInt(t->i32, 0x80, false), ""),
-            LLVMConstInt(t->i32, 0x80, false), "sext8");
-      }
-      chan[s] = v;
+      byte[s] = LLVMBuildLoad2(t->b, t->i32, p, "texel_i");
    }
-   emit_tex_swizzle_store(t, tex, chan, LLVMConstInt(t->i32, 0, false),
-                          LLVMConstInt(t->i32, 1, false));
+   emit_tex_store_int8_chan(t, tex, byte, is_signed);
 }
 
-/* Unpack a packed A8R8G8B8 texel into the tex def's components as floats [0,1]. */
+/* Unpack a packed A8R8G8B8 texel into the tex def's components: floats [0,1] for a
+ * float sampler, the raw stored integers for an isampler/usampler. This is the common
+ * tail of every packed-texel sampler (2D, array, cube, cube-array, 3D) on both the SW
+ * and HW paths, so the sampler's result type is resolved here rather than in each. */
 static void
 emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
 {
@@ -3238,6 +3257,18 @@ emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
       byte[s] = LLVMBuildAnd(t->b,
          LLVMBuildLShr(t->b, texel, LLVMConstInt(t->i32, shift[s], false), ""),
          LLVMConstInt(t->i32, 0xff, false), "");
+
+   /* An integer sampler must yield the stored value, not a normalised colour.
+    * Branch on the BASE type only: lavapipe
+    * runs nir_opt_16bit_tex_image with int/uint in opt_tex_dest_types, so the size
+    * bits of dest_type are not guaranteed. Integer formats sample point-only (Vulkan
+    * gates VK_FILTER_LINEAR on a format feature no integer format advertises), so the
+    * packed word holds the four stored bytes unblended. */
+   nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+   if (base == nir_type_int || base == nir_type_uint) {
+      emit_tex_store_int8_chan(t, tex, byte, base == nir_type_int);
+      return;
+   }
 
    /* Scale each channel to [0,1], then swizzle. The multiply-by-reciprocal (not a
     * divide) is what the SW sampler's float decode also uses, so the two unpacks
