@@ -3641,6 +3641,23 @@ emit_tex_3d(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef u, LLVMValueRef v,
       LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), zero32, "");
    LLVMValueRef sw_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
 
+   /* A float sampler takes the four-float form (see emit_tex_array); a 3D sample is
+    * always software, so there is no second arm to merge. The lambda and tap above
+    * are shared -- only the final call differs. */
+   if (!tex_dest_is_int(tex)) {
+      LLVMTypeRef params[7] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32, t->ptr };
+      LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 7, false);
+      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_3d_f32");
+      if (!fn) {
+         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_3d_f32", fty);
+      }
+      LLVMValueRef out = tex_f32_scratch(t);
+      LLVMValueRef a[7] = { t->fs_texstate, u, v, w, lod, sw_filter, out };
+      LLVMBuildCall2(t->b, fty, fn, a, 7, "");
+      emit_tex_unpack_f32(t, tex, out);
+      return;
+   }
+
    LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
    LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
    LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_3d_sw");
