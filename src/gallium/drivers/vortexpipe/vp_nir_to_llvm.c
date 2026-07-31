@@ -3299,6 +3299,18 @@ emit_tex_unpack_i32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out,
    emit_tex_store_int8_chan(t, tex, byte, is_signed);
 }
 
+/* Does this sampler yield integers (isampler/usampler) rather than floats? Decides
+ * which carrier a sample travels in and how it is written to the def.
+ *
+ * The BASE type only, never the size bits: lavapipe runs nir_opt_16bit_tex_image with
+ * int/uint in opt_tex_dest_types, so dest_type may arrive narrowed. */
+static bool
+tex_dest_is_int(const nir_tex_instr *tex)
+{
+   nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+   return base == nir_type_int || base == nir_type_uint;
+}
+
 /* Split a packed A8R8G8B8 word into its four source channel bytes (R,G,B,A). */
 static void
 tex_argb_bytes(struct vp_tr *t, LLVMValueRef texel, LLVMValueRef byte[4])
@@ -3331,15 +3343,14 @@ emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
    LLVMValueRef byte[4];
    tex_argb_bytes(t, texel, byte);
 
-   /* An integer sampler must yield the stored value, not a normalised colour.
-    * Branch on the BASE type only: lavapipe
-    * runs nir_opt_16bit_tex_image with int/uint in opt_tex_dest_types, so the size
-    * bits of dest_type are not guaranteed. Integer formats sample point-only (Vulkan
-    * gates VK_FILTER_LINEAR on a format feature no integer format advertises), so the
-    * packed word holds the four stored bytes unblended. */
-   nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
-   if (base == nir_type_int || base == nir_type_uint) {
-      emit_tex_store_int8_chan(t, tex, byte, base == nir_type_int);
+   /* An integer sampler must yield the stored value, not a normalised colour. Integer
+    * formats sample point-only (Vulkan gates VK_FILTER_LINEAR on a format feature no
+    * integer format advertises), so the packed word holds the four stored bytes
+    * unblended. */
+   if (tex_dest_is_int(tex)) {
+      const bool is_signed =
+         nir_alu_type_get_base_type(tex->dest_type) == nir_type_int;
+      emit_tex_store_int8_chan(t, tex, byte, is_signed);
       return;
    }
 
@@ -3472,6 +3483,22 @@ static void
 emit_tex_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y,
                LLVMValueRef layer, LLVMValueRef lod)
 {
+   /* A float sampler takes the four-float form: a float-format texel leaves [0,1] and
+    * cannot survive the packed word. An array sample is always software, so unlike the
+    * 2D path there is no second arm to merge. */
+   if (!tex_dest_is_int(tex)) {
+      LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->ptr };
+      LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_array_f32");
+      if (!fn)
+         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_array_f32", fty);
+      LLVMValueRef out = tex_f32_scratch(t);
+      LLVMValueRef a[6] = { t->fs_texstate, x, y, layer, lod, out };
+      LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+      emit_tex_unpack_f32(t, tex, out);
+      return;
+   }
+
    LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
    LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
    LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_array_sw");
@@ -3907,8 +3934,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
     * leaves [0,1] and cannot survive the packed 8-bit word -- and as that packed word
     * for an integer sampler, whose formats are all 8-bit and FF. The carrier follows
     * the sampler's static result type, so only one form is ever emitted. */
-   nir_alu_type dbase = nir_alu_type_get_base_type(tex->dest_type);
-   const bool as_f32 = !(dbase == nir_type_int || dbase == nir_type_uint);
+   const bool as_f32 = !tex_dest_is_int(tex);
    LLVMValueRef lod_bits = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
 
    if (t->sw_tex) {
