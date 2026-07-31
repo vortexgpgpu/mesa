@@ -99,6 +99,7 @@
 #define VP_RAST_ATTR_A       84
 #define VP_RAST_ATTR_U       96
 #define VP_RAST_ATTR_V      108
+#define VP_RAST_ATTR_RHW    120
 
 /* TEX unit: coordinates are S.23 fixed-point (VX_types.h VX_TEX_FXD_FRAC). */
 #define VP_TEX_FXD_FRAC      23
@@ -2497,23 +2498,39 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
                       LLVMValueRef in_addr,
                       LLVMValueRef dxq, LLVMValueRef dyq)
 {
-   static const unsigned colour[4]   = {
+   /* The front end interpolates 6 scalar planes; expand_k packed the VS varyings
+    * into them in declaration order [u,v,r,g,b,a] (gfx_frontend_k.h). Read them
+    * back the same way: each FS input varying claims the next nc lanes, so a draw
+    * carrying several varyings never collides them onto one plane (the old
+    * nc<=2->texcoord / else->colour heuristic aliased every >=3-component varying
+    * onto r,g,b,a). */
+   static const unsigned lane[6] = {
+      VP_RAST_ATTR_U, VP_RAST_ATTR_V,
       VP_RAST_ATTR_R, VP_RAST_ATTR_G, VP_RAST_ATTR_B, VP_RAST_ATTR_A };
-   static const unsigned texcoord[2] = {
-      VP_RAST_ATTR_U, VP_RAST_ATTR_V };
 
+   /* Perspective recovery: setup premultiplied every colour/uv plane by 1/w and
+    * carries a separate 1/w plane, so the true attribute is
+    * interp(a/w)/interp(1/w) (gfx_setup.h). For a screen-aligned triangle 1/w is
+    * constant, so this is an exact divide. */
+   LLVMValueRef rhw_f = emit_fixed_to_float(t,
+      emit_interp(t, addk(t, prim, VP_RAST_ATTR_RHW), dxq, dyq), 24);
+   LLVMValueRef nz = LLVMBuildFCmp(t->b, LLVMRealONE, rhw_f,
+                                   LLVMConstReal(t->f32, 0.0), "");
+   LLVMValueRef inv_rhw = LLVMBuildFDiv(t->b, LLVMConstReal(t->f32, 1.0),
+      LLVMBuildSelect(t->b, nz, rhw_f, LLVMConstReal(t->f32, 1.0), ""), "");
+
+   unsigned li = 0;
    for (unsigned i = 0; i < t->nvars; i++) {
       const nir_variable *var = t->vars[i].var;
       if (!var || var->data.mode != nir_var_shader_in ||
           t->vars[i].out_off < 0)
          continue;
       unsigned nc = glsl_get_components(var->type);
-      const unsigned *plane  = (nc <= 2) ? texcoord : colour;
-      unsigned        planes = (nc <= 2) ? 2u : 4u;
-      LLVMValueRef    slot   = addk(t, in_addr, (unsigned)t->vars[i].out_off);
-      for (unsigned c = 0; c < nc && c < planes; c++) {
-         LLVMValueRef q = emit_interp(t, addk(t, prim, plane[c]), dxq, dyq);
-         LLVMValueRef f = emit_fixed_to_float(t, q, 24);
+      LLVMValueRef slot = addk(t, in_addr, (unsigned)t->vars[i].out_off);
+      for (unsigned c = 0; c < nc && li < 6u; c++, li++) {
+         LLVMValueRef q = emit_interp(t, addk(t, prim, lane[li]), dxq, dyq);
+         LLVMValueRef f = LLVMBuildFMul(t->b, emit_fixed_to_float(t, q, 24),
+                                        inv_rhw, "");
          emit_store_i32(t, addk(t, slot, c * 4),
                         LLVMBuildBitCast(t->b, f, t->i32, ""));
       }
