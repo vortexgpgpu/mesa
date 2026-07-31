@@ -2323,7 +2323,7 @@ emit_store_i32(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef val)
 static LLVMValueRef
 emit_vx_frag_payload(struct vp_tr *t, unsigned word)
 {
-   return emit_csr_read(t, word ? VX_CSR_FRAG_PID : VX_CSR_FRAG_POSMASK,
+   return emit_csr_read(t, word ? VX_CSR_FRAG_PID : VX_CSR_FRAG_POS,
                         word ? "frag_pid" : "frag_pos");
 }
 
