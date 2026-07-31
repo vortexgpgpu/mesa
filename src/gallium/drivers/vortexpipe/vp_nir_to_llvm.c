@@ -2595,6 +2595,26 @@ emit_tex_fetch_f32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef
    return out;
 }
 
+/* The SW sampler delivered as four floats: gfx_tex_sample_f32(&texstate[0], u, v,
+ * lod, filter, out). A float-format texture holds values outside [0,1] and cannot be
+ * filtered through the 8-bit ARGB working space; the callee decodes and blends it in
+ * float, and delegates every other format to the packed sampler so those results stay
+ * bit-identical. Returns the scratch slot the callee filled. */
+static LLVMValueRef
+emit_tex_sw_f32(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lod,
+                LLVMValueRef filter)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->ptr };
+   LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_f32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_f32", fty);
+   LLVMValueRef out = tex_f32_scratch(t);
+   LLVMValueRef a[6] = { t->fs_texstate, u, v, lod, filter, out };
+   LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+   return out;
+}
+
 /* The int32[4] slot the integer texture ABI writes through; entry-block allocated
  * and reused for the same reason as tex_f32_scratch. */
 static LLVMValueRef
@@ -2944,9 +2964,10 @@ emit_tex_lod_clamp(struct vp_tr *t, LLVMValueRef lam)
  * -> min tap, magnified -> mag tap), pick the mip level (round-to-nearest for
  * mip-nearest, Q(VX_TEX_LOD_FRAC_BITS) fractional lambda for mip-linear), and sample.
  * Must run with the whole quad active (the derivative SHFL). */
-static LLVMValueRef
-emit_tex_sw_resolved(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
-                     LLVMValueRef shader_bias)
+static void
+emit_tex_resolve_auto_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
+                          LLVMValueRef shader_bias, LLVMValueRef *out_lod,
+                          LLVMValueRef *out_filter)
 {
    LLVMValueRef rho  = emit_tex_grad_rho(t, u, v);
    LLVMValueRef filt = emit_tex_filter_word(t);
@@ -3017,9 +3038,27 @@ emit_tex_sw_resolved(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
    LLVMValueRef lod = LLVMBuildSelect(t->b, mip_active, lam, level, "lod");
    LLVMValueRef mip_bit = LLVMBuildSelect(t->b, mip_active,
       LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), zero32, "");
-   LLVMValueRef sw_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+   *out_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+   *out_lod = lod;
+}
 
-   return emit_tex_sw(t, u, v, lod, sw_filter);
+static LLVMValueRef
+emit_tex_sw_resolved(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
+                     LLVMValueRef shader_bias)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_auto_lod(t, u, v, shader_bias, &lod, &filter);
+   return emit_tex_sw(t, u, v, lod, filter);
+}
+
+/* Same sample, delivered as four floats in the scratch slot. */
+static LLVMValueRef
+emit_tex_sw_resolved_f32(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
+                         LLVMValueRef shader_bias)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_auto_lod(t, u, v, shader_bias, &lod, &filter);
+   return emit_tex_sw_f32(t, u, v, lod, filter);
 }
 
 /* Encode an EXPLICIT float lambda into the LOD value the SW sampler expects for
@@ -3067,8 +3106,9 @@ emit_encode_explicit_lod(struct vp_tr *t, LLVMValueRef lam_bits)
  * but driven by lambda directly: minified when lambda>0 (pick the min tap, else
  * mag); the mip level is encoded by emit_encode_explicit_lod. `lam_bits` is the
  * lod source's raw i32 (f32 bits). */
-static LLVMValueRef
-emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lam_bits)
+static void
+emit_tex_resolve_explicit_lod(struct vp_tr *t, LLVMValueRef lam_bits,
+                              LLVMValueRef *out_lod, LLVMValueRef *out_filter)
 {
    LLVMValueRef filt = emit_tex_filter_word(t);
    LLVMValueRef zerof = LLVMConstReal(t->f32, 0.0);
@@ -3087,13 +3127,29 @@ emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef la
          LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
       LLVMConstInt(t->i32, 0, false), "mip_lin");
 
-   LLVMValueRef lod = emit_encode_explicit_lod(t, lam_bits);
+   *out_lod = emit_encode_explicit_lod(t, lam_bits);
    LLVMValueRef mip_bit = LLVMBuildSelect(t->b,
       LLVMBuildAnd(t->b, minified, mip_lin, ""),
       LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false),
       LLVMConstInt(t->i32, 0, false), "");
-   LLVMValueRef sw_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
-   return emit_tex_sw(t, u, v, lod, sw_filter);
+   *out_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+}
+
+static LLVMValueRef
+emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lam_bits)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_explicit_lod(t, lam_bits, &lod, &filter);
+   return emit_tex_sw(t, u, v, lod, filter);
+}
+
+/* Same sample, delivered as four floats in the scratch slot. */
+static LLVMValueRef
+emit_tex_sw_lod_f32(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lam_bits)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_explicit_lod(t, lam_bits, &lod, &filter);
+   return emit_tex_sw_f32(t, u, v, lod, filter);
 }
 
 /* mip-0 {width,height} from the resident TEX descriptor, as i32. A descriptor
@@ -3243,6 +3299,28 @@ emit_tex_unpack_i32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out,
    emit_tex_store_int8_chan(t, tex, byte, is_signed);
 }
 
+/* Split a packed A8R8G8B8 word into its four source channel bytes (R,G,B,A). */
+static void
+tex_argb_bytes(struct vp_tr *t, LLVMValueRef texel, LLVMValueRef byte[4])
+{
+   static const unsigned shift[4] = { 16, 8, 0, 24 };
+   for (unsigned s = 0; s < 4; s++)
+      byte[s] = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, texel, LLVMConstInt(t->i32, shift[s], false), ""),
+         LLVMConstInt(t->i32, 0xff, false), "");
+}
+
+/* Scale four channel bytes to [0,1]. The multiply-by-reciprocal (not a divide) is
+ * what the SW sampler's float decode also uses, so the two agree bit-for-bit on a
+ * non-float format. */
+static void
+tex_bytes_to_f32(struct vp_tr *t, LLVMValueRef byte[4], LLVMValueRef out[4])
+{
+   LLVMValueRef c1 = LLVMConstReal(t->f32, 1.0 / 255.0);
+   for (unsigned s = 0; s < 4; s++)
+      out[s] = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte[s], t->f32, ""), c1, "");
+}
+
 /* Unpack a packed A8R8G8B8 texel into the tex def's components: floats [0,1] for a
  * float sampler, the raw stored integers for an isampler/usampler. This is the common
  * tail of every packed-texel sampler (2D, array, cube, cube-array, 3D) on both the SW
@@ -3250,13 +3328,8 @@ emit_tex_unpack_i32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out,
 static void
 emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
 {
-   /* ARGB8888 byte position of each source channel (R,G,B,A). */
-   static const unsigned shift[4] = { 16, 8, 0, 24 };
    LLVMValueRef byte[4];
-   for (unsigned s = 0; s < 4; s++)
-      byte[s] = LLVMBuildAnd(t->b,
-         LLVMBuildLShr(t->b, texel, LLVMConstInt(t->i32, shift[s], false), ""),
-         LLVMConstInt(t->i32, 0xff, false), "");
+   tex_argb_bytes(t, texel, byte);
 
    /* An integer sampler must yield the stored value, not a normalised colour.
     * Branch on the BASE type only: lavapipe
@@ -3270,18 +3343,48 @@ emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
       return;
    }
 
-   /* Scale each channel to [0,1], then swizzle. The multiply-by-reciprocal (not a
-    * divide) is what the SW sampler's float decode also uses, so the two unpacks
-    * agree bit-for-bit on a non-float format. */
-   LLVMValueRef c1 = LLVMConstReal(t->f32, 1.0 / 255.0);
-   LLVMValueRef chan[4];
+   LLVMValueRef f[4], chan[4];
+   tex_bytes_to_f32(t, byte, f);
    for (unsigned s = 0; s < 4; s++)
-      chan[s] = LLVMBuildBitCast(t->b,
-         LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte[s], t->f32, ""), c1, ""),
-         t->i32, "");
+      chan[s] = LLVMBuildBitCast(t->b, f[s], t->i32, "");
    LLVMValueRef czero, cone;
    tex_swizzle_float_consts(t, &czero, &cone);
    emit_tex_swizzle_store(t, tex, chan, czero, cone);
+}
+
+/* Expand a packed A8R8G8B8 texel into the float[4] scratch slot, so a packed
+ * producer (the HW TEX unit) can feed the same float unpack the float-returning SW
+ * sampler feeds. Returns the slot. */
+static LLVMValueRef
+emit_tex_argb_to_f32_scratch(struct vp_tr *t, LLVMValueRef texel)
+{
+   LLVMValueRef byte[4], f[4];
+   tex_argb_bytes(t, texel, byte);
+   tex_bytes_to_f32(t, byte, f);
+   LLVMValueRef out = tex_f32_scratch(t);
+   for (unsigned s = 0; s < 4; s++) {
+      LLVMValueRef idx[2] = { LLVMConstInt(t->i32, 0, false),
+                              LLVMConstInt(t->i32, s, false) };
+      LLVMValueRef p = LLVMBuildGEP2(t->b, LLVMArrayType(t->f32, 4), out, idx, 2, "");
+      LLVMBuildStore(t->b, f[s], p);
+   }
+   return out;
+}
+
+/* The software arm of a 2D sampling op, in whichever carrier the sampler's result
+ * type calls for: textureLod samples the explicit lambda, textureBias adds its bias
+ * to the quad-gradient LOD, and plain texture() takes the gradient alone. */
+static LLVMValueRef
+emit_tex_sw_arm(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef ux, LLVMValueRef vx,
+                LLVMValueRef lod_bits, LLVMValueRef bias_q8, bool as_f32)
+{
+   if (tex->op == nir_texop_txl)
+      return as_f32 ? emit_tex_sw_lod_f32(t, ux, vx, lod_bits)
+                    : emit_tex_sw_lod(t, ux, vx, lod_bits);
+
+   LLVMValueRef bias = (tex->op == nir_texop_txb) ? bias_q8 : NULL;
+   return as_f32 ? emit_tex_sw_resolved_f32(t, ux, vx, bias)
+                 : emit_tex_sw_resolved(t, ux, vx, bias);
 }
 
 /* sampler2DShadow: gfx_tex_shadow_sw(&texstate[0], x, y, ref_bits, filter) --
@@ -3798,123 +3901,68 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
     * mipmapped sampler stays on the fast HW TEX path at the base level. mip-enable is
     * a uniform descriptor bit, so the branch never diverges. On a TEX-less device
     * (t->sw_tex) every sample is software. Explicit-LOD/bias (txl/txb) have no
-    * derivatives and take the base level. */
-   LLVMValueRef texel;
-   if (tex->op == nir_texop_tex && !t->sw_tex) {
-      LLVMValueRef filt = emit_tex_filter_word(t);
-      /* Route to the SW sampler when the sampler is mipmapped, the texture is
-       * NPOT (the FF vx_tex4 unit is POT-only) or its format is above the FF set
-       * (the FF unit has no decoder or texel stride for it); otherwise the fast HW
-       * path. All are uniform descriptor bits, so the branch never diverges. */
-      LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
-         LLVMBuildAnd(t->b, filt,
-            LLVMConstInt(t->i32,
-               GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
-               GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
-         LLVMConstInt(t->i32, 0, false), "tex_use_sw");
-      LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
-      LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_sw");
-      LLVMBasicBlockRef bb_hw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_hw");
-      LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_merge");
-      LLVMBuildCondBr(t->b, use_sw, bb_sw, bb_hw);
+    * derivatives and take the base level.
+    *
+    * The sample is carried as four floats for a float sampler -- a float-format texel
+    * leaves [0,1] and cannot survive the packed 8-bit word -- and as that packed word
+    * for an integer sampler, whose formats are all 8-bit and FF. The carrier follows
+    * the sampler's static result type, so only one form is ever emitted. */
+   nir_alu_type dbase = nir_alu_type_get_base_type(tex->dest_type);
+   const bool as_f32 = !(dbase == nir_type_int || dbase == nir_type_uint);
+   LLVMValueRef lod_bits = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
 
-      LLVMPositionBuilderAtEnd(t->b, bb_sw);
-      LLVMValueRef texel_sw = emit_tex_sw_resolved(t, ux, vx, NULL);
-      LLVMBasicBlockRef end_sw = LLVMGetInsertBlock(t->b);
-      LLVMBuildBr(t->b, bb_mg);
-
-      LLVMPositionBuilderAtEnd(t->b, bb_hw);
-      LLVMValueRef texel_hw = emit_tex_hw(t, ux, vx, LLVMConstInt(t->i32, 0, false));
-      LLVMBasicBlockRef end_hw = LLVMGetInsertBlock(t->b);
-      LLVMBuildBr(t->b, bb_mg);
-
-      LLVMPositionBuilderAtEnd(t->b, bb_mg);
-      texel = LLVMBuildPhi(t->b, t->i32, "texel");
-      LLVMValueRef vals[2] = { texel_sw, texel_hw };
-      LLVMBasicBlockRef bbs[2] = { end_sw, end_hw };
-      LLVMAddIncoming(texel, vals, bbs, 2);
-   } else if (tex->op == nir_texop_tex) {
-      /* TEX-less device: software always. Resolves min/mag + mip like the HW-device
-       * SW branch (a non-mipmapped sampler falls out as magnified -> base level). */
-      texel = emit_tex_sw_resolved(t, ux, vx, NULL);
-   } else if (tex->op == nir_texop_txl) {
-      /* textureLod: sample the explicit lambda. On a HW-TEX device a mipmapped
-       * sampler routes to the SW sampler (which resolves the level from lambda);
-       * a non-mipmapped sampler stays on the HW path at level 0. mip-enable is a
-       * uniform descriptor bit, so the branch never diverges. */
-      LLVMValueRef lod_bits = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
-      if (t->sw_tex) {
-         texel = emit_tex_sw_lod(t, ux, vx, lod_bits);
-      } else {
-         /* SW sampler when mipmapped, NPOT (FF vx_tex4 is POT-only) or an
-          * extended format (no FF decoder for it); else HW. */
-         LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
-            LLVMBuildAnd(t->b, emit_tex_filter_word(t),
-               LLVMConstInt(t->i32,
-                  GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
-                  GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
-            LLVMConstInt(t->i32, 0, false), "txl_use_sw");
-         LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
-         LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "txl_sw");
-         LLVMBasicBlockRef bb_hw = LLVMAppendBasicBlockInContext(t->ctx, fn, "txl_hw");
-         LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "txl_merge");
-         LLVMBuildCondBr(t->b, use_sw, bb_sw, bb_hw);
-
-         LLVMPositionBuilderAtEnd(t->b, bb_sw);
-         LLVMValueRef texel_sw = emit_tex_sw_lod(t, ux, vx, lod_bits);
-         LLVMBasicBlockRef end_sw = LLVMGetInsertBlock(t->b);
-         LLVMBuildBr(t->b, bb_mg);
-
-         LLVMPositionBuilderAtEnd(t->b, bb_hw);
-         LLVMValueRef texel_hw = emit_tex_hw(t, ux, vx, LLVMConstInt(t->i32, 0, false));
-         LLVMBasicBlockRef end_hw = LLVMGetInsertBlock(t->b);
-         LLVMBuildBr(t->b, bb_mg);
-
-         LLVMPositionBuilderAtEnd(t->b, bb_mg);
-         texel = LLVMBuildPhi(t->b, t->i32, "texel");
-         LLVMValueRef vals[2] = { texel_sw, texel_hw };
-         LLVMBasicBlockRef bbs[2] = { end_sw, end_hw };
-         LLVMAddIncoming(texel, vals, bbs, 2);
-      }
-   } else {
-      /* txb (textureBias): auto-LOD from the quad gradient plus the shader bias.
-       * Route like texture(): a mipmapped, NPOT or extended-format sampler resolves
-       * in SW (auto-LOD + bias + min/mag tap), else the fast HW path at the base
-       * level (a bias on a non-mipmapped sampler has no other level to reach). The
-       * routing bits are uniform, so the branch never diverges (derivatives safe). */
-      if (t->sw_tex) {
-         texel = emit_tex_sw_resolved(t, ux, vx, bias_q8);
-      } else {
-         LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
-            LLVMBuildAnd(t->b, emit_tex_filter_word(t),
-               LLVMConstInt(t->i32,
-                  GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
-                  GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
-            LLVMConstInt(t->i32, 0, false), "txb_use_sw");
-         LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
-         LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "txb_sw");
-         LLVMBasicBlockRef bb_hw = LLVMAppendBasicBlockInContext(t->ctx, fn, "txb_hw");
-         LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "txb_merge");
-         LLVMBuildCondBr(t->b, use_sw, bb_sw, bb_hw);
-
-         LLVMPositionBuilderAtEnd(t->b, bb_sw);
-         LLVMValueRef texel_sw = emit_tex_sw_resolved(t, ux, vx, bias_q8);
-         LLVMBasicBlockRef end_sw = LLVMGetInsertBlock(t->b);
-         LLVMBuildBr(t->b, bb_mg);
-
-         LLVMPositionBuilderAtEnd(t->b, bb_hw);
-         LLVMValueRef texel_hw = emit_tex_hw(t, ux, vx, LLVMConstInt(t->i32, 0, false));
-         LLVMBasicBlockRef end_hw = LLVMGetInsertBlock(t->b);
-         LLVMBuildBr(t->b, bb_mg);
-
-         LLVMPositionBuilderAtEnd(t->b, bb_mg);
-         texel = LLVMBuildPhi(t->b, t->i32, "texel");
-         LLVMValueRef vals[2] = { texel_sw, texel_hw };
-         LLVMBasicBlockRef bbs[2] = { end_sw, end_hw };
-         LLVMAddIncoming(texel, vals, bbs, 2);
-      }
+   if (t->sw_tex) {
+      /* TEX-less device: software always. The SW arm resolves min/mag + mip itself
+       * (a non-mipmapped sampler falls out as magnified -> base level). */
+      LLVMValueRef r = emit_tex_sw_arm(t, tex, ux, vx, lod_bits, bias_q8, as_f32);
+      if (as_f32)
+         emit_tex_unpack_f32(t, tex, r);
+      else
+         emit_tex_unpack(t, tex, r);
+      return;
    }
 
+   /* Route to the SW sampler when the sampler is mipmapped, the texture is NPOT (the
+    * FF vx_tex4 unit is POT-only) or its format is above the FF set (the FF unit has
+    * no decoder or texel stride for it); otherwise the fast HW path. All are uniform
+    * descriptor bits, so the branch never diverges (derivatives safe). A float format
+    * always sets the extended-format bit, so the HW unit never sees a wide texel. */
+   LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, emit_tex_filter_word(t),
+         LLVMConstInt(t->i32,
+            GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
+            GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
+      LLVMConstInt(t->i32, 0, false), "tex_use_sw");
+   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
+   LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_sw");
+   LLVMBasicBlockRef bb_hw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_hw");
+   LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_merge");
+   LLVMBuildCondBr(t->b, use_sw, bb_sw, bb_hw);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_sw);
+   LLVMValueRef texel_sw = emit_tex_sw_arm(t, tex, ux, vx, lod_bits, bias_q8, as_f32);
+   LLVMBasicBlockRef end_sw = LLVMGetInsertBlock(t->b);
+   LLVMBuildBr(t->b, bb_mg);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_hw);
+   LLVMValueRef texel_hw = emit_tex_hw(t, ux, vx, LLVMConstInt(t->i32, 0, false));
+   if (as_f32)
+      emit_tex_argb_to_f32_scratch(t, texel_hw);
+   LLVMBasicBlockRef end_hw = LLVMGetInsertBlock(t->b);
+   LLVMBuildBr(t->b, bb_mg);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_mg);
+   if (as_f32) {
+      /* Both arms filled the one scratch slot, so there is nothing to merge: the
+       * slot is the entry block's alloca, which dominates this block whichever arm
+       * ran. */
+      emit_tex_unpack_f32(t, tex, texel_sw);
+      return;
+   }
+   LLVMValueRef texel = LLVMBuildPhi(t->b, t->i32, "texel");
+   LLVMValueRef vals[2] = { texel_sw, texel_hw };
+   LLVMBasicBlockRef bbs[2] = { end_sw, end_hw };
+   LLVMAddIncoming(texel, vals, bbs, 2);
    emit_tex_unpack(t, tex, texel);
 }
 
