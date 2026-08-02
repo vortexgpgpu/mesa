@@ -418,6 +418,14 @@ vp_set_constant_buffer(struct pipe_context *pipe, enum pipe_shader_type shader,
       vp->fs_cbuf_off[index] = cb ? cb->buffer_offset : 0u;
       vp->fs_cbuf_sz[index]  = cb ? cb->buffer_size : 0u;
    }
+   /* Same for the vertex stage. Without this the driver has no record of a
+    * vertex shader's UBOs or push constants at all, and its load_ubo reads
+    * resolve against arg-block slots that carry vertex meanings instead. */
+   if (shader == PIPE_SHADER_VERTEX && index < 8) {
+      vp->vs_cbuf[index]     = cb ? cb->buffer : NULL;
+      vp->vs_cbuf_off[index] = cb ? cb->buffer_offset : 0u;
+      vp->vs_cbuf_sz[index]  = cb ? cb->buffer_size : 0u;
+   }
    vp->lp_set_constant_buffer(pipe, shader, index, take_ownership, cb);
 }
 
@@ -2317,6 +2325,23 @@ vp_draw_vbo(struct pipe_context *pipe,
             fs_consts.data[i] = (const uint8_t *)m + vp->fs_cbuf_off[i];
             fs_consts.size[i] = vp->fs_cbuf_sz[i];
          }
+         /* Same gather for the vertex stage, which needs its own table: the VS
+          * overlays vertex meanings on the arg-block slots the compute path
+          * uses for constant buffers, so it cannot read them from there. */
+         struct vp_fs_consts vs_consts;
+         memset(&vs_consts, 0, sizeof(vs_consts));
+         vs_consts.descs     = vs->descs;
+         vs_consts.num_descs = vs->num_descs;
+         struct pipe_transfer *vscbxfer[GFX_FS_DESC_SLOTS] = { NULL };
+         for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++) {
+            if (!vp->vs_cbuf[i] || !vp->vs_cbuf_sz[i])
+               continue;
+            void *m = pipe_buffer_map(pipe, vp->vs_cbuf[i], PIPE_MAP_READ,
+                                      &vscbxfer[i]);
+            if (!m) { vscbxfer[i] = NULL; continue; }
+            vs_consts.data[i] = (const uint8_t *)m + vp->vs_cbuf_off[i];
+            vs_consts.size[i] = vp->vs_cbuf_sz[i];
+         }
          if (drew)
             drew = vp_raster_draw(vp->dev, vp->raster_pool,
                                   vs->vxbin, vs->vxbin_size,
@@ -2331,9 +2356,11 @@ vp_draw_vbo(struct pipe_context *pipe,
                                   tex_used ? tex_dev : 0, tex_used ? &tex : NULL,
                                   cull_mode, fs_sw_tex, fs_sw_om, fs_sw_raster,
                                   vp_sx, vp_tx, vp_sy, vp_ty,
-                                  &fs_consts, use_mrt ? &mrt : NULL);
+                                  &fs_consts, &vs_consts, use_mrt ? &mrt : NULL);
          for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++)
             if (cbxfer[i]) pipe_buffer_unmap(pipe, cbxfer[i]);
+         for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++)
+            if (vscbxfer[i]) pipe_buffer_unmap(pipe, vscbxfer[i]);
          if (drew) {
             vp->rfb_dirty = true;   /* device colour ahead of the resource */
             vp->draws_device++;

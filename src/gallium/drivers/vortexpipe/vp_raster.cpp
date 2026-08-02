@@ -230,6 +230,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                bool sw_tex, bool sw_om, bool sw_raster,
                float vp_sx, float vp_tx, float vp_sy, float vp_ty,
                const struct vp_fs_consts *fs_consts,
+               const struct vp_fs_consts *vs_consts,
                const struct vp_mrt_params *mrt)
 {
    /* A draw targeting >1 colour attachment merges in software (the FF
@@ -299,6 +300,13 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
    vx_buffer_h fs_cbuf_bufs[GFX_FS_DESC_SLOTS] = { NULL };
    vx_buffer_h fs_res_bufs[VP_MAX_DESCS] = { NULL };   /* UBO/SSBO resources */
    uint8_t    *fs_desc_stage[GFX_FS_DESC_SLOTS] = { NULL }; /* per-set relocated blob */
+   /* The same set for the vertex stage. The VS overlays its own meanings on
+    * arg-block slots 0-4, so it reaches its constant buffers only through its
+    * own table, handed to it in VP_ARG_VS_DESC. */
+   vx_buffer_h vs_desc_buf = NULL;
+   vx_buffer_h vs_cbuf_bufs[GFX_FS_DESC_SLOTS] = { NULL };
+   vx_buffer_h vs_res_bufs[VP_MAX_DESCS] = { NULL };
+   uint8_t    *vs_desc_stage[GFX_FS_DESC_SLOTS] = { NULL };
    vx_buffer_h mrtbuf = NULL;                          /* gfx_sw_omcolor_t[] */
 
    /* kernels resolved from the residency caches below (the modules persist
@@ -728,6 +736,74 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       vs_argblk[3] = instanced ? verts_per_instance : 0;
       vs_argblk[4] = first_instance;
 
+      /* slot VP_ARG_VS_DESC: the vertex stage's constant-buffer table, built
+       * exactly like the fragment one above -- upload each bound VS constant
+       * buffer, relocating any UBO/SSBO descriptor's lp_jit_buffer.ptr
+       * host->device so the VS's load_ubo/load_ssbo dereference resolves on
+       * device, then a table of their device base addresses. Always uploaded,
+       * zero-filled when the VS binds nothing, so the VS's table reads never
+       * dereference a null pointer. Slots 0-4 carry vertex meanings, so without
+       * this table a VS UBO read resolves against the attribute table and a
+       * push-constant read against the VS output buffer. */
+      uint64_t vs_desc_table[GFX_FS_DESC_SLOTS] = { 0 };
+      for (uint32_t i = 0; vs_consts && i < GFX_FS_DESC_SLOTS; i++) {
+         if (!vs_consts->data[i] || !vs_consts->size[i])
+            continue;
+         const void *upload = vs_consts->data[i];
+         bool has_desc = false;
+         for (uint32_t d = 0; d < vs_consts->num_descs && d < VP_MAX_DESCS; d++)
+            if (vs_consts->descs[d].kind == VP_DESC_BUFFER &&
+                vs_consts->descs[d].cbuf_index == i) { has_desc = true; break; }
+         if (has_desc) {
+            vs_desc_stage[i] = (uint8_t *)malloc(vs_consts->size[i]);
+            if (!vs_desc_stage[i]) { mesa_loge("vortexpipe: raster: vs desc OOM"); goto done; }
+            memcpy(vs_desc_stage[i], vs_consts->data[i], vs_consts->size[i]);
+            for (uint32_t d = 0; d < vs_consts->num_descs && d < VP_MAX_DESCS; d++) {
+               if (vs_consts->descs[d].kind != VP_DESC_BUFFER ||
+                   vs_consts->descs[d].cbuf_index != i)
+                  continue;
+               uint32_t off = vs_consts->descs[d].offset;
+               if (off + VP_JIT_BUF_SIZE + 4u > vs_consts->size[i])
+                  continue;
+               uint64_t host_ptr = 0; uint32_t num_elems = 0;
+               memcpy(&host_ptr,  vs_desc_stage[i] + off + VP_JIT_BUF_PTR,  sizeof host_ptr);
+               memcpy(&num_elems, vs_desc_stage[i] + off + VP_JIT_BUF_SIZE, sizeof num_elems);
+               uint32_t rsz = num_elems * (vs_consts->descs[d].elem_bytes
+                                           ? vs_consts->descs[d].elem_bytes : 1u);
+               if (!host_ptr || !rsz)
+                  continue;
+               VP_CHECK(vx_buffer_create(dev, rsz, 0, &vs_res_bufs[d]),
+                        "vx_buffer_create(vs_res)");
+               uint64_t res_dev = 0;
+               VP_CHECK(vx_buffer_address(vs_res_bufs[d], &res_dev),
+                        "vx_buffer_address(vs_res)");
+               VP_CHECK(vx_enqueue_write(q, vs_res_bufs[d], 0,
+                                         (void *)(uintptr_t)host_ptr, rsz, 0, NULL, NULL),
+                        "vx_enqueue_write(vs_res)");
+               memcpy(vs_desc_stage[i] + off + VP_JIT_BUF_PTR, &res_dev, sizeof res_dev);
+            }
+            upload = vs_desc_stage[i];
+         }
+         VP_CHECK(vx_buffer_create(dev, vs_consts->size[i], 0, &vs_cbuf_bufs[i]),
+                  "vx_buffer_create(vs_cbuf)");
+         uint64_t cb_dev = 0;
+         VP_CHECK(vx_buffer_address(vs_cbuf_bufs[i], &cb_dev),
+                  "vx_buffer_address(vs_cbuf)");
+         VP_CHECK(vx_enqueue_write(q, vs_cbuf_bufs[i], 0, upload,
+                                   vs_consts->size[i], 0, NULL, NULL),
+                  "vx_enqueue_write(vs_cbuf)");
+         vs_desc_table[i] = cb_dev;
+      }
+      VP_CHECK(vx_buffer_create(dev, sizeof(vs_desc_table), 0, &vs_desc_buf),
+               "vx_buffer_create(vs_desc)");
+      uint64_t vs_desc_dev = 0;
+      VP_CHECK(vx_buffer_address(vs_desc_buf, &vs_desc_dev),
+               "vx_buffer_address(vs_desc)");
+      VP_CHECK(vx_enqueue_write(q, vs_desc_buf, 0, vs_desc_table,
+                                sizeof(vs_desc_table), 0, NULL, NULL),
+               "vx_enqueue_write(vs_desc)");
+      vs_argblk[VP_ARG_VS_DESC] = vs_desc_dev;
+
       /* FS launch fills every HW lane: block = threads × warps (one CTA/core),
        * grid = cores. (nt/nw/nc queried above for the VS geometry.)
        * Launch descriptors + per-stage args must outlive vx_enqueue_draw
@@ -964,6 +1040,13 @@ done:
    for (vx_buffer_h b : fs_res_bufs)
       if (b) vx_buffer_release(b);
    for (uint8_t *s : fs_desc_stage)
+      if (s) free(s);
+   if (vs_desc_buf) vx_buffer_release(vs_desc_buf);
+   for (vx_buffer_h b : vs_cbuf_bufs)
+      if (b) vx_buffer_release(b);
+   for (vx_buffer_h b : vs_res_bufs)
+      if (b) vx_buffer_release(b);
+   for (uint8_t *s : vs_desc_stage)
       if (s) free(s);
    if (mrtbuf) vx_buffer_release(mrtbuf);
    if (q)         vx_queue_release(q);

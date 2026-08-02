@@ -203,6 +203,14 @@ struct vp_context {
    struct pipe_resource *fs_cbuf[8];
    unsigned              fs_cbuf_off[8];
    unsigned              fs_cbuf_sz[8];
+   /* Vertex-stage constant buffers, by index, with the same meaning per index
+    * as the fragment set above. The vertex stage overlays its own meanings on
+    * arg-block slots 0-4, so it cannot reach these the way compute does; the
+    * draw path uploads them and builds a VS descriptor table passed in
+    * VP_ARG_VS_DESC. */
+   struct pipe_resource *vs_cbuf[8];
+   unsigned              vs_cbuf_off[8];
+   unsigned              vs_cbuf_sz[8];
    /* Raw compute shader buffers bound via set_shader_buffers (distinct from
     * the descriptor-set SSBOs, which live in the set-0 blob at cbuf[1]).
     * lavapipe binds internal buffers here — e.g. the RT trace-ray command

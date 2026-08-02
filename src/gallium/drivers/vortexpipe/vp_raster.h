@@ -166,6 +166,7 @@ bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                     bool sw_tex, bool sw_om, bool sw_raster,
                     float vp_sx, float vp_tx, float vp_sy, float vp_ty,
                     const struct vp_fs_consts *fs_consts,
+                    const struct vp_fs_consts *vs_consts,
                     const struct vp_mrt_params *mrt);
 
 #ifdef __cplusplus

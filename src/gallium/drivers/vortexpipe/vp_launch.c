@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include "vp_launch.h"
+#include "gfx_fs_desc_abi.h"     /* GFX_FS_DESC_SLOTS (VS constant-buffer table) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -864,7 +865,7 @@ vp_launch_vs(vx_device_h dev,
    vx_queue_h  q    = NULL;
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
-   vx_buffer_h obuf = NULL, tbuf = NULL;
+   vx_buffer_h obuf = NULL, tbuf = NULL, dtbuf = NULL;
    vx_buffer_h vbufs_dev[8] = { NULL };   /* one per distinct vertex buffer */
    char vxpath[512];
    const char *vs_tmpdir = getenv("TMPDIR");
@@ -948,9 +949,25 @@ vp_launch_vs(vx_device_h dev,
    VP_CHECK(vx_buffer_address(obuf, &out_dev), "vx_buffer_address");
 
    /* arg block: slot 0 -> output buffer device address,
-    *            slot 1 -> vertex attribute table (0 if self-contained) */
+    *            slot 1 -> vertex attribute table (0 if self-contained),
+    *            VP_ARG_VS_DESC -> VS constant-buffer table (see below) */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
    argblk[0] = out_dev;
+
+   /* This standalone path (the llvmpipe raster fallback) has no descriptor
+    * state, but the VS prologue always dereferences VP_ARG_VS_DESC to reach
+    * its constant buffers, so the slot must hold a real table rather than 0.
+    * Upload a zero-filled one: a VS that reads a UBO here still gets wrong
+    * data -- this path never supported descriptors -- but it does not fault.
+    * Wiring real constant buffers through here is tracked separately. */
+   uint64_t vs_desc_table[GFX_FS_DESC_SLOTS] = { 0 };
+   VP_CHECK(vx_buffer_create(dev, sizeof(vs_desc_table), 0, &dtbuf),
+            "vx_buffer_create(vs_desc)");
+   uint64_t vs_desc_dev = 0;
+   VP_CHECK(vx_buffer_address(dtbuf, &vs_desc_dev), "vx_buffer_address(vs_desc)");
+   VP_CHECK(vx_enqueue_write(q, dtbuf, 0, vs_desc_table, sizeof(vs_desc_table),
+                             0, NULL, NULL), "vx_enqueue_write(vs_desc)");
+   argblk[VP_ARG_VS_DESC] = vs_desc_dev;
 
    /* Vertex buffer + attribute table: upload the interleaved vertex
     * buffer, then a table indexed by driver_location holding the
@@ -1018,6 +1035,7 @@ vp_launch_vs(vx_device_h dev,
 
 done:
    if (tbuf) vx_buffer_release(tbuf);
+   if (dtbuf) vx_buffer_release(dtbuf);
    for (unsigned j = 0; j < 8; j++) if (vbufs_dev[j]) vx_buffer_release(vbufs_dev[j]);
    if (!ok && obuf) vx_buffer_release(obuf);   /* on success the caller owns obuf */
    if (kbuf) vx_kernel_release(kbuf);

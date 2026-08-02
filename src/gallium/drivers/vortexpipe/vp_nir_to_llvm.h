@@ -74,7 +74,19 @@ void vp_free_ir(char *ir);
 #define VP_ARG_GRID_BASE_Z  3   /* base_group_z                        */
 #define VP_ARG_SSBO_BASE 4
 #define VP_MAX_SSBO      4
-#define VP_ARG_SLOTS     (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
+
+/* The VERTEX stage overlays its own meanings on slots 0-4 (output record
+ * buffer, attribute table, index buffer, verts-per-instance, base instance --
+ * see vp_raster_draw's vs_argblk), so the slots above describe COMPUTE only.
+ * A vertex shader therefore cannot reach its constant buffers through slot 0/1
+ * the way compute does; it gets its own descriptor table here, at a slot no
+ * other stage assigns a meaning to. Its contents are the same
+ * i64[GFX_FS_DESC_SLOTS] of constant-buffer device base addresses the fragment
+ * stage receives, and the VS prologue routes it through t->arg so the shared
+ * load_ubo / load_ssbo / load_push_constant lowering indexes the table rather
+ * than the arg block. 0 for a VS that binds no constant buffers. */
+#define VP_ARG_VS_DESC   (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
+#define VP_ARG_SLOTS     (VP_ARG_VS_DESC + 1)
 
 /* A descriptor a compute kernel reaches through set-0's descriptor
  * buffer (constant-buffer index 1):

@@ -5258,6 +5258,19 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       LLVMBasicBlockRef vin_bb[2] = { from_bb, idx_bb };
       LLVMAddIncoming(vphi, vin_vals, vin_bb, 2);
       t.vid = vphi;
+
+      /* Every arg-block slot this stage reads is resolved above, so t.arg can
+       * now be repointed at the VS constant-buffer table (VP_ARG_VS_DESC). The
+       * shared load_ubo / load_ssbo / load_push_constant lowering indexes t.arg
+       * by constant-buffer index, exactly as the fragment stage does; slots 0-4
+       * carry vertex meanings, so reading the arg block directly would return
+       * the attribute table's address for a UBO and the output buffer's for a
+       * push constant. vp_raster_draw always supplies the table (zero-filled
+       * when the VS binds nothing), so this never yields a null t.arg. */
+      LLVMValueRef dsc   = LLVMConstInt(t.i32, VP_ARG_VS_DESC, false);
+      LLVMValueRef dscp  = LLVMBuildGEP2(t.b, t.i64, t.arg, &dsc, 1, "");
+      LLVMValueRef dsc64 = LLVMBuildLoad2(t.b, t.i64, dscp, "vsdesc64");
+      t.arg = LLVMBuildIntToPtr(t.b, dsc64, t.ptr, "vsdesc");
    }
 
    /* Fragment-shader prologue: assign varying/output slots. fs_main's
