@@ -3896,9 +3896,19 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
 
    /* Accept auto-LOD (tex) and explicit-LOD/bias (txl/txb) sampling. Ray-tracing
     * and compute shaders emit txl since they have no implicit derivatives. */
-   if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
-        tex->op != nir_texop_txb) || !u || !v) {
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txb) {
       mesa_logw("vortexpipe: vp_nir_to_llvm: unsupported texture op %d", tex->op);
+      t->ok = false;
+      return;
+   }
+   /* A sampler dimensionality whose coordinate has no second component (1D and
+    * 1D-array) leaves v unset. That is a missing dimension, not a rejected op,
+    * and reporting it as one sends the reader to the op switch. */
+   if (!u || !v) {
+      mesa_logw("vortexpipe: vp_nir_to_llvm: texture op %d: no %s coordinate "
+                "component (unsupported sampler dimensionality)",
+                tex->op, u ? "second" : "first");
       t->ok = false;
       return;
    }
