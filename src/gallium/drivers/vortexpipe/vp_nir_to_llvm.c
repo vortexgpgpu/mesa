@@ -3636,6 +3636,14 @@ emit_tex_3d(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef u, LLVMValueRef v,
 static void
 emit_tex(struct vp_tr *t, nir_tex_instr *tex)
 {
+   /* Every texture route -- the SW sampler and the HW TEX path alike -- reads the
+    * resident descriptor table for the filter word and the log2 dimensions. Only
+    * the fragment entry carries that table, so a texture op in any other stage has
+    * no descriptor to read. Refuse the shader rather than build a GEP on a null. */
+   if (!t->fs_texstate) {
+      t->ok = false;
+      return;
+   }
    LLVMValueRef u = NULL, v = NULL, lod_int = NULL, bias_f = NULL;
    LLVMValueRef off_x = NULL, off_y = NULL, cmp = NULL;
    unsigned coord_ssa = 0;
