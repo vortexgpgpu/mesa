@@ -88,12 +88,14 @@ namespace graphics = vortex::graphics;
       }                                                                 \
    } while (0)
 
-/* exact log2 of a power-of-two texture dimension */
+/* exact log2 of a power-of-two texture dimension; the bound keeps the shift
+ * count in range, since a dimension above 2^31 would otherwise shift by 32 and
+ * spin here forever */
 static inline uint32_t
 vp_log2u(uint32_t n)
 {
    uint32_t l = 0;
-   while ((1u << l) < n)
+   while (l < 32 && (1u << l) < n)
       l++;
    return l;
 }
