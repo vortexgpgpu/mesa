@@ -835,6 +835,12 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
          features->shaderSharedFloat32AtomicMinMax = false;
          features->shaderImageFloat32AtomicMinMax  = false;
          features->sparseImageFloat32AtomicMinMax  = false;
+         /* No device-address path: a shader cannot dereference a raw buffer
+          * address because nothing maps a buffer allocation into the device
+          * page tables, so the address it reads is unmapped. */
+         features->bufferDeviceAddress              = false;
+         features->bufferDeviceAddressCaptureReplay = false;
+         features->bufferDeviceAddressMultiDevice   = false;
       }
    }
 }
