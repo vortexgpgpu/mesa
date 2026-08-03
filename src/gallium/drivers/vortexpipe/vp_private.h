@@ -166,6 +166,7 @@ struct vp_sampler_cso {
    uint32_t min_lod;           /* sampler LOD clamp lower bound, Q(VX_TEX_LOD_FRAC_BITS) */
    uint32_t max_lod;           /* sampler LOD clamp upper bound, Q(VX_TEX_LOD_FRAC_BITS) */
    int32_t  lod_bias;          /* sampler LOD bias, signed Q(VX_TEX_LOD_FRAC_BITS) */
+   uint32_t border;            /* CLAMP_TO_BORDER colour, ARGB8888 */
 };
 
 /* Captured vertex-input layout. The VS kernel fetches one thread's

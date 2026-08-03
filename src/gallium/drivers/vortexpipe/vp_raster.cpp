@@ -565,8 +565,12 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
             | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u)
             | (tex_pot ? 0u : GFX_SW_TEX_FILTER_NPOT)
             | (texstate.format > (uint32_t)VX_TEX_FORMAT_FF_MAX
-                  ? GFX_SW_TEX_FILTER_EXT_FORMAT : 0u);
+                  ? GFX_SW_TEX_FILTER_EXT_FORMAT : 0u)
+            | ((tex->wrap_u == VX_TEX_WRAP_BORDER ||
+                tex->wrap_v == VX_TEX_WRAP_BORDER)
+                  ? GFX_SW_TEX_FILTER_BORDER : 0u);
          texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
+         texstate.border = tex->border;
          /* Carry the mip-0 integer dims so the SW sampler can address NPOT
           * textures (multiply addressing). POT textures leave width==1<<logdim
           * so the sampler keeps the bit-exact shift path. */

@@ -709,10 +709,29 @@ static uint32_t
 vp_vx_wrap(unsigned w)
 {
    switch (w) {
-   case PIPE_TEX_WRAP_REPEAT:        return VX_TEX_WRAP_REPEAT;
-   case PIPE_TEX_WRAP_MIRROR_REPEAT: return VX_TEX_WRAP_MIRROR;
-   default:                          return VX_TEX_WRAP_CLAMP;
+   case PIPE_TEX_WRAP_REPEAT:          return VX_TEX_WRAP_REPEAT;
+   case PIPE_TEX_WRAP_MIRROR_REPEAT:   return VX_TEX_WRAP_MIRROR;
+   case PIPE_TEX_WRAP_CLAMP_TO_BORDER: return VX_TEX_WRAP_BORDER;
+   default:                            return VX_TEX_WRAP_CLAMP;
    }
+}
+
+/* The sampler's border colour as the ARGB8888 word the software sampler
+ * substitutes for an out-of-range tap. Only the standard transparent/opaque
+ * black and opaque white are expressible exactly; a custom colour quantizes to
+ * eight bits per channel. */
+static uint32_t
+vp_vx_border(const struct pipe_sampler_state *s)
+{
+   float c[4];
+   for (unsigned i = 0; i < 4; i++) {
+      float f = s->border_color.f[i];
+      c[i] = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+   }
+   return ((uint32_t)(c[3] * 255.0f + 0.5f) << 24)
+        | ((uint32_t)(c[0] * 255.0f + 0.5f) << 16)
+        | ((uint32_t)(c[1] * 255.0f + 0.5f) << 8)
+        |  (uint32_t)(c[2] * 255.0f + 0.5f);
 }
 
 /* Capture the bound texture + sampler for the Vortex TEX unit.
@@ -792,6 +811,7 @@ vp_create_texture_handle(struct pipe_context *pipe,
       vp->cur_sampler_store.wrap_u = vp_vx_wrap(state->wrap_s);
       vp->cur_sampler_store.wrap_v = vp_vx_wrap(state->wrap_t);
       vp->cur_sampler_store.wrap_w = vp_vx_wrap(state->wrap_r);
+      vp->cur_sampler_store.border = vp_vx_border(state);
       /* Vulkan has no "disable mipmapping" flag; a non-mipmapped NEAREST/LINEAR
        * sampler is expressed as max_lod == 0.25, which clamps the LOD so only the
        * base level is ever read. A level >= 1 is reachable only when max_lod > 0.5
@@ -2219,10 +2239,13 @@ vp_draw_vbo(struct pipe_context *pipe,
                                             : VX_TEX_WRAP_CLAMP;
                tex.wrap_w = vp->cur_sampler ? vp->cur_sampler->wrap_w
                                             : VX_TEX_WRAP_CLAMP;
+               tex.border = vp->cur_sampler ? vp->cur_sampler->border : 0u;
                /* sampler3D: depth-slice count drives the third-coordinate slice
                 * selection. samplerCubeArray: the cube count bounds the array-layer
-                * clamp (selectLayer). 0 for any other texture (2D/array/plain cube).
-                * Cube-ness rides on the view target, not the resource. */
+                * clamp. A 1D/2D array carries its layer count, which bounds the
+                * layer clamp and answers textureSize's third component. 0 for a
+                * plain 2D or cube texture. Cube-ness rides on the view target, not
+                * the resource. */
                tex.depth = (vp->cur_tex->target == PIPE_TEXTURE_3D)
                               ? vp->cur_tex->depth0
                          : (vp->cur_tex_target == PIPE_TEXTURE_CUBE_ARRAY)

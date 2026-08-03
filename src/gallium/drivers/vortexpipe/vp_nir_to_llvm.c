@@ -2670,18 +2670,22 @@ emit_tex_fetch_array_f32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y,
 
 /* textureGather: gfx_tex_gather_sw(&texstate[0], x, y, comp) -- channel `comp` of
  * the 2x2 footprint at (x,y), base level, packed in GL gather order as bytes
- * x | y<<8 | z<<16 | w<<24. Unpack to the def's vec4 as floats in [0,1]. */
+ * x | y<<8 | z<<16 | w<<24. Unpack to the def's vec4 as floats in [0,1]. An array
+ * sampler passes its layer, which selects the slice the footprint is taken from. */
 static void
-emit_tex_gather(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y)
+emit_tex_gather(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y,
+                LLVMValueRef layer)
 {
-   LLVMTypeRef params[4] = { t->ptr, t->i32, t->i32, t->i32 };
-   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 4, false);
-   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_gather_sw");
+   const unsigned n = layer ? 5 : 4;
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, n, false);
+   const char *name = layer ? "gfx_tex_gather_array_sw" : "gfx_tex_gather_sw";
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, name);
    if (!fn)
-      fn = LLVMAddFunction(t->mod, "gfx_tex_gather_sw", fty);
-   LLVMValueRef a[4] = { t->fs_texstate, x, y,
-                         LLVMConstInt(t->i32, tex->component, false) };
-   LLVMValueRef packed = LLVMBuildCall2(t->b, fty, fn, a, 4, "gather");
+      fn = LLVMAddFunction(t->mod, name, fty);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y,
+                         LLVMConstInt(t->i32, tex->component, false), layer };
+   LLVMValueRef packed = LLVMBuildCall2(t->b, fty, fn, a, n, "gather");
    for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
       LLVMValueRef byte = LLVMBuildAnd(t->b,
          LLVMBuildLShr(t->b, packed, LLVMConstInt(t->i32, c * 8, false), ""),
@@ -3194,8 +3198,21 @@ emit_tex_size(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef lod_int)
    wl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntULT, wl, one, ""), one, wl, "wl");
    hl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntULT, hl, one, ""), one, hl, "hl");
 
-   /* A 2D-array adds a layer count the descriptor does not carry; report 1. */
+   /* Third component: the descriptor's depth field carries the layer count for
+    * arrays (cube count for cube arrays) and the slice count for 3D. Layers do
+    * not shrink with the mip level; 3D slices halve like the other axes. */
    LLVMValueRef dims[3] = { wl, hl, one };
+   if (tex->def.num_components >= 3) {
+      LLVMValueRef off_d = LLVMConstInt(t->i32,
+         offsetof(gfx_sw_texstate_t, depth), false);
+      LLVMValueRef d0 = LLVMBuildLoad2(t->b, t->i32,
+         LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_d, 1, ""), "tdepth");
+      LLVMValueRef dl = (tex->sampler_dim == GLSL_SAMPLER_DIM_3D)
+         ? LLVMBuildLShr(t->b, d0, lod, "")
+         : d0;
+      dims[2] = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntULT, dl, one, ""), one, dl, "dl");
+   }
    for (unsigned c = 0; c < tex->def.num_components && c < 3; c++)
       ssa_set(t, tex->def.index, c, dims[c]);
 }
@@ -3644,6 +3661,17 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       t->ok = false;
       return;
    }
+   /* The gather footprint is addressed in one face's 2D space, so a cube gather
+    * would have to resolve taps that cross a face edge. The cube branches below
+    * precede the gather one and would otherwise take a cube tg4 as an ordinary
+    * cube sample -- a wrong result rather than a refusal. */
+   if (tex->op == nir_texop_tg4 &&
+       tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+      mesa_logw("vortexpipe: vp_nir_to_llvm: textureGather on a cube sampler "
+                "is unimplemented");
+      t->ok = false;
+      return;
+   }
    LLVMValueRef u = NULL, v = NULL, lod_int = NULL, bias_f = NULL;
    LLVMValueRef off_x = NULL, off_y = NULL, cmp = NULL;
    unsigned coord_ssa = 0;
@@ -3890,7 +3918,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
          emit_tex_gather_cmp(t, tex, gux, gvx,
             cmp ? cmp : ssa_get(t, coord_ssa, tex->is_array ? 3 : 2), glayer);
       else
-         emit_tex_gather(t, tex, gux, gvx);
+         emit_tex_gather(t, tex, gux, gvx, glayer);
       return;
    }
 
@@ -3902,9 +3930,17 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       t->ok = false;
       return;
    }
-   /* A sampler dimensionality whose coordinate has no second component (1D and
-    * 1D-array) leaves v unset. That is a missing dimension, not a rejected op,
-    * and reporting it as one sends the reader to the op switch. */
+   /* A 1D texture is one row of a 2D one, so supplying the second coordinate
+    * lets the whole 2D path -- filtering, mip selection, wrap -- apply as it
+    * stands. A 1D array carries its layer in the second component instead and
+    * needs its own handling, so it is left to the guard below. */
+   if (!v && u && tex->sampler_dim == GLSL_SAMPLER_DIM_1D && !tex->is_array) {
+      v = LLVMConstInt(t->i32, 0, false);          /* 0.0f is all-zero bits */
+   }
+   /* What still reaches here without a second component is a 1D array, whose
+    * second coordinate is a layer rather than an axis. That is a missing
+    * dimension, not a rejected op, and reporting it as one would send the
+    * reader to the op switch. */
    if (!u || !v) {
       mesa_logw("vortexpipe: vp_nir_to_llvm: texture op %d: no %s coordinate "
                 "component (unsupported sampler dimensionality)",
@@ -3974,15 +4010,17 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    }
 
    /* Route to the SW sampler when the sampler is mipmapped, the texture is NPOT (the
-    * FF vx_tex4 unit is POT-only) or its format is above the FF set (the FF unit has
-    * no decoder or texel stride for it); otherwise the fast HW path. All are uniform
-    * descriptor bits, so the branch never diverges (derivatives safe). A float format
-    * always sets the extended-format bit, so the HW unit never sees a wide texel. */
+    * FF vx_tex4 unit is POT-only), its format is above the FF set (the FF unit has
+    * no decoder or texel stride for it), or it wraps to a border colour (the FF unit
+    * has no border mux and would decode that wrap as REPEAT); otherwise the fast HW
+    * path. All are uniform descriptor bits, so the branch never diverges (derivatives
+    * safe). A float format always sets the extended-format bit, so the HW unit never
+    * sees a wide texel. */
    LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
       LLVMBuildAnd(t->b, emit_tex_filter_word(t),
          LLVMConstInt(t->i32,
             GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
-            GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
+            GFX_SW_TEX_FILTER_EXT_FORMAT | GFX_SW_TEX_FILTER_BORDER, false), ""),
       LLVMConstInt(t->i32, 0, false), "tex_use_sw");
    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
    LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_sw");

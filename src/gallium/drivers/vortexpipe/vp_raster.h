@@ -107,6 +107,7 @@ struct vp_tex_params {
    int32_t     lod_bias;    /* sampler LOD bias, signed Q(VX_TEX_LOD_FRAC_BITS) */
    uint32_t    depth;       /* mip-0 depth-slice count (sampler3D); 0 => not 3D */
    uint32_t    wrap_w;      /* VX_TEX_WRAP_* for the 3D depth (r) axis */
+   uint32_t    border;      /* CLAMP_TO_BORDER colour, ARGB8888 */
 };
 
 /* Run the WHOLE draw as one device-orchestrated command: the vertex shader
