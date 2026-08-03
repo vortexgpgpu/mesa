@@ -618,6 +618,113 @@ vp_fs_uses_sw_texop(struct nir_shader *nir)
 /* The driver JIT-compiles the fragment shader at pipeline creation,
  * the same NIR -> LLVM -> .vxbin path the vertex/compute stages use
  * (a real GPU driver compiles every stage; nothing is prebuilt). */
+
+/* Canonicalise a variant key. Built in one place so the key primed at creation
+ * and the key resolved per draw cannot disagree -- if they did, every pipeline
+ * would compile a second, identical variant on its first draw. Multisampling
+ * runs only in the software rasterizer and merger, and sw_raster has no meaning
+ * without sw_om, so the implied bits are forced here rather than at each call
+ * site. */
+static struct vp_fs_variant_key
+vp_fs_key_make(const struct vp_sw_routing *routing, unsigned samples)
+{
+   struct vp_fs_variant_key k;
+   memset(&k, 0, sizeof(k));
+   k.routing = *routing;
+   k.samples = samples ? samples : 1u;
+   if (k.samples > 1) {
+      k.routing.sw_raster = true;
+   }
+   if (k.routing.sw_raster) {
+      k.routing.sw_om = true;
+   }
+   return k;
+}
+
+/* Compared field by field rather than by memcmp, so that adding a key dimension
+ * forces this to be updated instead of silently comparing padding. */
+static bool
+vp_fs_key_equal(const struct vp_fs_variant_key *a,
+                const struct vp_fs_variant_key *b)
+{
+   return a->samples == b->samples
+       && a->routing.sw_tex == b->routing.sw_tex
+       && a->routing.sw_om == b->routing.sw_om
+       && a->routing.sw_raster == b->routing.sw_raster;
+}
+
+/* Translate + compile one fragment-shader variant from the cloned NIR. Returns
+ * false and leaves the slot empty when the shader cannot be built for this key;
+ * the caller then falls through to llvmpipe. */
+static bool
+vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v)
+{
+   char *ir = NULL;
+   if (!vp_nir_to_llvm(cso->fs_nir, &ir, NULL, &v->key.routing))
+      return false;
+   /* Co-compile the gfx_sw ABI whenever this variant could call it -- a
+    * routed-to-SW unit, or a HW-TEX shader that samples a texture (a mipmapped
+    * sampler routes to the SW sampler at draw time). Per variant, because it is
+    * derived from the routing the variant was built with. */
+   const bool uses_sw = v->key.routing.sw_tex || v->key.routing.sw_om ||
+                        cso->has_tex_desc;
+   const bool ok = vp_compile_vxbin(ir, VP_STARTUP_FS, uses_sw,
+                                    &v->vxbin, &v->vxbin_size);
+   vp_free_ir(ir);
+   return ok;
+}
+
+/* Resolve the variant for `key`, compiling it on first use. Returns NULL when
+ * the shader has no device path for this key. */
+static struct vp_fs_variant *
+vp_fs_variant_get(struct vp_cso *cso, const struct vp_fs_variant_key *key)
+{
+   for (unsigned i = 0; i < cso->num_fs_variants; i++) {
+      if (vp_fs_key_equal(&cso->fs_variants[i].key, key))
+         return cso->fs_variants[i].vxbin ? &cso->fs_variants[i] : NULL;
+   }
+   /* No NIR means no device path for this shader at all (a TGSI stage), so it
+    * has no variants and must not consume a slot. */
+   if (!cso->fs_nir)
+      return NULL;
+   if (cso->num_fs_variants >= VP_MAX_FS_VARIANTS) {
+      mesa_logw("vortexpipe: fragment-shader variant table full; "
+                "this draw runs on llvmpipe");
+      return NULL;
+   }
+   struct vp_fs_variant *v = &cso->fs_variants[cso->num_fs_variants];
+   memset(v, 0, sizeof(*v));
+   v->key = *key;
+   cso->num_fs_variants++;
+   if (!vp_fs_variant_compile(cso, v)) {
+      mesa_loge("vortexpipe: FS variant .vxbin compile failed");
+      return NULL;
+   }
+   vp_dbg("vortexpipe: compiled FS variant %u -> %zu bytes "
+          "(sw_tex=%d sw_om=%d sw_raster=%d samples=%u)",
+          cso->num_fs_variants - 1, v->vxbin_size,
+          v->key.routing.sw_tex, v->key.routing.sw_om,
+          v->key.routing.sw_raster, v->key.samples);
+   return v;
+}
+
+/* Make `want` the resident variant. Only one fragment image can live at the
+ * fixed FS device address, and the allocator rejects an overlapping reservation
+ * outright, so the previous one has to be released before the next is loaded --
+ * a switch that skipped this would fail the load rather than run stale code. */
+static void
+vp_fs_variant_make_resident(struct vp_cso *cso, int want)
+{
+   if (cso->fs_resident == want)
+      return;
+   if (cso->fs_resident >= 0) {
+      struct vp_fs_variant *r = &cso->fs_variants[cso->fs_resident];
+      if (r->vx_kernel) { vx_kernel_release(r->vx_kernel); r->vx_kernel = NULL; }
+      if (r->vx_module) { vx_module_release(r->vx_module); r->vx_module = NULL; }
+   }
+   cso->fs_resident = want;
+}
+
 static void *
 vp_create_fs_state(struct pipe_context *pipe,
                    const struct pipe_shader_state *state)
@@ -630,9 +737,9 @@ vp_create_fs_state(struct pipe_context *pipe,
    cso->lp_cso = vp->lp_create_fs_state(pipe, state);
    cso->fs_routing = vp_fs_routing(pipe);
    cso->fs_num_color = 1;
+   cso->fs_resident = -1;   /* no variant holds the FS device address yet */
 
    if (state->type == PIPE_SHADER_IR_NIR) {
-      char *ir = NULL;
       /* A >1-RT fragment shader must merge in software — the FF OM unit
        * is single-attachment. Force SW OM here so the compiled kernel calls the
        * MRT fallback AND the draw path (fs_routing.sw_om) programs it to match. */
@@ -656,22 +763,15 @@ vp_create_fs_state(struct pipe_context *pipe,
       cso->has_tex_desc = vp_scan_tex_descriptor(
          (struct nir_shader *)state->ir.nir,
          &cso->tex_desc_cbuf, &cso->tex_desc_offset);
-      if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir, NULL,
-                         &cso->fs_routing)) {
-         /* Co-compile the gfx_sw ABI (gfx_tex_sample_sw / gfx_om_fragment_sw)
-          * whenever the FS could call it: a routed-to-SW unit, or a HW-TEX shader
-          * that samples a texture (a mipmapped sampler routes to the SW sampler at
-          * draw time via the emit_tex runtime branch). --gc-sections drops it if
-          * unused, so a non-mipmapped textured FS pays only compile time. */
-         bool uses_sw = cso->fs_routing.sw_tex || cso->fs_routing.sw_om ||
-                        cso->has_tex_desc;
-         if (vp_compile_vxbin(ir, VP_STARTUP_FS, uses_sw, &cso->vxbin, &cso->vxbin_size))
-            vp_dbg("vortexpipe: compiled fragment shader -> %zu-byte .vxbin%s",
-                   cso->vxbin_size, uses_sw ? " (SW units)" : "");
-         else
-            mesa_loge("vortexpipe: FS .vxbin compile failed");
-         vp_free_ir(ir);
-      } else {
+      /* Clone the NIR so a variant can still be translated after this call.
+       * Taken here, after lp_create_fs_state, so it captures the same
+       * post-nir_lower_fragcolor shader the first translation sees. */
+      cso->fs_nir = nir_shader_clone(NULL, (struct nir_shader *)state->ir.nir);
+      /* Prime the single-sample variant here, through the same path a draw
+       * resolves, so a pipeline that only ever needs one pays its compile at
+       * creation rather than inside its first draw. */
+      const struct vp_fs_variant_key k0 = vp_fs_key_make(&cso->fs_routing, 1);
+      if (!vp_fs_variant_get(cso, &k0)) {
          mesa_logw("vortexpipe: FS NIR->LLVM unavailable; "
                    "fragment stage runs on llvmpipe");
       }
@@ -685,9 +785,10 @@ vp_bind_fs_state(struct pipe_context *pipe, void *p)
    struct vp_context *vp  = vp_reg_get(pipe);
    struct vp_cso     *cso = p;
    /* FS device address is fixed (VP_STARTUP_FS); evict the previously resident
-    * FS so the newly-bound one can load there on the next draw. */
+    * FS -- whichever of its variants held the address -- so the newly-bound one
+    * can load there on the next draw. */
    if (vp->cur_fs && vp->cur_fs != cso)
-      vp_cso_evict_module(vp->cur_fs);
+      vp_fs_variant_make_resident(vp->cur_fs, -1);
    vp->cur_fs = cso;
    vp->lp_bind_fs_state(pipe, cso ? cso->lp_cso : NULL);
 }
@@ -699,9 +800,12 @@ vp_delete_fs_state(struct pipe_context *pipe, void *p)
    struct vp_cso     *cso = p;
    if (vp->cur_fs == cso)
       vp->cur_fs = NULL;
-   vp_cso_evict_module(cso);
+   vp_fs_variant_make_resident(cso, -1);   /* release whatever is resident */
+   for (unsigned i = 0; i < cso->num_fs_variants; i++)
+      vp_free_blob(cso->fs_variants[i].vxbin);
    vp->lp_delete_fs_state(pipe, cso->lp_cso);
-   vp_free_blob(cso->vxbin);
+   if (cso->fs_nir)
+      ralloc_free(cso->fs_nir);
    FREE(cso);
 }
 
@@ -1001,6 +1105,13 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
    vp->fb_depth  = (fb && fb->zsbuf) ? fb->zsbuf->texture : NULL;
    vp->fb_width  = fb ? fb->width  : 0;
    vp->fb_height = fb ? fb->height : 0;
+   /* Sample count of the pass. Pinned to 1 until the multisample fragment path
+    * exists: the screen still refuses multisample formats, but that hook never
+    * sees a no-attachment framebuffer's rasterizationSamples, so an unpinned
+    * read here would size the resident buffers per sample while every draw
+    * still merged as if single-sample. The capture is left in place because it
+    * is what the residency below is keyed on. */
+   vp->fb_samples = 1;
    /* Capture every bound colour attachment (fb_cbufs[0] == fb_color). */
    vp->fb_nr_cbufs = 0;
    for (unsigned i = 0; i < GFX_OM_MAX_RT; i++)
@@ -1047,6 +1158,27 @@ vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
 {
    return vp_resource_rw(pipe, vp->fb_color, vp->fb_width, vp->fb_height,
                          dst, false);
+}
+
+/* Expand a single-sample w*h plane in place into the sample-major multisample
+ * layout, replicating each pixel across its samples. The buffer must already be
+ * w*h*samples words; the source occupies its first w*h. Walked backwards so the
+ * expansion cannot overwrite a pixel it has not read yet.
+ *
+ * Groundwork only: nothing sets a sample count above 1 yet, so this is unreached
+ * until the multisample fragment path exists. The row strides the merger reads
+ * (om_state_t cbuf_pitch/zbuf_pitch) and the pass-end readback are still
+ * single-sample and must move with it. */
+static void
+vp_fb_expand_samples(void *buf, unsigned w, unsigned h, unsigned samples)
+{
+   uint32_t *p = (uint32_t *)buf;
+   for (size_t i = (size_t)w * h; i-- > 0; ) {
+      const uint32_t v = p[i];
+      for (unsigned k = 0; k < samples; k++) {
+         p[i * samples + k] = v;
+      }
+   }
 }
 
 /* Read the depth/stencil attachment back into the device's packed word: depth
@@ -1233,6 +1365,7 @@ vp_fb_invalidate(struct pipe_context *pipe, struct vp_context *vp)
    vp->rmrt_nr = 0;
    vp->rfb_res = NULL;
    vp->rfb_w = vp->rfb_h = 0;
+   vp->rfb_s = 0;
 }
 
 /* Ensure the resident colour + depth buffers exist for the bound framebuffer at
@@ -1243,8 +1376,10 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
              uint32_t w, uint32_t h, const struct vp_om_params *om,
              uint64_t *color_dev, uint64_t *depth_dev)
 {
+   /* The sample count is part of the key: the buffers are sized per sample, so
+    * a pass that changes it must not reuse buffers sized for the old one. */
    if (vp->rcb && vp->rfb_res == vp->fb_color &&
-       vp->rfb_w == w && vp->rfb_h == h) {
+       vp->rfb_w == w && vp->rfb_h == h && vp->rfb_s == vp->fb_samples) {
       /* reuse the resident pass buffers (preserve colour + depth across draws) */
       if (vx_buffer_address(vp->rcb, color_dev) != VX_SUCCESS) return false;
       if (vx_buffer_address(vp->rzb, depth_dev) != VX_SUCCESS) return false;
@@ -1253,13 +1388,22 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
 
    vp_fb_invalidate(pipe, vp);
 
+   /* Both planes are stored sample-major within a pixel -- (y*w + x)*S + k --
+    * which is the layout gfx_sw's msaa_*_addr helpers and the resolve assume.
+    * At S == 1 that degenerates to the single-sample layout exactly. */
+   const uint32_t S = vp->fb_samples ? vp->fb_samples : 1u;
    const uint32_t bytes = w * h * 4;
+   const uint32_t dev_bytes = bytes * S;
+
    /* colour init: capture the attachment's current contents (the render pass's
-    * loadOp=CLEAR already cleared the resource via llvmpipe). */
-   void *cinit = malloc(bytes);
+    * loadOp=CLEAR already cleared the resource via llvmpipe). The attachment is
+    * single-sample, so every sample of a pixel starts at that pixel's value. */
+   void *cinit = malloc(dev_bytes);
    bool cok = cinit && vp_fb_color_read(pipe, vp, cinit);
+   if (cok && S > 1)
+      vp_fb_expand_samples(cinit, w, h, S);
    if (cok)
-      cok = vp_dev_upload(vp->dev, cinit, bytes, &vp->rcb, color_dev);
+      cok = vp_dev_upload(vp->dev, cinit, dev_bytes, &vp->rcb, color_dev);
    free(cinit);
    if (!cok) return false;
 
@@ -1267,21 +1411,24 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * reach the device. With no attachment bound there is nothing to read and
     * nothing that tests it either, so fall back to the far value (GREATER and
     * GEQUAL count 0 as far, everything else max). */
-   void *zinit = malloc(bytes);
+   void *zinit = malloc(dev_bytes);
    bool zok = zinit != NULL;
    if (zok && !vp_fb_depth_read(pipe, vp, w, h, zinit)) {
       uint8_t zfill = (om->depth_func == VX_OM_DEPTH_FUNC_GREATER ||
                        om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL) ? 0x00 : 0xFF;
       memset(zinit, zfill, bytes);
    }
+   if (zok && S > 1) {
+      vp_fb_expand_samples(zinit, w, h, S);
+   }
    if (zok) {
-      zok = vp_dev_upload(vp->dev, zinit, bytes, &vp->rzb, depth_dev);
+      zok = vp_dev_upload(vp->dev, zinit, dev_bytes, &vp->rzb, depth_dev);
    }
    free(zinit);
    if (!zok) { vx_buffer_release(vp->rcb); vp->rcb = NULL; return false; }
 
    vp->rfb_res = vp->fb_color;
-   vp->rfb_w = w; vp->rfb_h = h;
+   vp->rfb_w = w; vp->rfb_h = h; vp->rfb_s = vp->fb_samples;
    vp->rfb_dirty = false;
    return true;
 }
@@ -2304,6 +2451,18 @@ vp_draw_vbo(struct pipe_context *pipe,
        * genuinely indexed source, or a strip/fan we translate to an index list. */
       bool dev_indexed = indexed || tristrip;
 
+      /* Resolve the fragment-shader variant this draw needs BEFORE anything is
+       * mapped: the routing it was compiled with drives every decision below,
+       * and a variant that has to compile forks the toolchain. A shader with no
+       * device path for this key resolves to NULL and falls through to
+       * llvmpipe. */
+      struct vp_fs_variant *fsv = NULL;
+      if (fs) {
+         const struct vp_fs_variant_key key =
+            vp_fs_key_make(&fs->fs_routing, vp->fb_samples);
+         fsv = vp_fs_variant_get(fs, &key);
+      }
+
       /* Gather the vertex-buffer geometry if the VS fetches inputs;
        * if it needs them and we can't supply them, fall back wholly. */
       struct vp_vertex_input vin = { 0 };
@@ -2346,8 +2505,8 @@ vp_draw_vbo(struct pipe_context *pipe,
        * for it) rather than dropping the whole draw to llvmpipe. RASTER, OM and
        * TEX may each be HW or SW; the device path is taken as long as every unit
        * the draw needs is satisfied HW-or-SW. */
-      bool fs_sw_om     = fs && fs->fs_routing.sw_om;
-      bool fs_sw_raster = fs && fs->fs_routing.sw_raster;
+      bool fs_sw_om     = fsv && fsv->key.routing.sw_om;
+      bool fs_sw_raster = fsv && fsv->key.routing.sw_raster;
       bool gfx_hw = vps && (vps->has_raster || fs_sw_raster)
                         && (vps->has_om     || fs_sw_om);
       bool tex_needed = vp->cur_tex != NULL;
@@ -2355,7 +2514,7 @@ vp_draw_vbo(struct pipe_context *pipe,
        * compiled to sample in software (fs_routing.sw_tex), so the device path
        * runs HW raster + (HW/SW) OM + SW TEX. Only skip if the FS was NOT built
        * for SW texturing (e.g. caps changed under a cached shader). */
-      bool fs_sw_tex = fs && fs->fs_routing.sw_tex;
+      bool fs_sw_tex = fsv && fsv->key.routing.sw_tex;
       if (gfx_hw && tex_needed && !vps->has_tex && !fs_sw_tex) {
          mesa_logw("vortexpipe: draw_vbo: device lacks TEX extension and FS not "
                    "compiled for SW texturing — skipping hardware RASTER+OM path");
@@ -2387,7 +2546,7 @@ vp_draw_vbo(struct pipe_context *pipe,
          vp_min_z = vp->vp_min_z; vp_max_z = vp->vp_max_z;
       }
 
-      bool hw_path = vin_ok && !sw_raster && gfx_hw && fs && fs->vxbin &&
+      bool hw_path = vin_ok && !sw_raster && gfx_hw && fsv &&
                      vp->fb_color && vp->fb_width && vp->fb_height;
 
       /* Vortex hardware raster + OM path: the VS is folded into the draw —
@@ -2635,12 +2794,16 @@ vp_draw_vbo(struct pipe_context *pipe,
             vs_consts.data[i] = (const uint8_t *)m + vp->vs_cbuf_off[i];
             vs_consts.size[i] = vp->vs_cbuf_sz[i];
          }
-         if (drew)
+         if (drew) {
+            /* Claim the fixed FS device address for this variant, releasing
+             * whichever one held it: the draw below loads the module only when
+             * the handle is null, and an overlapping reservation is rejected. */
+            vp_fs_variant_make_resident(fs, (int)(fsv - fs->fs_variants));
             drew = vp_raster_draw(vp->dev, vp->raster_pool,
                                   vs->vxbin, vs->vxbin_size,
                                   &vs->vx_module, &vs->vx_kernel,
-                                  fs->vxbin, fs->vxbin_size,
-                                  &fs->vx_module, &fs->vx_kernel,
+                                  fsv->vxbin, fsv->vxbin_size,
+                                  &fsv->vx_module, &fsv->vx_kernel,
                                   count, dev_indexed ? 0u : draws[0].start,
                                   info->instance_count, info->start_instance,
                                   &vs->vs_layout,
@@ -2651,6 +2814,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                                   cull_mode, fs_sw_tex, fs_sw_om, fs_sw_raster,
                                   vp_sx, vp_tx, vp_sy, vp_ty, vp_min_z, vp_max_z,
                                   &fs_consts, &vs_consts, use_mrt ? &mrt : NULL);
+         }
          for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++)
             if (cbxfer[i]) pipe_buffer_unmap(pipe, cbxfer[i]);
          for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++)

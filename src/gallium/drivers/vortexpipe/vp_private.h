@@ -74,6 +74,33 @@ struct vp_screen {
  * (not the raw llvmpipe cso); bind/delete unwrap it. The descriptor
  * table (vp_desc, from vp_nir_to_llvm.h) is discovered by scanning
  * the NIR and drives vp_launch_grid's descriptor-buffer relocation. */
+/* What makes two compilations of one fragment shader differ. Routing decides
+ * which kernel wrapper the translator emits and whether the merge is a call or
+ * an OM-aperture store, so it cannot be a runtime argument; the sample count
+ * will select the multisample fragment path the same way. Everything else the
+ * translator reads is a property of the NIR and so is invariant across
+ * variants. Keep this minimal -- every dimension multiplies compile time and
+ * device residency churn. */
+struct vp_fs_variant_key {
+   struct vp_sw_routing routing;
+   unsigned             samples;   /* 1, or the pass' sample count */
+};
+
+/* One compiled fragment shader: its image, and the device residency handles
+ * that image holds while it occupies the fixed FS address. */
+struct vp_fs_variant {
+   struct vp_fs_variant_key key;
+   void       *vxbin;
+   size_t      vxbin_size;
+   vx_module_h vx_module;
+   vx_kernel_h vx_kernel;
+};
+
+/* Routing is fixed per shader (caps + env + NIR), so the only live dimension is
+ * the sample count, and Vulkan offers few of those. A small fixed array needs no
+ * recency bookkeeping. */
+#define VP_MAX_FS_VARIANTS 4
+
 struct vp_cso {
    void  *lp_cso;          /* llvmpipe's shader-state object */
    void  *vxbin;           /* compiled Vortex kernel image, or NULL */
@@ -110,6 +137,18 @@ struct vp_cso {
     * device caps + VORTEXPIPE_FORCE_SW). The draw path reads this to build +
     * pass the resident SW descriptors the FS was compiled to expect. */
    struct vp_sw_routing fs_routing;
+   /* Fragment shaders only. The NIR is cloned here so a variant can be
+    * translated after pipeline creation -- llvmpipe owns and frees the original
+    * (lp_state_fs.c), so its lifetime is not ours to rely on. NULL for a TGSI
+    * shader, and for the vertex and compute stages, which are single-variant
+    * and keep using the vxbin/vx_module fields above. */
+   struct nir_shader *fs_nir;
+   struct vp_fs_variant fs_variants[VP_MAX_FS_VARIANTS];
+   unsigned             num_fs_variants;
+   /* Which variant currently holds the fixed FS device address, or -1. Only one
+    * image can be resident there, so switching variants must evict this one
+    * first -- the allocator rejects an overlapping reservation outright. */
+   int                  fs_resident;
    /* Number of colour outputs the fragment shader writes (RT count).
     * >1 forces the SW-OM MRT path. 0/1 = single RT. */
    unsigned fs_num_color;
@@ -269,6 +308,7 @@ struct vp_context {
    struct pipe_resource *fb_color;
    struct pipe_resource *fb_depth;       /* depth/stencil attachment, or NULL */
    unsigned              fb_width, fb_height;
+   unsigned              fb_samples;     /* samples per pixel; 1 = single-sample */
    /* All bound colour attachments (fb_color == fb_cbufs[0]). A draw to
     * >1 attachment renders each into its own resident device buffer and writes
     * each back at sync. */
@@ -285,6 +325,7 @@ struct vp_context {
    vx_buffer_h           rcb, rzb;
    struct pipe_resource *rfb_res;
    unsigned              rfb_w, rfb_h;
+   unsigned              rfb_s;   /* samples the resident buffers were sized for */
    bool                  rfb_dirty;
    /* Extra resident colour buffers for attachments 1.. (RT0 uses rcb).
     * rmrt_res[k] is the framebuffer resource each is synced back to. */
