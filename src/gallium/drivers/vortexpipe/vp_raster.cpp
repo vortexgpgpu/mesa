@@ -218,6 +218,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                const void *fs_vxbin, size_t fs_vxbin_size,
                vx_module_h *fs_module_io, vx_kernel_h *fs_kernel_io,
                uint32_t vertex_count,
+               uint32_t first_vertex,
                uint32_t instance_count, uint32_t first_instance,
                const struct vp_vs_layout *layout,
                const struct vp_vertex_input *vin,
@@ -749,6 +750,13 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       const bool instanced = (inst_count > 1) || (first_instance != 0);
       vs_argblk[3] = instanced ? verts_per_instance : 0;
       vs_argblk[4] = first_instance;
+      /* Slot 5: base vertex. Vulkan defines gl_VertexIndex as firstVertex + i,
+       * but the vid the VS computes is the 0-based draw position because the
+       * host already folded firstVertex into the attribute base addresses. The
+       * shader-visible index therefore needs the base back, and only there --
+       * adding it to the vid would offset the attribute fetch twice. Zero for
+       * an indexed draw, where the vid is already the absolute index value. */
+      vs_argblk[5] = index_dev ? 0u : first_vertex;
 
       /* slot VP_ARG_VS_DESC: the vertex stage's constant-buffer table, built
        * exactly like the fragment one above -- upload each bound VS constant

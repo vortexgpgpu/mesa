@@ -75,9 +75,10 @@ void vp_free_ir(char *ir);
 #define VP_ARG_SSBO_BASE 4
 #define VP_MAX_SSBO      4
 
-/* The VERTEX stage overlays its own meanings on slots 0-4 (output record
- * buffer, attribute table, index buffer, verts-per-instance, base instance --
- * see vp_raster_draw's vs_argblk), so the slots above describe COMPUTE only.
+/* The VERTEX stage overlays its own meanings on slots 0-5 (output record
+ * buffer, attribute table, index buffer, verts-per-instance, base instance,
+ * base vertex -- see vp_raster_draw's vs_argblk), so the slots above describe
+ * COMPUTE only.
  * A vertex shader therefore cannot reach its constant buffers through slot 0/1
  * the way compute does; it gets its own descriptor table here, at a slot no
  * other stage assigns a meaning to. Its contents are the same

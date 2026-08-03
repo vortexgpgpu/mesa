@@ -170,6 +170,8 @@ struct vp_tr {
     * fast path (verts_per_instance == 0). */
    LLVMValueRef   instance;       /* i32 0-based instance id (gl_InstanceID) */
    LLVMValueRef   first_instance; /* i32 base instance (gl_BaseInstance) */
+   LLVMValueRef   base_vertex;    /* i32 base vertex (gl_BaseVertex); added to
+                                   * gl_VertexIndex only -- see the vid comment */
    LLVMValueRef   out_base;     /* iptr output-buffer device address */
    unsigned       out_stride;   /* bytes per output vertex record */
    LLVMValueRef   attr_table;   /* iptr addr of the {base,stride}[] table */
@@ -1611,11 +1613,22 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       }
       break;
    }
-   /* gl_VertexIndex: one Vortex thread per vertex, so it is the CTA
-    * thread id (vp_draw_vbo launches a single block of `count`). */
+   /* gl_VertexIndex is firstVertex + the draw position, while the vid is the
+    * 0-based position (the host folds firstVertex into the attribute bases, so
+    * the fetch must not see it twice). The base is zero on an indexed draw,
+    * where the vid is already the absolute index value, and on the
+    * zero-base opcode, which is 0-based by definition. */
    case nir_intrinsic_load_vertex_id:
+      ssa_set(t, in->def.index, 0,
+              t->base_vertex ? LLVMBuildAdd(t->b, t->vid, t->base_vertex, "vidx")
+                             : t->vid);
+      break;
    case nir_intrinsic_load_vertex_id_zero_base:
       ssa_set(t, in->def.index, 0, t->vid);
+      break;
+   case nir_intrinsic_load_base_vertex:
+      ssa_set(t, in->def.index, 0,
+              t->base_vertex ? t->base_vertex : LLVMConstInt(t->i32, 0, false));
       break;
    /* Instancing. gl_InstanceIndex lowers (nir_lower_system_values) to
     * load_instance_id + load_base_instance; the VS prologue resolves the
@@ -5294,6 +5307,13 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       LLVMValueRef fip   = LLVMBuildGEP2(t.b, t.i64, t.arg, &four, 1, "");
       LLVMValueRef fi64  = LLVMBuildLoad2(t.b, t.i64, fip, "firstinst64");
       t.first_instance   = LLVMBuildTrunc(t.b, fi64, t.i32, "firstinst");
+      /* arg slot 5: base vertex (gl_BaseVertex / the firstVertex half of
+       * gl_VertexIndex); 0 on an indexed draw and on a draw that starts at
+       * vertex 0, which keeps the emitted code identical to the prior ABI. */
+      LLVMValueRef five  = LLVMConstInt(t.i32, 5, false);
+      LLVMValueRef bvp   = LLVMBuildGEP2(t.b, t.i64, t.arg, &five, 1, "");
+      LLVMValueRef bv64  = LLVMBuildLoad2(t.b, t.i64, bvp, "basevert64");
+      t.base_vertex      = LLVMBuildTrunc(t.b, bv64, t.i32, "basevert");
       LLVMValueRef vpi_is0   = LLVMBuildICmp(t.b, LLVMIntEQ, vpi,
                                              LLVMConstInt(t.i32, 0, false), "vpi0");
       /* guard the div/rem against a zero divisor on the non-instanced fast path */
