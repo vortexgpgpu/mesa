@@ -41,6 +41,13 @@ OBJCOPY  := $(VORTEX_TOOLDIR)/llvm-vortex/bin/llvm-objcopy
 
 # -ffp-contract=off keeps the device setup math bit-faithful to the host
 # Binning() oracle the front end was validated against.
+#
+# -vortex-divergence-max-bbs raises the divergence pass's basic-block budget.
+# The fused nine-stage front end exceeds the default, and past it the pass
+# silently skips StructurizeCFG + split/join and miscompiles divergent control
+# flow instead of failing: a per-thread primitive store is dropped, so a draw
+# keeps only the triangle its first thread emitted. The shader path
+# (vp_compile.c) and libgfx_sw raise it for the same reason.
 VX_CFLAGS := --target=$(TARGET) \
   --sysroot=$(VORTEX_TOOLDIR)/$(GNU_DIR)/$(TARGET) \
   --gcc-toolchain=$(VORTEX_TOOLDIR)/$(GNU_DIR) \
@@ -48,6 +55,7 @@ VX_CFLAGS := --target=$(TARGET) \
   -Xclang -target-feature -Xclang +xvortex \
   -Xclang -target-feature -Xclang +zicond \
   -mllvm -disable-loop-idiom-all \
+  -mllvm -vortex-divergence-max-bbs=65536 \
   -Wno-unused-command-line-argument -Wno-override-module \
   -O3 -mcmodel=medany -nostartfiles -nostdlib -fuse-ld=lld \
   -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections -ffp-contract=off \
