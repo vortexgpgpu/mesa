@@ -728,10 +728,12 @@ vp_vx_border(const struct pipe_sampler_state *s)
       float f = s->border_color.f[i];
       c[i] = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
    }
+   /* Channel order matches what the fragment shader packs: red in the low
+    * byte, alpha in the high one. */
    return ((uint32_t)(c[3] * 255.0f + 0.5f) << 24)
-        | ((uint32_t)(c[0] * 255.0f + 0.5f) << 16)
+        | ((uint32_t)(c[2] * 255.0f + 0.5f) << 16)
         | ((uint32_t)(c[1] * 255.0f + 0.5f) << 8)
-        |  (uint32_t)(c[2] * 255.0f + 0.5f);
+        |  (uint32_t)(c[0] * 255.0f + 0.5f);
 }
 
 /* Capture the bound texture + sampler for the Vortex TEX unit.
