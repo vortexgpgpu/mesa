@@ -59,6 +59,10 @@ void                   vp_raster_pool_destroy(struct vp_raster_pool *pool);
 /* Output-merger state for a draw -- the Gallium depth-stencil + blend
  * state, translated to the Vortex OM encoding (see vp_context.c). */
 struct vp_om_params {
+   /* Samples per pixel for the pass. 1 keeps every multisample path out of the
+    * way; above 1 the resident colour and depth planes carry that many samples
+    * per pixel and the merger addresses them contiguously within a row. */
+   uint32_t samples;
    bool     depth_test;
    uint32_t depth_func;     /* VX_OM_DEPTH_FUNC_* */
    bool     depth_write;

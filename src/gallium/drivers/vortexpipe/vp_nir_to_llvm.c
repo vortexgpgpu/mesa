@@ -27,6 +27,7 @@
 #include "gfx_sw_abi.h"      /* gfx_sw_texstate_t (logdim offset for auto-LOD) */
 #include "VX_types.h"        /* VX_MEM_OM_BASE_ADDR */
 
+#include <assert.h>          /* static_assert */
 #include <stddef.h>          /* offsetof */
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,6 +178,7 @@ struct vp_tr {
    LLVMValueRef   attr_table;   /* iptr addr of the {base,stride}[] table */
    /* fragment-shader state (is_fs only) */
    bool           is_fs;
+   unsigned       fs_samples;   /* samples per pixel; 1 = single-sample */
    LLVMValueRef   fs_in_base;   /* iptr interpolated-varyings area */
    LLVMValueRef   fs_out_base;  /* iptr output-colour area */
    struct vp_var  vars[VP_MAXV];
@@ -4602,6 +4604,13 @@ struct vp_bc_src {
    bool         from_window;  /* HW: recompute from the primitive's edge planes */
    LLVMValueRef quad_addr;    /* SW: iptr address of the gfx_rast_quad_t */
    LLVMValueRef sub;          /* SW: this lane's corner within that quad (0..3) */
+   unsigned     bcoord_word0; /* SW: word index of bcoords[0] in that record --
+                               * 1 single-sample, 5 multisample (the wider record
+                               * carries sample_masks[4] between the two) */
+   LLVMValueRef sample_mask;  /* SW multisample: this corner's per-sample coverage
+                               * (bit k = sample k). NULL on every single-sample
+                               * path, and on the fixed-function path, which has no
+                               * per-sample coverage to give. */
 };
 
 /* Edge value F[axis] at this lane's pixel, as a float (fixed_t<16> raw).
@@ -4622,11 +4631,12 @@ emit_bc(struct vp_tr *t, const struct vp_bc_src *bc, LLVMValueRef prim,
          LLVMBuildAdd(t->b, LLVMBuildMul(t->b, ex, px, ""),
                             LLVMBuildMul(t->b, ey, py, ""), ""), ez, "bcraw");
    } else {
-      /* gfx_rast_quad_t: pos_mask @word0, bcoords[axis*4+corner] @word 1+..
-       * The corner is this lane's sub, a runtime value, so index it dynamically. */
+      /* bcoords[axis*4+corner], at bcoord_word0 + .. in the quad record (word 1
+       * single-sample, word 5 multisample). The corner is this lane's sub, a
+       * runtime value, so index it dynamically. */
       LLVMValueRef off = LLVMBuildShl(t->b,
          LLVMBuildAdd(t->b, bc->sub,
-            LLVMConstInt(t->i32, 1 + axis * 4, false), ""),
+            LLVMConstInt(t->i32, bc->bcoord_word0 + axis * 4, false), ""),
          LLVMConstInt(t->i32, 2, false), "bcoff");
       raw = emit_load_i32(t,
          LLVMBuildAdd(t->b, bc->quad_addr, vp_to_iptr(t, off), ""));
@@ -4780,7 +4790,54 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
             LLVMBuildICmp(t->b, LLVMIntUGT, zi, zmask, ""), zmask, zi, "depth");
       }
 
-      if (t->sw_om && num_color > 1) {
+      /* Multisample merge is legal to emit only when this kernel was translated
+       * for it AND this call site actually carries per-sample coverage. The two
+       * clauses check different things, and both are load-bearing: the
+       * fixed-function wrapper fails the second unconditionally, which is what
+       * keeps the shared emitter from taking this arm where there is no mask to
+       * read. A kernel built for multisample whose source cannot feed it is a
+       * translator bug, not a runtime case -- bail rather than silently emit the
+       * single-sample arm and render subtly wrong coverage. */
+      const bool msaa = t->fs_samples > 1 && bc->sample_mask && t->sw_om;
+      if (t->fs_samples > 1 && !msaa) {
+         mesa_logw("vortexpipe: multisample FS variant lacks a per-sample "
+                   "coverage source or a software merger; runs on llvmpipe");
+         t->ok = false;
+      }
+      /* MRT under multisampling has no device ABI -- gfx_om_fragment_mrt_sw is
+       * single-sample only, and merging through it would write plausible garbage
+       * into buffers strided for S samples. Refuse the translation so the variant
+       * never exists and the draw falls to llvmpipe, which renders it correctly. */
+      if (msaa && num_color > 1) {
+         mesa_logw("vortexpipe: multisample MRT has no device merge path; "
+                   "this shader runs on llvmpipe");
+         t->ok = false;
+      }
+
+      if (msaa && num_color <= 1) {
+         /* Per-sample merge: gfx_om_fragment_msaa_sw(omstate, samples,
+          * sample_mask, px, py, face, colour, depth). `cov` was already folded
+          * with the shader's discard flag above, so gating the whole mask on it
+          * applies discard exactly once -- the per-fragment flag cannot be
+          * expressed inside a per-sample mask any other way, which is why the
+          * callee's contract puts the fold on us. An all-zero mask is dropped by
+          * the callee, keeping this straight-line like the single-sample call. */
+         LLVMValueRef mask_live = LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntNE, cov,
+                          LLVMConstInt(t->i32, 0, false), ""),
+            bc->sample_mask, LLVMConstInt(t->i32, 0, false), "smask_live");
+         LLVMTypeRef params[8] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
+                                   t->i32, t->i32, t->i32 };
+         LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                            params, 8, false);
+         LLVMValueRef ofn = LLVMGetNamedFunction(t->mod, "gfx_om_fragment_msaa_sw");
+         if (!ofn)
+            ofn = LLVMAddFunction(t->mod, "gfx_om_fragment_msaa_sw", fty);
+         LLVMValueRef a[8] = { omstate_ptr,
+                               LLVMConstInt(t->i32, t->fs_samples, false),
+                               mask_live, pxc, pyc, face, rgba, depth_i };
+         LLVMBuildCall2(t->b, fty, ofn, a, 8, "");
+      } else if (t->sw_om && num_color > 1) {
          /* >1 colour attachment merges via gfx_om_fragment_mrt_sw(
           * omstate, rt[], num_color, covered, px, py, face, colours[], depth) —
           * one shared depth op then a per-attachment blend + colour write. Pack
@@ -4954,7 +5011,15 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
  * [8]=scissor_h. */
 #define VP_SW_RAST_TILE_LOG  3u                                  /* 8x8 px tile  */
 #define VP_SW_RAST_MAX_QUADS (1u << (2 * (VP_SW_RAST_TILE_LOG - 1)))/* (tile/2)^2 */
-#define VP_RAST_QUAD_WORDS   13u                  /* sizeof(gfx_rast_quad_t)/4    */
+/* Quad-record widths, derived from the device ABI rather than copied from it:
+ * both structs come from gfx_sw_abi.h, so a change there cannot silently
+ * desynchronise the stride the emitter walks with. */
+#define VP_RAST_QUAD_WORDS      ((unsigned)(sizeof(gfx_rast_quad_t) / 4))
+#define VP_RAST_MSAA_QUAD_WORDS ((unsigned)(sizeof(gfx_rast_msaa_quad_t) / 4))
+static_assert(VP_RAST_QUAD_WORDS == 13,
+              "gfx_rast_quad_t width moved; the FF frag payload layout changed");
+static_assert(VP_RAST_MSAA_QUAD_WORDS == 17,
+              "gfx_rast_msaa_quad_t width moved; check the bcoord base word");
 
 static LLVMValueRef
 emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
@@ -5019,8 +5084,16 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
          LLVMArrayType(t->i32, nrt), "fs_colors");
       mrt_colors_addr = LLVMBuildPtrToInt(t->b, col_scr, t->iptr, "");
    }
+   /* Multisample quads carry per-sample coverage, so their record is wider and
+    * the walk that fills it is a different entry point. Both are selected here,
+    * once, from the variant's sample count -- a single-sample kernel keeps the
+    * narrower per-lane quad buffer rather than paying for a field it cannot use. */
+   const bool ms = t->fs_samples > 1;
+   const unsigned quad_words = ms ? VP_RAST_MSAA_QUAD_WORDS : VP_RAST_QUAD_WORDS;
+   const char *walk_name = ms ? "gfx_rast_walk_tile_msaa_sw"
+                              : "gfx_rast_walk_tile_sw";
    LLVMValueRef quadbuf = LLVMBuildAlloca(t->b,
-      LLVMArrayType(t->i32, VP_SW_RAST_MAX_QUADS * VP_RAST_QUAD_WORDS), "quads");
+      LLVMArrayType(t->i32, VP_SW_RAST_MAX_QUADS * quad_words), "quads");
    /* Entry-block slot: this wrapper shades inside a loop nest, and an alloca built
     * at the shade site would grow the stack once per quad. */
    LLVMValueRef live      = LLVMBuildAlloca(t->b, t->i32, "fs_live");
@@ -5068,9 +5141,9 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMTypeRef wparams[9] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
                               t->i32, t->i32, t->ptr, t->i32 };
    LLVMTypeRef wty = LLVMFunctionType(t->i32, wparams, 9, false);
-   LLVMValueRef wfn = LLVMGetNamedFunction(t->mod, "gfx_rast_walk_tile_sw");
+   LLVMValueRef wfn = LLVMGetNamedFunction(t->mod, walk_name);
    if (!wfn)
-      wfn = LLVMAddFunction(t->mod, "gfx_rast_walk_tile_sw", wty);
+      wfn = LLVMAddFunction(t->mod, walk_name, wty);
    LLVMValueRef wargs[9] = {
       LLVMBuildIntToPtr(t->b, prim, t->ptr, "primp"), pid, tx, ty, logc,
       scis_w, scis_h, quadbuf, LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false) };
@@ -5116,12 +5189,19 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
     * buffers — the split is over corners, not over data. */
    LLVMPositionBuilderAtEnd(t->b, qbody);
    LLVMValueRef qoff = LLVMBuildMul(t->b, base,
-      LLVMConstInt(t->i32, VP_RAST_QUAD_WORDS * 4, false), "");
+      LLVMConstInt(t->i32, quad_words * 4, false), "");
    LLVMValueRef quad_addr = LLVMBuildAdd(t->b, quad_base, vp_to_iptr(t, qoff), "quad");
    LLVMValueRef pos_mask = emit_load_i32(t, quad_addr);
 
    /* pos_mask: mask@[3:0], qx@[4+:DIM-1], qy@[4+DIM-1+:DIM-1]. This lane's pixel is
-    * px=(qx<<1)|(sub&1), py=(qy<<1)|(sub>>1), covered = mask[sub]. */
+    * px=(qx<<1)|(sub&1), py=(qy<<1)|(sub>>1), covered = mask[sub].
+    *
+    * The position fields decode identically in both records, but the coverage
+    * nibble does NOT: rast_emit_quad_msaa builds pos_mask from the quad position
+    * alone and leaves [3:0] zero, because multisample coverage is "any sample
+    * inside" and cannot be expressed as one bit per pixel. Reading it there would
+    * mask every fragment off and render an empty image with no diagnostic, so the
+    * multisample coverage comes from sample_masks[sub] instead. */
    const uint32_t dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
    LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
    LLVMValueRef qx = LLVMBuildAnd(t->b,
@@ -5135,11 +5215,27 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
       LLVMBuildAnd(t->b, sub, one, ""), "px");
    LLVMValueRef py = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
       LLVMBuildLShr(t->b, sub, one, ""), "py");
-   LLVMValueRef cov = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, sub, ""), one, "cov");
+   LLVMValueRef smask = NULL;
+   LLVMValueRef cov;
+   if (ms) {
+      /* sample_masks[sub] at word 1+sub; covered = any sample of this corner. */
+      LLVMValueRef soff = LLVMBuildShl(t->b,
+         LLVMBuildAdd(t->b, sub, one, ""),
+         LLVMConstInt(t->i32, 2, false), "smoff");
+      smask = emit_load_i32(t,
+         LLVMBuildAdd(t->b, quad_addr, vp_to_iptr(t, soff), ""));
+      cov = LLVMBuildZExt(t->b,
+         LLVMBuildICmp(t->b, LLVMIntNE, smask,
+                       LLVMConstInt(t->i32, 0, false), ""), t->i32, "cov");
+   } else {
+      cov = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, pos_mask, sub, ""), one, "cov");
+   }
 
    struct vp_bc_src bc = { .from_window = false, .quad_addr = quad_addr,
-                           .sub = sub };
+                           .sub = sub,
+                           .bcoord_word0 = ms ? 5u : 1u,
+                           .sample_mask = smask };
    emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
                     in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
                     mrt_ptr, mrt_colors_addr, live, px, py, cov, &bc);
@@ -5165,7 +5261,8 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
 bool
 vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
                struct vp_vs_layout *out_vs,
-               const struct vp_sw_routing *routing)
+               const struct vp_sw_routing *routing,
+               unsigned samples)
 {
    if (out_ir)
       *out_ir = NULL;
@@ -5188,6 +5285,10 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    t.sw_tex    = (t.is_fs && routing && routing->sw_tex);
    t.sw_om     = (t.is_fs && routing && routing->sw_om);
    t.sw_raster = (t.is_fs && routing && routing->sw_raster);
+   /* Samples per pixel this kernel is built for. Above 1 the merge is per-sample
+    * and the coverage the rasterizer hands over is a sample mask rather than a
+    * single bit, so it changes what is emitted, not just what is passed in. */
+   t.fs_samples = (t.is_fs && samples > 1) ? samples : 1u;
    t.ctx   = LLVMContextCreate();
    t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
    LLVMSetTarget(t.mod, vp_target_triple());

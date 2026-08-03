@@ -626,8 +626,11 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          omstate.logic_op       = om->logic_op;
          omstate.zbuf_base      = depth_dev;
          omstate.cbuf_base      = color_dev;
-         omstate.zbuf_pitch     = width * 4;
-         omstate.cbuf_pitch     = width * 4;
+         /* The merger addresses a pixel's samples contiguously within its row,
+          * so the pitch it reads is the multisample row stride, not the pixel
+          * row width. At one sample the two are the same. */
+         omstate.zbuf_pitch     = width * 4 * om->samples;
+         omstate.cbuf_pitch     = width * 4 * om->samples;
          omstate.cbuf_writemask4 = om->colormask;
          /* resolve_om_state (host-side derivation, mirrors gfx_sw.h) */
          omstate.depth_enabled = !((omstate.depth_func == (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS)

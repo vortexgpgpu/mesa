@@ -143,7 +143,7 @@ vp_create_compute_state(struct pipe_context *pipe,
        * SBT shader-record pointer relocation at launch. */
       cso->trace_cmd_slots =
          vp_scan_trace_cmd_slots((struct nir_shader *)state->prog);
-      if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL, NULL)) {
+      if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL, NULL, 1)) {
          if (vp_compile_vxbin(ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
                       cso->vxbin_size);
@@ -473,7 +473,7 @@ vp_create_vs_state(struct pipe_context *pipe,
    if (state->type == PIPE_SHADER_IR_NIR) {
       char *ir = NULL;
       if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir,
-                         &cso->vs_layout, NULL)) {
+                         &cso->vs_layout, NULL, 1)) {
          /* VS links at a distinct base so it co-resides with the FS
           * (0x80000000) + front end (0x80200000) in one OP_DRAW. */
          if (vp_compile_vxbin(ir, VP_STARTUP_VS, false, &cso->vxbin, &cso->vxbin_size))
@@ -660,7 +660,7 @@ static bool
 vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v)
 {
    char *ir = NULL;
-   if (!vp_nir_to_llvm(cso->fs_nir, &ir, NULL, &v->key.routing))
+   if (!vp_nir_to_llvm(cso->fs_nir, &ir, NULL, &v->key.routing, v->key.samples))
       return false;
    /* Co-compile the gfx_sw ABI whenever this variant could call it -- a
     * routed-to-SW unit, or a HW-TEX shader that samples a texture (a mipmapped
@@ -2456,6 +2456,16 @@ vp_draw_vbo(struct pipe_context *pipe,
        * and a variant that has to compile forks the toolchain. A shader with no
        * device path for this key resolves to NULL and falls through to
        * llvmpipe. */
+      /* The device rasterizer's sample pattern is the fixed 4x table in
+       * gfx_frag_rast.h, and the coverage mask it produces is always a 4-sample
+       * mask. Merging that at any other count would silently use the wrong
+       * sample positions -- a 2x draw would take samples 0 and 1 of the 4x
+       * pattern -- so every other multisample count goes to llvmpipe. The test
+       * precedes variant resolution so an unsupported count never compiles a
+       * kernel that cannot be launched. */
+      if (vp->fb_samples != 1 && vp->fb_samples != 4)
+         goto llvmpipe;
+
       struct vp_fs_variant *fsv = NULL;
       if (fs) {
          const struct vp_fs_variant_key key =
@@ -2570,6 +2580,8 @@ vp_draw_vbo(struct pipe_context *pipe,
 
          /* gather the OM state from the bound depth/blend csos */
          struct vp_om_params om = { 0 };
+         /* Never zero: the merger multiplies its row stride by this. */
+         om.samples = vp->fb_samples ? vp->fb_samples : 1u;
          if (vp->cur_dsa) {
             om.depth_test  = vp->cur_dsa->depth_test;
             om.depth_func  = vp->cur_dsa->depth_func;
@@ -2598,8 +2610,8 @@ vp_draw_vbo(struct pipe_context *pipe,
                om.depth_func == VX_OM_DEPTH_FUNC_GREATER ||
                om.depth_func == VX_OM_DEPTH_FUNC_GEQUAL;
             om.earlyz_safe = om.depth_test && monotone
-                          && om.stencil_writemask == 0u
-                          && !(fs && fs->fs_writes_depth);
+                           && om.stencil_writemask == 0u
+                           && !(fs && fs->fs_writes_depth);
          }
          if (vp->cur_blend) {
             om.blend_const = vp->cur_blend_color;
