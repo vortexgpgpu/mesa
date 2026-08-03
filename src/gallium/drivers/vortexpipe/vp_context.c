@@ -760,6 +760,22 @@ vp_create_texture_handle(struct pipe_context *pipe,
          const void *base = pipe_texture_map(pipe, res, 0, 0, PIPE_MAP_READ,
                                              0, 0, res->width0, res->height0, &xfer);
          if (base) {
+            /* A destroyed resource leaves its entry behind, and a later
+             * allocation can reuse its storage address. The stale entry would
+             * then win the per-draw match and resolve every property -- target,
+             * layer count, the resource itself -- from the wrong texture, so
+             * this capture supersedes it. */
+            for (unsigned i = 0; i < vp->txh_count; ) {
+               if (vp->txh_base[i] == base) {
+                  vp->txh_count--;
+                  vp->txh_base[i]   = vp->txh_base[vp->txh_count];
+                  vp->txh_res[i]    = vp->txh_res[vp->txh_count];
+                  vp->txh_target[i] = vp->txh_target[vp->txh_count];
+                  vp->txh_layers[i] = vp->txh_layers[vp->txh_count];
+               } else {
+                  i++;
+               }
+            }
             vp->txh_base[vp->txh_count]   = base;
             vp->txh_res[vp->txh_count]    = res;
             vp->txh_target[vp->txh_count] = view->target;
