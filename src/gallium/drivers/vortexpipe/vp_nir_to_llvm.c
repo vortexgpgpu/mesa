@@ -206,6 +206,7 @@ struct vp_tr {
     * array and calls gfx_om_fragment_mrt_sw when num_color > 1. */
    unsigned       fs_num_color;
    unsigned       fs_out_words;  /* i32 words in the FS output area (incl. scratch) */
+   int            fs_depth_off;  /* byte offset of gl_FragDepth's slot; -1 if unwritten */
    bool           ok;
 };
 
@@ -4280,10 +4281,11 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
    /* Output slots are keyed by render-target index: a colour output at
     * FRAG_RESULT_DATA0+k lands at out slot k*16, so the wrapper can pack colours
     * 0..num_color-1 deterministically regardless of declaration order. Non-colour
-    * outputs (gl_FragDepth/stencil — unsupported on gfx-v1, depth comes from the
-    * plane) get a scratch slot past the colour area so their stores never corrupt
-    * a colour and are never read back. */
+    * outputs get a slot past the colour area, where a store cannot corrupt a
+    * colour; gl_FragDepth's is read back for the fragment's depth, and anything
+    * else there is written and ignored. */
    unsigned num_color = 0, scratch = 0;
+   t->fs_depth_off = -1;
    nir_foreach_shader_out_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
       unsigned loc = var->data.location;
@@ -4311,6 +4313,8 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
       t->vars[t->nvars].var     = var;
       t->vars[t->nvars].alloca  = NULL;
       t->vars[t->nvars].out_off = (int)(slot * 16);
+      if (loc == FRAG_RESULT_DEPTH)
+         t->fs_depth_off = (int)(slot * 16);
       t->nvars++;
    }
    t->fs_num_color = num_color ? num_color : 1;
@@ -4736,6 +4740,32 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
          LLVMBuildSelect(t->b,
             LLVMBuildICmp(t->b, LLVMIntSGT, z32, zmask, ""), zmask, z32, ""),
          "depth");
+
+      /* gl_FragDepth replaces the interpolated plane: the shader's [0,1] value
+       * scales to the same 24-bit range the plane path saturates to, so the
+       * merger tests and stores it without knowing which produced it. */
+      if (t->fs_depth_off >= 0) {
+         LLVMValueRef zf = LLVMBuildBitCast(t->b,
+            emit_load_i32(t, addk(t, out_addr, (unsigned)t->fs_depth_off)),
+            t->f32, "fragdepth");
+         LLVMValueRef zero_f = LLVMConstReal(t->f32, 0.0);
+         LLVMValueRef one_f  = LLVMConstReal(t->f32, 1.0);
+         /* Ordered compares select the bound on an unordered result, so a NaN
+          * depth resolves to a defined value instead of poisoning fptoui. */
+         zf = LLVMBuildSelect(t->b,
+            LLVMBuildFCmp(t->b, LLVMRealOLT, zf, one_f, ""), zf, one_f, "");
+         zf = LLVMBuildSelect(t->b,
+            LLVMBuildFCmp(t->b, LLVMRealOGT, zf, zero_f, ""), zf, zero_f, "");
+         LLVMValueRef zi = LLVMBuildFPToUI(t->b,
+            LLVMBuildFAdd(t->b,
+               LLVMBuildFMul(t->b, zf,
+                  LLVMConstReal(t->f32, (double)0xffffff), ""),
+               LLVMConstReal(t->f32, 0.5), ""), t->i32, "fragdepth_i");
+         /* 0xffffff+0.5 is not representable in f32 and rounds up, so z == 1.0
+          * lands one past the field; saturate as the plane path does. */
+         depth_i = LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntUGT, zi, zmask, ""), zmask, zi, "depth");
+      }
 
       if (t->sw_om && num_color > 1) {
          /* >1 colour attachment merges via gfx_om_fragment_mrt_sw(

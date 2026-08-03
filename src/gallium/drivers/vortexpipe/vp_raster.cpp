@@ -599,13 +599,16 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                                                   : (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS;
          omstate.depth_writemask = om->depth_write ? 1u : 0u;
          for (int f = 0; f < 2; ++f) {
-            omstate.stencil_func[f]      = VX_OM_DEPTH_FUNC_ALWAYS;
-            omstate.stencil_zpass[f]     = VX_OM_STENCIL_OP_KEEP;
-            omstate.stencil_zfail[f]     = VX_OM_STENCIL_OP_KEEP;
-            omstate.stencil_fail[f]      = VX_OM_STENCIL_OP_KEEP;
-            omstate.stencil_ref[f]       = 0;
-            omstate.stencil_mask[f]      = OM_STENCIL_MASK;
-            omstate.stencil_writemask[f] = 0;
+            /* Unpack the same front/back halves the FF DCRs carry, so a draw
+             * that routes to the software merger produces identical pixels. */
+            const int sh = f * 16;
+            omstate.stencil_func[f]      = (om->stencil_func      >> sh) & 0xffff;
+            omstate.stencil_zpass[f]     = (om->stencil_zpass     >> sh) & 0xffff;
+            omstate.stencil_zfail[f]     = (om->stencil_zfail     >> sh) & 0xffff;
+            omstate.stencil_fail[f]      = (om->stencil_fail      >> sh) & 0xffff;
+            omstate.stencil_ref[f]       = (om->stencil_ref       >> sh) & 0xffff;
+            omstate.stencil_mask[f]      = (om->stencil_mask      >> sh) & 0xffff;
+            omstate.stencil_writemask[f] = (om->stencil_writemask >> sh) & 0xffff;
          }
          omstate.blend_mode_rgb = om->blend_mode & 0xffff;
          omstate.blend_mode_a   = om->blend_mode >> 16;
@@ -613,8 +616,8 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          omstate.blend_src_a    = (om->blend_func >> 8)  & 0xff;
          omstate.blend_dst_rgb  = (om->blend_func >> 16) & 0xff;
          omstate.blend_dst_a    = (om->blend_func >> 24) & 0xff;
-         omstate.blend_const    = 0;
-         omstate.logic_op       = 0;
+         omstate.blend_const    = om->blend_const;
+         omstate.logic_op       = om->logic_op;
          omstate.zbuf_base      = depth_dev;
          omstate.cbuf_base      = color_dev;
          omstate.zbuf_pitch     = width * 4;
@@ -623,7 +626,12 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          /* resolve_om_state (host-side derivation, mirrors gfx_sw.h) */
          omstate.depth_enabled = !((omstate.depth_func == (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS)
                                 && !(omstate.depth_writemask & 1u));
-         omstate.stencil_enabled[0] = omstate.stencil_enabled[1] = 0;  /* ALWAYS/KEEP */
+         for (int f = 0; f < 2; ++f) {
+            omstate.stencil_enabled[f] =
+               !((omstate.stencil_func[f]  == (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS)
+              && (omstate.stencil_zpass[f] == (uint32_t)VX_OM_STENCIL_OP_KEEP)
+              && (omstate.stencil_zfail[f] == (uint32_t)VX_OM_STENCIL_OP_KEEP));
+         }
          omstate.blend_enabled = !((omstate.blend_mode_rgb == (uint32_t)VX_OM_BLEND_MODE_ADD)
                                 && (omstate.blend_mode_a   == (uint32_t)VX_OM_BLEND_MODE_ADD)
                                 && (omstate.blend_src_rgb  == (uint32_t)VX_OM_BLEND_FUNC_ONE)
@@ -668,8 +676,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
             rt[k].blend_src_a    = (mrt->blend_func[k] >> 8)  & 0xff;
             rt[k].blend_dst_rgb  = (mrt->blend_func[k] >> 16) & 0xff;
             rt[k].blend_dst_a    = (mrt->blend_func[k] >> 24) & 0xff;
-            rt[k].blend_const    = 0;
-            rt[k].logic_op       = 0;
+            /* Both are pipeline-wide in Vulkan, so every attachment carries the
+             * same values the scalar path uses. */
+            rt[k].blend_const    = om->blend_const;
+            rt[k].logic_op       = om->logic_op;
             rt[k].cbuf_writemask4 = mrt->colormask[k];
             rt[k].blend_enabled  = !((rt[k].blend_mode_rgb == (uint32_t)VX_OM_BLEND_MODE_ADD)
                                   && (rt[k].blend_mode_a   == (uint32_t)VX_OM_BLEND_MODE_ADD)
@@ -972,17 +982,18 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_OM_ZBUF_PITCH,       width * 4);
       DCRW(VX_DCR_OM_DEPTH_FUNC,       om->depth_test ? om->depth_func : VX_OM_DEPTH_FUNC_ALWAYS);
       DCRW(VX_DCR_OM_DEPTH_WRITEMASK,  (om->depth_test && om->depth_write) ? 1u : 0u);
-      DCRW(VX_DCR_OM_STENCIL_FUNC,      VX_OM_DEPTH_FUNC_ALWAYS);
-      DCRW(VX_DCR_OM_STENCIL_ZPASS,     VX_OM_STENCIL_OP_KEEP);
-      DCRW(VX_DCR_OM_STENCIL_ZFAIL,     VX_OM_STENCIL_OP_KEEP);
-      DCRW(VX_DCR_OM_STENCIL_FAIL,      VX_OM_STENCIL_OP_KEEP);
-      DCRW(VX_DCR_OM_STENCIL_REF,       0);
-      DCRW(VX_DCR_OM_STENCIL_MASK,      0xFF);
-      DCRW(VX_DCR_OM_STENCIL_WRITEMASK, 0);
+      DCRW(VX_DCR_OM_STENCIL_FUNC,      om->stencil_func);
+      DCRW(VX_DCR_OM_STENCIL_ZPASS,     om->stencil_zpass);
+      DCRW(VX_DCR_OM_STENCIL_ZFAIL,     om->stencil_zfail);
+      DCRW(VX_DCR_OM_STENCIL_FAIL,      om->stencil_fail);
+      DCRW(VX_DCR_OM_STENCIL_REF,       om->stencil_ref);
+      DCRW(VX_DCR_OM_STENCIL_MASK,      om->stencil_mask);
+      DCRW(VX_DCR_OM_STENCIL_WRITEMASK, om->stencil_writemask);
       DCRW(VX_DCR_OM_BLEND_MODE,        om->blend_mode);
       DCRW(VX_DCR_OM_BLEND_FUNC,        om->blend_func);
-      DCRW(VX_DCR_OM_BLEND_CONST,       0);
-      DCRW(VX_DCR_OM_LOGIC_OP,          0);
+      DCRW(VX_DCR_OM_BLEND_CONST,       om->blend_const);
+      DCRW(VX_DCR_OM_LOGIC_OP,          om->logic_op);
+      DCRW(VX_DCR_OM_EARLYZ_SAFE,       om->earlyz_safe ? 1u : 0u);
 
       /* OM aperture: a fragment export is a store into a virtual address range
        * that the cluster's OM ingress peels off the L1->L2 trunk. The address is

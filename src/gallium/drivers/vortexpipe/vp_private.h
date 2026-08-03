@@ -113,6 +113,8 @@ struct vp_cso {
    /* Number of colour outputs the fragment shader writes (RT count).
     * >1 forces the SW-OM MRT path. 0/1 = single RT. */
    unsigned fs_num_color;
+   /* The shader supplies gl_FragDepth, which rules out early-Z. */
+   bool     fs_writes_depth;
 };
 
 /* Captured + VX-encoded output-merger state. create_*_state
@@ -120,11 +122,19 @@ struct vp_cso {
  * once and registers it (keyed by the llvmpipe cso, via vp_reg);
  * create returns llvmpipe's cso unchanged so csos made before
  * vortexpipe's hooks were armed (util_blitter's) pass straight
- * through. Stencil is left disabled for gfx-v1. */
+ * through. */
 struct vp_dsa_cso {
    bool     depth_test;
    bool     depth_write;
    uint32_t depth_func;        /* VX_OM_DEPTH_FUNC_* */
+   /* Two-sided stencil, indexed [0]=front [1]=back. The reference value is not
+    * here: Gallium delivers it as dynamic state through set_stencil_ref. */
+   uint32_t stencil_func[2];        /* VX_OM_DEPTH_FUNC_* */
+   uint32_t stencil_fail[2];        /* VX_OM_STENCIL_OP_* */
+   uint32_t stencil_zfail[2];
+   uint32_t stencil_zpass[2];
+   uint32_t stencil_mask[2];        /* value (compare) mask */
+   uint32_t stencil_writemask[2];
 };
 
 struct vp_blend_cso {
@@ -138,6 +148,7 @@ struct vp_blend_cso {
    uint32_t rt_blend_mode[GFX_OM_MAX_RT];
    uint32_t rt_blend_func[GFX_OM_MAX_RT];
    uint32_t rt_colormask[GFX_OM_MAX_RT];
+   uint32_t logic_op;          /* VX_OM_LOGIC_OP_* */
 };
 
 /* Captured rasterizer state: the face-cull inputs the device front end
@@ -304,6 +315,8 @@ struct vp_context {
    /* Output-merger state (depth-stencil-alpha + blend). */
    struct vp_dsa_cso   *cur_dsa;
    struct vp_blend_cso *cur_blend;
+   uint32_t             cur_stencil_ref[2];   /* set_stencil_ref, front/back */
+   uint32_t             cur_blend_color;      /* set_blend_color, ARGB8888 */
    void *(*lp_create_dsa_state)(struct pipe_context *,
                                 const struct pipe_depth_stencil_alpha_state *);
    void  (*lp_bind_dsa_state)(struct pipe_context *, void *);
@@ -312,6 +325,10 @@ struct vp_context {
                                   const struct pipe_blend_state *);
    void  (*lp_bind_blend_state)(struct pipe_context *, void *);
    void  (*lp_delete_blend_state)(struct pipe_context *, void *);
+   void  (*lp_set_blend_color)(struct pipe_context *,
+                               const struct pipe_blend_color *);
+   void  (*lp_set_stencil_ref)(struct pipe_context *,
+                               const struct pipe_stencil_ref);
    /* Rasterizer state: face cull + front-face winding for the device
     * front end (see vp_rast_cso). Captured at create time (the winding /
     * cull mask are only in pipe_rasterizer_state there); everything else

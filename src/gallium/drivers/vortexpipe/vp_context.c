@@ -556,6 +556,20 @@ vp_fs_routing(struct pipe_context *pipe)
    return r;
 }
 
+/* True when the fragment shader supplies its own depth. Early-Z evaluates the
+ * interpolated plane before the shader runs, so a shader-written depth makes
+ * that decision meaningless and the arming below has to back off. */
+static bool
+vp_fs_writes_depth(struct nir_shader *nir)
+{
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location == FRAG_RESULT_DEPTH) {
+         return true;
+      }
+   }
+   return false;
+}
+
 /* Count the fragment shader's colour outputs (max render-target index
  * + 1). >1 means the draw targets multiple render targets, which the SW OM MRT
  * fallback handles (the FF vx_om4 unit is single-RT). */
@@ -631,6 +645,8 @@ vp_create_fs_state(struct pipe_context *pipe,
        * instead of dropping them to llvmpipe. */
       if (vp_fs_uses_sw_texop((struct nir_shader *)state->ir.nir))
          cso->fs_routing.sw_tex = true;
+      cso->fs_writes_depth =
+         vp_fs_writes_depth((struct nir_shader *)state->ir.nir);
       /* The set-0 descriptors the FS reaches (SSBO/UBO/AS) — recorded for
        * the descriptor-blob relocation the SSBO path needs (follow-up). */
       vp_scan_descriptors((struct nir_shader *)state->ir.nir,
@@ -1506,10 +1522,50 @@ vp_vx_blend_mode(unsigned bm)
    }
 }
 
-/* depth-stencil-alpha state: capture depth test / func / writemask
- * into a vp_dsa_cso registered under the llvmpipe cso. Stencil + the
- * alpha test are gfx-v1 deferred (left disabled). create returns
- * llvmpipe's cso so blitter csos made before our hooks pass through. */
+/* Gallium's stencil-op and logic-op enumerations are ordered differently from
+ * the VX ones, so both need a real map rather than a cast. */
+static uint32_t
+vp_vx_stencil_op(unsigned op)
+{
+   switch (op) {
+   case PIPE_STENCIL_OP_ZERO:      return VX_OM_STENCIL_OP_ZERO;
+   case PIPE_STENCIL_OP_REPLACE:   return VX_OM_STENCIL_OP_REPLACE;
+   case PIPE_STENCIL_OP_INCR:      return VX_OM_STENCIL_OP_INCR;
+   case PIPE_STENCIL_OP_DECR:      return VX_OM_STENCIL_OP_DECR;
+   case PIPE_STENCIL_OP_INCR_WRAP: return VX_OM_STENCIL_OP_INCR_WRAP;
+   case PIPE_STENCIL_OP_DECR_WRAP: return VX_OM_STENCIL_OP_DECR_WRAP;
+   case PIPE_STENCIL_OP_INVERT:    return VX_OM_STENCIL_OP_INVERT;
+   default:                        return VX_OM_STENCIL_OP_KEEP;
+   }
+}
+
+static uint32_t
+vp_vx_logic_op(unsigned op)
+{
+   switch (op) {
+   case PIPE_LOGICOP_CLEAR:         return VX_OM_LOGIC_OP_CLEAR;
+   case PIPE_LOGICOP_NOR:           return VX_OM_LOGIC_OP_NOR;
+   case PIPE_LOGICOP_AND_INVERTED:  return VX_OM_LOGIC_OP_AND_INVERTED;
+   case PIPE_LOGICOP_COPY_INVERTED: return VX_OM_LOGIC_OP_COPY_INVERTED;
+   case PIPE_LOGICOP_AND_REVERSE:   return VX_OM_LOGIC_OP_AND_REVERSE;
+   case PIPE_LOGICOP_INVERT:        return VX_OM_LOGIC_OP_INVERT;
+   case PIPE_LOGICOP_XOR:           return VX_OM_LOGIC_OP_XOR;
+   case PIPE_LOGICOP_NAND:          return VX_OM_LOGIC_OP_NAND;
+   case PIPE_LOGICOP_AND:           return VX_OM_LOGIC_OP_AND;
+   case PIPE_LOGICOP_EQUIV:         return VX_OM_LOGIC_OP_EQUIV;
+   case PIPE_LOGICOP_NOOP:          return VX_OM_LOGIC_OP_NOOP;
+   case PIPE_LOGICOP_OR_INVERTED:   return VX_OM_LOGIC_OP_OR_INVERTED;
+   case PIPE_LOGICOP_OR_REVERSE:    return VX_OM_LOGIC_OP_OR_REVERSE;
+   case PIPE_LOGICOP_OR:            return VX_OM_LOGIC_OP_OR;
+   case PIPE_LOGICOP_SET:           return VX_OM_LOGIC_OP_SET;
+   default:                         return VX_OM_LOGIC_OP_COPY;
+   }
+}
+
+/* depth-stencil-alpha state: capture the depth test / func / writemask and the
+ * per-face stencil state into a vp_dsa_cso registered under the llvmpipe cso.
+ * The alpha test is still deferred (left disabled). create returns llvmpipe's
+ * cso so blitter csos made before our hooks pass through. */
 static void *
 vp_create_dsa_state(struct pipe_context *pipe,
                     const struct pipe_depth_stencil_alpha_state *s)
@@ -1522,6 +1578,27 @@ vp_create_dsa_state(struct pipe_context *pipe,
       cso->depth_test  = s->depth_enabled;
       cso->depth_write = s->depth_writemask;
       cso->depth_func  = vp_vx_depth_func(s->depth_func);
+      for (unsigned f = 0; f < 2; f++) {
+         /* A single-sided pipeline leaves stencil[1] disabled, in which case
+          * both faces take the front state -- the hardware always selects by
+          * face, so the back half cannot be left at whatever a previous draw
+          * programmed. */
+         const struct pipe_stencil_state *st =
+            (f == 1 && !s->stencil[1].enabled) ? &s->stencil[0] : &s->stencil[f];
+         /* Both models derive "stencil is live" from func + the two depth-side
+          * ops rather than from an enable bit, so a disabled face has to read
+          * back as ALWAYS/KEEP or it would force a depth read per fragment. */
+         cso->stencil_func[f]      = st->enabled ? vp_vx_depth_func(st->func)
+                                                 : VX_OM_DEPTH_FUNC_ALWAYS;
+         cso->stencil_fail[f]      = st->enabled ? vp_vx_stencil_op(st->fail_op)
+                                                 : VX_OM_STENCIL_OP_KEEP;
+         cso->stencil_zfail[f]     = st->enabled ? vp_vx_stencil_op(st->zfail_op)
+                                                 : VX_OM_STENCIL_OP_KEEP;
+         cso->stencil_zpass[f]     = st->enabled ? vp_vx_stencil_op(st->zpass_op)
+                                                 : VX_OM_STENCIL_OP_KEEP;
+         cso->stencil_mask[f]      = st->valuemask;
+         cso->stencil_writemask[f] = st->enabled ? st->writemask : 0u;
+      }
       vp_reg_put(lp_cso, cso);
    }
    return lp_cso;
@@ -1567,9 +1644,23 @@ vp_create_blend_state(struct pipe_context *pipe,
       const struct pipe_rt_blend_state *rt = &s->rt[0];
       cso->blend_enable = rt->blend_enable;
       cso->colormask    = rt->colormask;
-      if (rt->blend_enable) {
-         uint32_t m = vp_vx_blend_mode(rt->rgb_func);
-         cso->blend_mode = (m << 16) | (m << 0);
+      cso->logic_op       = s->logicop_enable ? vp_vx_logic_op(s->logicop_func)
+                                              : VX_OM_LOGIC_OP_COPY;
+      if (s->logicop_enable) {
+         /* A logic op is a blend *mode*, not a flag beside one: the merger
+          * reaches its logic path only through this mode, and the factors are
+          * unused there. It also supersedes blending, which Vulkan specifies
+          * as disabled whenever a logic op is active. */
+         cso->blend_mode = (VX_OM_BLEND_MODE_LOGICOP << 16)
+                         | (VX_OM_BLEND_MODE_LOGICOP << 0);
+         cso->blend_func =
+            (VX_OM_BLEND_FUNC_ZERO << 24) | (VX_OM_BLEND_FUNC_ZERO << 16) |
+            (VX_OM_BLEND_FUNC_ONE  << 8)  | (VX_OM_BLEND_FUNC_ONE  << 0);
+      } else if (rt->blend_enable) {
+         /* Low half is the RGB equation, high half the alpha one; they are
+          * independent state and the models read them separately. */
+         cso->blend_mode = (vp_vx_blend_mode(rt->alpha_func) << 16)
+                         | (vp_vx_blend_mode(rt->rgb_func)   << 0);
          cso->blend_func =
             (vp_vx_blend_factor(rt->alpha_dst_factor) << 24) |
             (vp_vx_blend_factor(rt->rgb_dst_factor)   << 16) |
@@ -1589,9 +1680,17 @@ vp_create_blend_state(struct pipe_context *pipe,
          const struct pipe_rt_blend_state *r =
             s->independent_blend_enable ? &s->rt[i] : &s->rt[0];
          cso->rt_colormask[i] = r->colormask;
-         if (r->blend_enable) {
-            uint32_t m = vp_vx_blend_mode(r->rgb_func);
-            cso->rt_blend_mode[i] = (m << 16) | (m << 0);
+         if (s->logicop_enable) {
+            /* Vulkan applies a logic op to every attachment, and it supersedes
+             * blending on each; the scalar fields above take the same path. */
+            cso->rt_blend_mode[i] = (VX_OM_BLEND_MODE_LOGICOP << 16)
+                                  | (VX_OM_BLEND_MODE_LOGICOP << 0);
+            cso->rt_blend_func[i] =
+               (VX_OM_BLEND_FUNC_ZERO << 24) | (VX_OM_BLEND_FUNC_ZERO << 16) |
+               (VX_OM_BLEND_FUNC_ONE  << 8)  | (VX_OM_BLEND_FUNC_ONE  << 0);
+         } else if (r->blend_enable) {
+            cso->rt_blend_mode[i] = (vp_vx_blend_mode(r->alpha_func) << 16)
+                                  | (vp_vx_blend_mode(r->rgb_func)   << 0);
             cso->rt_blend_func[i] =
                (vp_vx_blend_factor(r->alpha_dst_factor) << 24) |
                (vp_vx_blend_factor(r->rgb_dst_factor)   << 16) |
@@ -1633,6 +1732,38 @@ vp_delete_blend_state(struct pipe_context *pipe, void *p)
       FREE(cso);
    }
    vp->lp_delete_blend_state(pipe, p);
+}
+
+/* Stencil reference and blend constant are dynamic state, delivered outside the
+ * depth-stencil and blend CSOs, so they need their own hooks: without these the
+ * stencil compare would always use ref 0 and a constant-colour blend factor
+ * would always operate on black. */
+static void
+vp_set_stencil_ref(struct pipe_context *pipe, const struct pipe_stencil_ref ref)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->cur_stencil_ref[0] = ref.ref_value[0];
+   vp->cur_stencil_ref[1] = ref.ref_value[1];
+   vp->lp_set_stencil_ref(pipe, ref);
+}
+
+static void
+vp_set_blend_color(struct pipe_context *pipe,
+                   const struct pipe_blend_color *color)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   float c[4];
+   for (unsigned i = 0; i < 4; i++) {
+      float f = color->color[i];
+      c[i] = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+   }
+   /* Same channel order as the fragment shader's packed colour: red in the
+    * low byte, alpha in the high one. */
+   vp->cur_blend_color = ((uint32_t)(c[3] * 255.0f + 0.5f) << 24)
+                       | ((uint32_t)(c[2] * 255.0f + 0.5f) << 16)
+                       | ((uint32_t)(c[1] * 255.0f + 0.5f) << 8)
+                       |  (uint32_t)(c[0] * 255.0f + 0.5f);
+   vp->lp_set_blend_color(pipe, color);
 }
 
 /* ---- graphics: rasterizer state (face cull) ------------------------ *
@@ -2191,8 +2322,36 @@ vp_draw_vbo(struct pipe_context *pipe,
             om.depth_test  = vp->cur_dsa->depth_test;
             om.depth_func  = vp->cur_dsa->depth_func;
             om.depth_write = vp->cur_dsa->depth_write;
+            /* Pack the two faces as every consumer decodes them: front in the
+             * low half, back in the high half. */
+            #define VP_FACE_PACK(field) \
+               (vp->cur_dsa->field[0] | (vp->cur_dsa->field[1] << 16))
+            om.stencil_func      = VP_FACE_PACK(stencil_func);
+            om.stencil_fail      = VP_FACE_PACK(stencil_fail);
+            om.stencil_zfail     = VP_FACE_PACK(stencil_zfail);
+            om.stencil_zpass     = VP_FACE_PACK(stencil_zpass);
+            om.stencil_mask      = VP_FACE_PACK(stencil_mask);
+            om.stencil_writemask = VP_FACE_PACK(stencil_writemask);
+            #undef VP_FACE_PACK
+            om.stencil_ref = (vp->cur_stencil_ref[0] & 0xffffu)
+                           | (vp->cur_stencil_ref[1] << 16);
+            /* Early-Z drops quads the committed depth already occludes, before
+             * the shader runs. That is only equivalent to the late test when
+             * the compare is monotone in depth, the shader does not supply its
+             * own depth, and no stencil write depends on the fragment arriving
+             * -- a culled fragment performs no stencil op. */
+            const bool monotone =
+               om.depth_func == VX_OM_DEPTH_FUNC_LESS ||
+               om.depth_func == VX_OM_DEPTH_FUNC_LEQUAL ||
+               om.depth_func == VX_OM_DEPTH_FUNC_GREATER ||
+               om.depth_func == VX_OM_DEPTH_FUNC_GEQUAL;
+            om.earlyz_safe = om.depth_test && monotone
+                          && om.stencil_writemask == 0u
+                          && !(fs && fs->fs_writes_depth);
          }
          if (vp->cur_blend) {
+            om.blend_const = vp->cur_blend_color;
+            om.logic_op    = vp->cur_blend->logic_op;
             om.blend_mode = vp->cur_blend->blend_mode;
             om.blend_func = vp->cur_blend->blend_func;
             om.colormask  = vp->cur_blend->colormask;
@@ -2550,6 +2709,8 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_create_blend_state   = pipe->create_blend_state;
    vp->lp_bind_blend_state     = pipe->bind_blend_state;
    vp->lp_delete_blend_state   = pipe->delete_blend_state;
+   vp->lp_set_blend_color      = pipe->set_blend_color;
+   vp->lp_set_stencil_ref      = pipe->set_stencil_ref;
    vp->lp_create_rasterizer_state = pipe->create_rasterizer_state;
    vp->lp_bind_rasterizer_state   = pipe->bind_rasterizer_state;
    vp->lp_delete_rasterizer_state = pipe->delete_rasterizer_state;
@@ -2584,6 +2745,8 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->create_blend_state   = vp_create_blend_state;
    pipe->bind_blend_state     = vp_bind_blend_state;
    pipe->delete_blend_state   = vp_delete_blend_state;
+   pipe->set_blend_color      = vp_set_blend_color;
+   pipe->set_stencil_ref      = vp_set_stencil_ref;
    pipe->create_rasterizer_state = vp_create_rasterizer_state;
    pipe->bind_rasterizer_state   = vp_bind_rasterizer_state;
    pipe->delete_rasterizer_state = vp_delete_rasterizer_state;

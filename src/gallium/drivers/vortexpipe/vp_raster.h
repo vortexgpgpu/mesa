@@ -65,6 +65,18 @@ struct vp_om_params {
    uint32_t blend_mode;     /* VX_DCR_OM_BLEND_MODE packed word */
    uint32_t blend_func;     /* VX_DCR_OM_BLEND_FUNC packed word */
    uint32_t colormask;      /* VX_DCR_OM_CBUF_WRITEMASK */
+   /* Two-sided stencil and the blend constant, already packed as the DCRs
+    * encode them: front in bits 15:0, back in bits 31:16. */
+   uint32_t stencil_func;
+   uint32_t stencil_fail;
+   uint32_t stencil_zfail;
+   uint32_t stencil_zpass;
+   uint32_t stencil_ref;
+   uint32_t stencil_mask;
+   uint32_t stencil_writemask;
+   uint32_t blend_const;    /* ARGB8888 constant-colour blend operand */
+   uint32_t logic_op;       /* VX_OM_LOGIC_OP_* */
+   bool     earlyz_safe;    /* the rasterizer may cull provably-occluded quads */
 };
 
 /* Per-attachment output-merger state for a draw targeting >1 colour
