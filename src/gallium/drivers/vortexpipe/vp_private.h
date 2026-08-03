@@ -354,6 +354,7 @@ struct vp_context {
    bool  vp_valid;
    float vp_scale_x, vp_trans_x;
    float vp_scale_y, vp_trans_y;
+   float vp_min_z, vp_max_z;   /* depth range (VkViewport minDepth..maxDepth) */
    void  (*lp_set_viewport_states)(struct pipe_context *, unsigned, unsigned,
                                    const struct pipe_viewport_state *);
    /* Texture + sampler, captured from create_texture_handle.

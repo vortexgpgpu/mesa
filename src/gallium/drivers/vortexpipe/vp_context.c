@@ -1923,6 +1923,14 @@ vp_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
       vp->vp_trans_x = vps[0].translate[0];
       vp->vp_scale_y = vps[0].scale[1];
       vp->vp_trans_y = vps[0].translate[1];
+      /* Gallium reduces minDepth/maxDepth to scale/translate. lavapipe sets
+       * clip_halfz, so z_window = z_ndc*scale + translate with z_ndc already in
+       * [0,1] -- the range is translate..translate+scale, not the GL
+       * translate±scale. Reading it the GL way happens to give the right
+       * mapping back for the default 0..1 range and silently wrong depth for
+       * any other. */
+      vp->vp_min_z   = vps[0].translate[2];
+      vp->vp_max_z   = vps[0].translate[2] + vps[0].scale[2];
       vp->vp_valid   = true;
       vp_dbg("vortexpipe: viewport scale=(%g,%g) translate=(%g,%g)",
              vp->vp_scale_x, vp->vp_scale_y, vp->vp_trans_x, vp->vp_trans_y);
@@ -2372,9 +2380,11 @@ vp_draw_vbo(struct pipe_context *pipe,
        * [0,H] scissor, unchanged. */
       float vp_sx = 0.5f * (float)vp->fb_width,  vp_tx = 0.5f * (float)vp->fb_width;
       float vp_sy = 0.5f * (float)vp->fb_height, vp_ty = 0.5f * (float)vp->fb_height;
+      float vp_min_z = 0.0f, vp_max_z = 1.0f;
       if (vp->vp_valid) {
          vp_sx = vp->vp_scale_x; vp_tx = vp->vp_trans_x;
          vp_sy = vp->vp_scale_y; vp_ty = vp->vp_trans_y;
+         vp_min_z = vp->vp_min_z; vp_max_z = vp->vp_max_z;
       }
 
       bool hw_path = vin_ok && !sw_raster && gfx_hw && fs && fs->vxbin &&
@@ -2639,7 +2649,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                                   color_dev, depth_dev, w, h, &om,
                                   tex_used ? tex_dev : 0, tex_used ? &tex : NULL,
                                   cull_mode, fs_sw_tex, fs_sw_om, fs_sw_raster,
-                                  vp_sx, vp_tx, vp_sy, vp_ty,
+                                  vp_sx, vp_tx, vp_sy, vp_ty, vp_min_z, vp_max_z,
                                   &fs_consts, &vs_consts, use_mrt ? &mrt : NULL);
          for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++)
             if (cbxfer[i]) pipe_buffer_unmap(pipe, cbxfer[i]);

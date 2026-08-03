@@ -230,6 +230,7 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                uint32_t cull_mode,
                bool sw_tex, bool sw_om, bool sw_raster,
                float vp_sx, float vp_tx, float vp_sy, float vp_ty,
+               float vp_min_z, float vp_max_z,
                const struct vp_fs_consts *fs_consts,
                const struct vp_fs_consts *vs_consts,
                const struct vp_mrt_params *mrt)
@@ -406,6 +407,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       arg.cull_mode  = cull_mode;                /* SETUP_CULL_* from the rasterizer state */
       arg.vp_sx = vp_sx; arg.vp_tx = vp_tx;      /* app viewport transform (screen = ndc*scale+bias) */
       arg.vp_sy = vp_sy; arg.vp_ty = vp_ty;      /* negative vp_sy = Vulkan y-flip */
+      arg.vp_minz = vp_min_z; arg.vp_maxz = vp_max_z;
+      /* Vulkan clip z spans [0,w], so the front end must use the Vulkan near
+       * plane and depth map rather than the GL ones the native path feeds it. */
+      arg.vp_halfz = 1u;
 
       /* expand_k arg: on-device vertex assembly expands the resident VS
        * records into the setup_vertex_t[] the front end consumes
