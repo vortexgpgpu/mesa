@@ -1049,8 +1049,86 @@ vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
                          dst, false);
 }
 
+/* Read the depth/stencil attachment back into the device's packed word: depth
+ * in bits 23:0, stencil in 31:24. llvmpipe has already applied the render
+ * pass' depth and stencil loadOp to the resource, so this carries the app's
+ * clear values across the same way the colour path does -- the device cannot
+ * see a VkClearDepthStencilValue any other way.
+ *
+ * Only the formats vp_screen advertises are handled; anything else means the
+ * screen and this function have drifted apart, and uploading a mis-converted
+ * depth plane would corrupt every draw in the pass rather than fail visibly. */
+static bool
+vp_fb_depth_read(struct pipe_context *pipe, struct vp_context *vp,
+                 unsigned w, unsigned h, void *dst)
+{
+   struct pipe_resource *res = vp->fb_depth;
+   if (!res)
+      return false;
+
+   const enum pipe_format fmt = res->format;
+   switch (fmt) {
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+   case PIPE_FORMAT_Z32_FLOAT:
+   case PIPE_FORMAT_Z16_UNORM:
+      break;
+   default:
+      vp_dbg("vortexpipe: unhandled depth format %u in readback", (unsigned)fmt);
+      return false;
+   }
+
+   struct pipe_transfer *xfer = NULL;
+   uint8_t *map = pipe_texture_map(pipe, res, 0, 0, PIPE_MAP_READ, 0, 0, w, h,
+                                   &xfer);
+   if (!map)
+      return false;
+
+   for (unsigned y = 0; y < h; y++) {
+      const uint8_t *m = map + (size_t)y * xfer->stride;
+      uint32_t *d = (uint32_t *)dst + (size_t)y * w;
+      for (unsigned x = 0; x < w; x++) {
+         uint32_t z, s = 0;
+         switch (fmt) {
+         case PIPE_FORMAT_Z24_UNORM_S8_UINT: {
+            const uint32_t v = ((const uint32_t *)m)[x];
+            z = v & 0xffffff;
+            s = v >> 24;
+            break;
+         }
+         case PIPE_FORMAT_S8_UINT_Z24_UNORM: {
+            const uint32_t v = ((const uint32_t *)m)[x];
+            z = v >> 8;
+            s = v & 0xff;
+            break;
+         }
+         case PIPE_FORMAT_Z32_FLOAT: {
+            float f = ((const float *)m)[x];
+            f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+            /* 0xffffff+0.5 is not representable in f32 and rounds up, so a
+             * far-plane clear would land one past the field and read back as
+             * the near plane. */
+            z = (uint32_t)(f * 16777215.0f + 0.5f);
+            z = z > 0xffffff ? 0xffffff : z;
+            break;
+         }
+         default: {  /* PIPE_FORMAT_Z16_UNORM */
+            const uint32_t v = ((const uint16_t *)m)[x];
+            /* 16 -> 24 bits by replicating the high byte, so full scale stays
+             * full scale rather than landing 255 short of it. */
+            z = (v << 8) | (v >> 8);
+            break;
+         }
+         }
+         d[x] = (s << 24) | z;
+      }
+   }
+   pipe_texture_unmap(pipe, xfer);
+   return true;
+}
+
 /* VX OM encodings (VX_types.h) -- depth-compare function and blend.
- * Used by the residency depth-clear heuristic below and the OM-state
+ * Used by the residency depth-clear fallback below and the OM-state
  * translation further down. */
 #define VX_OM_DEPTH_FUNC_ALWAYS              0
 #define VX_OM_DEPTH_FUNC_NEVER               1
@@ -1185,13 +1263,18 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
    free(cinit);
    if (!cok) return false;
 
-   /* depth clear: far value (GREATER/GEQUAL clear to 0, else max), once. */
-   uint8_t zfill = (om->depth_func == VX_OM_DEPTH_FUNC_GREATER ||
-                    om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL) ? 0x00 : 0xFF;
+   /* depth/stencil init: read the attachment back, so the pass' clear values
+    * reach the device. With no attachment bound there is nothing to read and
+    * nothing that tests it either, so fall back to the far value (GREATER and
+    * GEQUAL count 0 as far, everything else max). */
    void *zinit = malloc(bytes);
    bool zok = zinit != NULL;
-   if (zok) {
+   if (zok && !vp_fb_depth_read(pipe, vp, w, h, zinit)) {
+      uint8_t zfill = (om->depth_func == VX_OM_DEPTH_FUNC_GREATER ||
+                       om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL) ? 0x00 : 0xFF;
       memset(zinit, zfill, bytes);
+   }
+   if (zok) {
       zok = vp_dev_upload(vp->dev, zinit, bytes, &vp->rzb, depth_dev);
    }
    free(zinit);
