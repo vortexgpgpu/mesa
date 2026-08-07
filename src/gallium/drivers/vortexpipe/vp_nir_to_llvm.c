@@ -597,29 +597,44 @@ emit_csr_read(struct vp_tr *t, unsigned csr, const char *name)
 }
 
 /* Inclusive prefix scan of `val` across the warp (subgroup) under reduction op
- * `rop`: Hillis-Steele over shfl_up. Two guards decide whether a lane combines
+ * `rop`: Hillis-Steele over shfl_up. Three guards decide whether a lane combines
  * its neighbour at step d:
  *   - in range: the source lane (lane-d) must exist (lane >= d);
- *   - source active: the source lane must be an active invocation.
+ *   - source active: the source lane must be an active invocation;
+ *   - same cluster: for a clustered reduction, the source must not cross the
+ *     cluster boundary.
  * The second matters under divergence — a shfl from an inactive lane returns the
  * reader's OWN value, so combining it unconditionally would double-count for a
  * non-idempotent op (add/mul/xor); an active source at a further power-of-two
  * distance is still picked up in a later step. Unrolled to cover NT up to 32.
+ *
+ * `cluster` is the width of the lane group a clustered reduction folds over, or
+ * 0 for the whole warp. It is a power of two, so a lane's offset within its
+ * cluster is `lane & (cluster-1)` and a source at distance d stays inside the
+ * cluster exactly when that offset is at least d. No lane reaches past its own
+ * cluster, so the scan stops at d == cluster.
+ *
  * Returns the inclusive result (NULL + clears ok on an unmapped op). */
 static LLVMValueRef
-emit_subgroup_incl_scan(struct vp_tr *t, nir_op rop, LLVMValueRef val)
+emit_subgroup_incl_scan(struct vp_tr *t, nir_op rop, LLVMValueRef val,
+                        unsigned cluster)
 {
    LLVMValueRef acc    = val;
    LLVMValueRef lane   = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
    LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
    LLVMValueRef one    = LLVMConstInt(t->i32, 1, false);
-   for (unsigned d = 1; d <= 16u; d <<= 1) {
+   /* Offset within the cluster; for the unclustered scan this is just the lane. */
+   LLVMValueRef pos    = cluster
+      ? LLVMBuildAnd(t->b, lane, LLVMConstInt(t->i32, cluster - 1u, false), "cpos")
+      : lane;
+   unsigned span = cluster ? cluster : 32u;
+   for (unsigned d = 1; d < span && d <= 16u; d <<= 1) {
       LLVMValueRef dc   = LLVMConstInt(t->i32, d, false);
       LLVMValueRef nbr  = emit_shfl_up(t, acc, d);
       LLVMValueRef comb = emit_scan_combine(t, rop, acc, nbr);
       if (!t->ok)
          return NULL;
-      LLVMValueRef inrange = LLVMBuildICmp(t->b, LLVMIntUGE, lane, dc, "");
+      LLVMValueRef inrange = LLVMBuildICmp(t->b, LLVMIntUGE, pos, dc, "");
       LLVMValueRef srcbit  = LLVMBuildAnd(t->b,
          LLVMBuildLShr(t->b, active, LLVMBuildSub(t->b, lane, dc, ""), ""),
          one, "");
@@ -2103,7 +2118,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
     *   inclusive[i] = combine(lanes 0..i)
     *   exclusive[i] = combine(lanes 0..i-1); lane 0 = identity  (= incl shifted up 1)
     *   reduce       = combine(all active lanes) = inclusive of the highest active lane
-    * 32-bit lane values only (the shfl transport width). */
+    * 32-bit lane values only (the shfl transport width).
+    *
+    * A reduce may additionally carry a cluster size: it then folds over each
+    * group of that many consecutive lanes independently rather than over the
+    * whole warp. Only reduce carries one — the scans never do — and a cluster
+    * spanning the entire subgroup has already been normalised to 0 upstream. */
    case nir_intrinsic_inclusive_scan:
    case nir_intrinsic_exclusive_scan:
    case nir_intrinsic_reduce: {
@@ -2113,8 +2133,26 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          t->ok = false;
          break;
       }
+      unsigned cluster = in->intrinsic == nir_intrinsic_reduce
+         ? nir_intrinsic_cluster_size(in) : 0u;
+      /* The cluster arithmetic below builds a power-of-two lane mask that must
+       * fit the 32-bit ballot, both of which Vulkan guarantees for a cluster no
+       * wider than the subgroup. Refuse anything else rather than fold over the
+       * wrong lanes. */
+      if ((cluster & (cluster - 1u)) || cluster > 32u) {
+         mesa_logw("vortexpipe: unsupported subgroup reduce cluster size %u",
+                   cluster);
+         t->ok = false;
+         break;
+      }
+      if (cluster == 1u) {
+         /* Each lane is its own cluster: the reduction is the lane's own value. */
+         ssa_set(t, in->def.index, 0, intr_src(t, in, 0));
+         break;
+      }
       nir_op rop  = nir_intrinsic_reduction_op(in);
-      LLVMValueRef incl = emit_subgroup_incl_scan(t, rop, intr_src(t, in, 0));
+      LLVMValueRef incl = emit_subgroup_incl_scan(t, rop, intr_src(t, in, 0),
+                                                  cluster);
       if (!t->ok)
          break;
       LLVMValueRef r;
@@ -2152,6 +2190,17 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          }
       } else { /* reduce: broadcast the highest active lane's inclusive value */
          LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+         if (cluster) {
+            /* Confine the search to this lane's cluster, or the broadcast would
+             * pull in the inclusive value of a lane the cluster does not
+             * contain -- which is the whole-warp answer, not the cluster's. */
+            LLVMValueRef lane = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+            LLVMValueRef base = LLVMBuildAnd(t->b, lane,
+               LLVMConstInt(t->i32, ~(cluster - 1u), false), "cbase");
+            LLVMValueRef cmask = LLVMBuildShl(t->b,
+               LLVMConstInt(t->i32, (1u << cluster) - 1u, false), base, "cmask");
+            active = LLVMBuildAnd(t->b, active, cmask, "cactive");
+         }
          LLVMValueRef hi = LLVMBuildSub(t->b, LLVMConstInt(t->i32, 31, false),
                                         emit_ctlz(t, active), "hi_lane");
          r = emit_shfl_idx(t, incl, hi);
