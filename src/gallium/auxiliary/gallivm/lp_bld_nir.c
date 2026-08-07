@@ -42,7 +42,7 @@
 
 /* do some basic opts to remove some things we don't want to see. */
 void
-lp_build_opt_nir(struct nir_shader *nir)
+lp_build_opt_nir(struct nir_shader *nir, unsigned subgroup_size)
 {
    bool progress;
 
@@ -74,7 +74,7 @@ lp_build_opt_nir(struct nir_shader *nir)
       NIR_PASS_V(nir, nir_lower_tex, &options);
 
       const nir_lower_subgroups_options subgroups_options = {
-         .subgroup_size = lp_native_vector_width / 32,
+         .subgroup_size = subgroup_size,
          .ballot_bit_size = 32,
          .ballot_components = 1,
          .lower_to_scalar = true,

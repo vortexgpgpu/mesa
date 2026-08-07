@@ -483,7 +483,7 @@ static char *
 llvmpipe_finalize_nir(struct pipe_screen *screen,
                       struct nir_shader *nir)
 {
-   lp_build_opt_nir(nir);
+   lp_build_opt_nir(nir, screen->compute_caps.subgroup_sizes);
    return NULL;
 }
 
