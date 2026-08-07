@@ -101,34 +101,78 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
    return vps->lp_finalize_nir(screen, nir);
 }
 
-/* Colour formats the device path renders and samples. The fixed-function
- * texture unit reads packed-integer formats only and the output merger writes
- * A8R8G8B8, so a render target or sampled texture outside this set would be
- * reinterpreted rather than converted -- wrong pixels with no error. Report
- * those unsupported so Vulkan skips them instead. */
-static bool
-vp_device_format_supported(enum pipe_format format, unsigned usage)
-{
-   const unsigned render_or_sample = PIPE_BIND_RENDER_TARGET |
-                                     PIPE_BIND_DEPTH_STENCIL |
-                                     PIPE_BIND_SAMPLER_VIEW;
-   if (!(usage & render_or_sample))
-      return true;   /* buffer / vertex / transfer use is format-agnostic here */
+/* What the device can carry, per usage. A format outside a set would be
+ * reinterpreted rather than converted -- wrong pixels with no error, or worse --
+ * so it is reported unsupported and Vulkan skips it.
+ *
+ * The four sets differ, and answering one list for every bind flag is what let
+ * a 16-bit colour attachment through while refusing a float texture that works.
+ * They are kept apart deliberately. */
 
+/* Textures the sampler path carries: the fixed-function formats, everything the
+ * host decodes to A8R8G8B8 on upload, the float formats that upload verbatim and
+ * sample through the float texel path, and the depth formats.
+ *
+ * sRGB is absent on purpose: the host decode converts sRGB to linear at 8-bit
+ * output precision, where Vulkan wants the conversion at higher precision ahead
+ * of filtering. It belongs on the device's native SRGB8A8 decode, not here. */
+static bool
+vp_format_sampled(enum pipe_format format)
+{
    switch (format) {
-   /* output-merger colour + the sampler's 32-bit source format */
+   /* 32-bit colour, decoded to the sampler's A8R8G8B8 source format */
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8X8_UNORM:
-   /* packed-integer texture formats the fixed-function sampler decodes */
+   /* packed and narrow colour, likewise host-decoded */
    case PIPE_FORMAT_B5G6R5_UNORM:
    case PIPE_FORMAT_B5G5R5A1_UNORM:
-   case PIPE_FORMAT_B4G4R4A4_UNORM:
-   case PIPE_FORMAT_L8A8_UNORM:
-   case PIPE_FORMAT_L8_UNORM:
-   case PIPE_FORMAT_A8_UNORM:
-   /* depth/stencil the output merger tests and writes */
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   /* 8-bit integer carriers, packed from their bytes (vp_is_int8_rgba) */
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R8G8B8A8_SINT:
+   /* float, uploaded verbatim and sampled as floats (vp_vx_tex_format) */
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R16G16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   /* depth, including the combined formats whose depth aspect converts to D32F */
+   case PIPE_FORMAT_Z16_UNORM:
+   case PIPE_FORMAT_Z32_FLOAT:
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Colour attachments. The output merger packs A8R8G8B8 and the pass-end transfer
+ * moves four bytes per texel, so a narrower attachment is not merely converted
+ * wrongly -- the transfer walks past the end of each row. 32-bit only. */
+static bool
+vp_format_render_target(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Depth/stencil attachments the output merger tests and writes. */
+static bool
+vp_format_depth_stencil(enum pipe_format format)
+{
+   switch (format) {
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
    case PIPE_FORMAT_S8_UINT_Z24_UNORM:
    case PIPE_FORMAT_Z16_UNORM:
@@ -137,6 +181,49 @@ vp_device_format_supported(enum pipe_format format, unsigned usage)
    default:
       return false;
    }
+}
+
+/* Storage images: the layouts the fragment translator emits image_load and
+ * image_store for. Anything else fails the translation loudly rather than
+ * reading wrong texels, but advertising it would still be a promise the driver
+ * cannot keep. */
+static bool
+vp_format_shader_image(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_UINT:
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Every requested bind must be one the device can honour for this format. */
+static bool
+vp_device_format_supported(enum pipe_format format, unsigned usage)
+{
+   if ((usage & PIPE_BIND_SAMPLER_VIEW) && !vp_format_sampled(format))
+      return false;
+   if ((usage & PIPE_BIND_RENDER_TARGET) && !vp_format_render_target(format))
+      return false;
+   if ((usage & PIPE_BIND_DEPTH_STENCIL) && !vp_format_depth_stencil(format))
+      return false;
+   if ((usage & PIPE_BIND_SHADER_IMAGE) && !vp_format_shader_image(format))
+      return false;
+   return true;   /* buffer / vertex / transfer use is format-agnostic here */
 }
 
 static bool

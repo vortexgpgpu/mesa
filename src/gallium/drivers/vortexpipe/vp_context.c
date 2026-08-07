@@ -856,6 +856,17 @@ vp_vx_border(const struct pipe_sampler_state *s)
         |  (uint32_t)(c[0] * 255.0f + 0.5f);
 }
 
+/* Drop the resident texture upload, so the next draw re-uploads. */
+static void
+vp_tex_residency_drop(struct vp_context *vp)
+{
+   if (vp->rtex_buf) {
+      vx_buffer_release(vp->rtex_buf);
+      vp->rtex_buf = NULL;
+   }
+   vp->rtex_res = NULL;
+}
+
 /* Capture the bound texture + sampler for the Vortex TEX unit.
  *
  * lavapipe does not bind app textures through set_sampler_views (it
@@ -872,6 +883,14 @@ vp_create_texture_handle(struct pipe_context *pipe,
 {
    struct vp_context *vp = vp_reg_get(pipe);
    if (view && view->texture) {
+      /* The resident upload is keyed on the resource pointer, and a destroyed
+       * resource's pointer is handed straight back to the next allocation. A
+       * new texture of the same dimensions would then hit the cache and be
+       * sampled as the old one's texels. A texture cannot be sampled without
+       * surfacing here first, so dropping the cache on every capture is what
+       * makes the key safe -- there is no cheaper signal, since the pointer,
+       * the storage address and the dimensions are all recycled. */
+      vp_tex_residency_drop(vp);
       vp->cur_tex = view->texture;
       vp->cur_tex_first_level = view->u.tex.first_level;
       /* The cube-ness of a cube/cube-array sampler lives on the view, not the
@@ -1515,9 +1534,16 @@ vp_vx_tex_format(enum pipe_format pf, uint32_t *bpp)
    case PIPE_FORMAT_R32G32B32A32_FLOAT:
       if (bpp) *bpp = 16;
       return VX_TEX_FORMAT_RGBA32F;
-   /* Combined depth/stencil (Z32_FLOAT_S8X24, Z24_UNORM_S8) has an interleaved
-    * stride the tight per-texel copy below can't reproduce; leave it as a
-    * follow-up rather than mis-decode it. */
+   /* Combined depth/stencil: the depth aspect converts to D32F on upload
+    * (vp_decode_slice). A 24-bit unorm is exact in an f32 significand, so the
+    * compare keeps full precision, and the SW sampler already decodes D32F.
+    * Sampling these is not optional -- lavapipe derives a format's sampled bit
+    * from its depth-stencil bit, so advertising the driver's primary depth
+    * format advertises sampling it too. */
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+      if (bpp) *bpp = 4;
+      return VX_TEX_FORMAT_D32F;
    default:
       if (bpp) *bpp = 4;
       return VX_TEX_FORMAT_A8R8G8B8;
@@ -1535,9 +1561,22 @@ vp_is_int8_rgba(enum pipe_format pf)
    return pf == PIPE_FORMAT_R8G8B8A8_SINT || pf == PIPE_FORMAT_R8G8B8A8_UINT;
 }
 
-/* Decode one mapped slice (wl x hl) into the tight device buffer at `dst`: `raw`
- * texels (depth and float) are copied verbatim, integer texels are packed from
- * their bytes, and other colour rows are decoded from the resource format to the
+/* True for the depth/stencil formats that pack both aspects into one word. Their
+ * depth aspect needs extracting, so they can be neither copied verbatim (the
+ * stencil byte would be read as part of the float) nor decoded by
+ * util_format_read_4ub -- a ZS format has no 8-unorm unpack at all (the function
+ * pointer is NULL, so calling it faults). */
+static bool
+vp_is_packed_zs(enum pipe_format pf)
+{
+   return pf == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+          pf == PIPE_FORMAT_S8_UINT_Z24_UNORM;
+}
+
+/* Decode one mapped slice (wl x hl) into the tight device buffer at `dst`: a
+ * packed depth/stencil row has its depth aspect converted to D32F, `raw` texels
+ * (depth and float) are copied verbatim, integer texels are packed from their
+ * bytes, and other colour rows are decoded from the resource format to the
  * VX A8R8G8B8 texel order (rowbuf is wl*4 scratch). */
 static void
 vp_decode_slice(uint8_t *dst, const uint8_t *map, unsigned src_stride,
@@ -1546,7 +1585,16 @@ vp_decode_slice(uint8_t *dst, const uint8_t *map, unsigned src_stride,
 {
    for (uint32_t y = 0; y < hl; y++) {
       const uint8_t *m = map + (size_t)y * src_stride;
-      if (!raw && vp_is_int8_rgba(fmt)) {
+      if (vp_is_packed_zs(fmt)) {
+         /* Z24_UNORM_S8 keeps depth in bits 23:0 and stencil in 31:24;
+          * S8_UINT_Z24_UNORM the other way round. */
+         const uint32_t shift = (fmt == PIPE_FORMAT_S8_UINT_Z24_UNORM) ? 8u : 0u;
+         float *df = (float *)(dst + (size_t)y * wl * 4);
+         for (uint32_t x = 0; x < wl; x++) {
+            const uint32_t v = ((const uint32_t *)m)[x];
+            df[x] = (float)((v >> shift) & 0xffffffu) * (1.0f / 16777215.0f);
+         }
+      } else if (!raw && vp_is_int8_rgba(fmt)) {
          uint32_t *d32 = (uint32_t *)(dst + (size_t)y * wl * 4);
          for (uint32_t x = 0; x < wl; x++) {
             d32[x] = ((uint32_t)m[x * 4 + 3] << 24) | ((uint32_t)m[x * 4 + 0] << 16)
@@ -1585,8 +1633,7 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
       return vx_buffer_address(vp->rtex_buf, tex_dev) == VX_SUCCESS;
    }
 
-   if (vp->rtex_buf) { vx_buffer_release(vp->rtex_buf); vp->rtex_buf = NULL; }
-   vp->rtex_res = NULL;
+   vp_tex_residency_drop(vp);
 
    /* Upload the whole mip chain contiguously so the TEX unit can address any
     * level the shader selects: level l lives at texel offset off_texels[l] and
