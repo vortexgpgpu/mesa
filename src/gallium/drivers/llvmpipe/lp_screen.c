@@ -483,7 +483,13 @@ static char *
 llvmpipe_finalize_nir(struct pipe_screen *screen,
                       struct nir_shader *nir)
 {
-   lp_build_opt_nir(nir, screen->compute_caps.subgroup_sizes);
+   /* llvmpipe's own execution width, not the screen's advertised subgroup
+    * size. A wrapping driver may advertise its device's warp width, and the
+    * shaders finalized here are the ones llvmpipe itself executes -- including
+    * every dispatch a wrapping driver falls back to it. Mesa's internal
+    * acceleration-structure builders do not survive being lowered for a
+    * narrower subgroup than llvmpipe runs. */
+   lp_build_opt_nir(nir, lp_native_vector_width / 32);
    return NULL;
 }
 

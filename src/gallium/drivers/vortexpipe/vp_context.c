@@ -109,12 +109,24 @@ vp_create_compute_state(struct pipe_context *pipe,
    struct vp_cso *cso = CALLOC_STRUCT(vp_cso);
    if (!cso)
       return NULL;   /* OOM -- vkCreateComputePipelines fails cleanly */
+   /* The device's own copy of the shader, lowered for a warp rather than for
+    * llvmpipe's vector width (vp_finalize_nir). Taken before llvmpipe is handed
+    * the original, because Gallium transfers NIR ownership here and the passes
+    * below rewrite what they are given. A miss falls back to the shader
+    * llvmpipe finalized. */
+   struct nir_shader *cs_nir = NULL;
+   if (state->ir_type == PIPE_SHADER_IR_NIR) {
+      cs_nir = vp_screen_take_dev_nir(pipe->screen,
+                                      (struct nir_shader *)state->prog);
+      if (!cs_nir)
+         cs_nir = nir_shader_clone(NULL, (struct nir_shader *)state->prog);
+   }
+
    cso->lp_cso = vp->lp_create_compute_state(pipe, state);
 
    /* Translate NIR -> LLVM IR -> Vortex .vxbin and retain it. */
-   if (state->ir_type == PIPE_SHADER_IR_NIR) {
+   if (cs_nir) {
       char *ir = NULL;
-      struct nir_shader *cs_nir = (struct nir_shader *)state->prog;
       /* VK_KHR_zero_initialize_workgroup_memory: a `shared` var with a null
        * initializer must read back as zero. Vortex LMEM is not cleared between
        * dispatches, so emit the standard cooperative zeroing pass (store_shared
@@ -137,13 +149,11 @@ vp_create_compute_state(struct pipe_context *pipe,
          (si->shared_size == 0) && !si->uses_control_barrier &&
          !si->workgroup_size_variable;
       /* the set-0 descriptors the kernel reaches -> launch relocation. */
-      vp_scan_descriptors((struct nir_shader *)state->prog,
-                          cso->descs, &cso->num_descs);
+      vp_scan_descriptors(cs_nir, cso->descs, &cso->num_descs);
       /* raw const-index shader-buffer slots (RT trace-ray command buffer) ->
        * SBT shader-record pointer relocation at launch. */
-      cso->trace_cmd_slots =
-         vp_scan_trace_cmd_slots((struct nir_shader *)state->prog);
-      if (vp_nir_to_llvm((struct nir_shader *)state->prog, &ir, NULL, NULL, 1)) {
+      cso->trace_cmd_slots = vp_scan_trace_cmd_slots(cs_nir);
+      if (vp_nir_to_llvm(cs_nir, &ir, NULL, NULL, 1)) {
          if (vp_compile_vxbin(ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
                       cso->vxbin_size);
@@ -160,6 +170,7 @@ vp_create_compute_state(struct pipe_context *pipe,
          mesa_logw("vortexpipe: NIR->LLVM unavailable; "
                    "shader runs on llvmpipe");
       }
+      ralloc_free(cs_nir);
    }
    return cso;
 }

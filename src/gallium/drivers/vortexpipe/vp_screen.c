@@ -21,6 +21,7 @@
 #include "vp_private.h"
 #include "llvmpipe/lp_public.h"
 #include "nir.h"
+#include "gallivm/lp_bld_nir.h"
 #include "util/u_memory.h"
 #include "util/log.h"
 
@@ -36,6 +37,12 @@ vp_screen_destroy(struct pipe_screen *screen)
        * inside the runtime; a no-op when unset. */
       vx_device_dump_perf(vps->dev, stdout);
       vx_device_release(vps->dev);
+   }
+   if (vps->dev_nir) {
+      hash_table_foreach(vps->dev_nir, e)
+         ralloc_free((struct nir_shader *)e->data);
+      _mesa_hash_table_destroy(vps->dev_nir, NULL);
+      simple_mtx_destroy(&vps->dev_nir_lock);
    }
    vp_reg_del(screen);
    FREE(vps);
@@ -98,7 +105,42 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
     * inlining, so callee scratch is covered) to keep the shader on device. */
    NIR_PASS(_, nir, nir_lower_scratch_to_var);
 
-   return vps->lp_finalize_nir(screen, nir);
+   /* Subgroup lowering constant-folds gl_SubgroupSize and sizes ballot and
+    * shuffle lowering, so the width is baked into the shader. llvmpipe
+    * finalizes for the width it executes at; the device needs its warp width.
+    * One shader object cannot carry both, and it has two consumers here --
+    * llvmpipe runs every dispatch that falls back. Keep a device copy lowered
+    * for the warp and let llvmpipe finalize the original for itself. */
+   struct nir_shader *dev = NULL;
+   if (vps->dev_nir && vps->hw_num_threads &&
+       nir->info.stage == MESA_SHADER_COMPUTE) {
+      dev = nir_shader_clone(NULL, nir);
+      lp_build_opt_nir(dev, vps->hw_num_threads);
+   }
+
+   char *err = vps->lp_finalize_nir(screen, nir);
+
+   if (dev) {
+      simple_mtx_lock(&vps->dev_nir_lock);
+      _mesa_hash_table_insert(vps->dev_nir, nir, dev);
+      simple_mtx_unlock(&vps->dev_nir_lock);
+   }
+   return err;
+}
+
+struct nir_shader *
+vp_screen_take_dev_nir(struct pipe_screen *screen, struct nir_shader *finalized)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (!vps || !vps->dev_nir)
+      return NULL;
+   simple_mtx_lock(&vps->dev_nir_lock);
+   struct hash_entry *e = _mesa_hash_table_search(vps->dev_nir, finalized);
+   struct nir_shader *dev = e ? e->data : NULL;
+   if (e)
+      _mesa_hash_table_remove(vps->dev_nir, e);
+   simple_mtx_unlock(&vps->dev_nir_lock);
+   return dev;
 }
 
 /* What the device can carry, per usage. A format outside a set would be
@@ -260,6 +302,11 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
       mesa_loge("vortexpipe: out of memory; running as plain llvmpipe");
       return screen;
    }
+
+   /* A miss here is not fatal: the device simply falls back to the shader
+    * llvmpipe finalized, which is what it used before this table existed. */
+   vps->dev_nir = _mesa_pointer_hash_table_create(NULL);
+   simple_mtx_init(&vps->dev_nir_lock, mtx_plain);
 
    /* Open the Vortex device once, held for the screen's lifetime. */
    uint32_t ndev = 0;

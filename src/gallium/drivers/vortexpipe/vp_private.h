@@ -18,6 +18,8 @@
 #ifndef VP_PRIVATE_H
 #define VP_PRIVATE_H
 
+#include "util/hash_table.h"
+#include "util/simple_mtx.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"      /* struct pipe_vertex_buffer (stored by value) */
@@ -42,6 +44,14 @@ struct vp_screen {
     * cached so the pointer Vulkan reads stays valid for the screen's life.
     * Sized to comfortably hold "vortexpipe (Vortex on <llvmpipe name>)". */
    char name_str[128];
+
+   /* Device-side copies of finalized compute shaders, keyed by the NIR
+    * llvmpipe kept. Subgroup lowering bakes in a width, and the two consumers
+    * of a finalized shader need different ones: llvmpipe executes at its own
+    * vector width, the device at a warp. One shader object cannot carry both,
+    * so the device gets its own copy lowered for the warp. */
+   struct hash_table *dev_nir;
+   simple_mtx_t       dev_nir_lock;
 
    /* Device caps cached at screen open. Used by the launch + draw paths
     * to refuse workloads the hardware can't run as one CTA, and to gate
@@ -432,6 +442,11 @@ struct vp_context {
 void  vp_reg_put(const void *key, void *data);
 void *vp_reg_get(const void *key);
 void  vp_reg_del(const void *key);
+
+/* Hand over the device-side copy of a finalized compute shader, or NULL if the
+ * screen kept none. The caller owns it and must ralloc_free it. */
+struct nir_shader *vp_screen_take_dev_nir(struct pipe_screen *screen,
+                                          struct nir_shader *finalized);
 
 /* Installed by vp_screen.c onto the llvmpipe screen's context_create. */
 struct pipe_context *vp_context_create(struct pipe_screen *screen,
