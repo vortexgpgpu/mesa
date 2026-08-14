@@ -593,6 +593,7 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
 bool
 vp_launch(vx_device_h dev,
           const void *vxbin, size_t vxbin_size,
+          vx_module_h *module_io, vx_kernel_h *kernel_io,
           const void *desc_host, uint32_t desc_bytes,
           const struct vp_desc *descs, uint32_t num_descs,
           const struct vp_ssbo *ssbos, uint32_t num_ssbos,
@@ -634,15 +635,18 @@ vp_launch(vx_device_h dev,
    asc.q   = q;
    asc.has_rtu = has_rtu;
 
-   /* Load the kernel image straight from memory — no /tmp round-trip (mirrors
-    * the gfx draw path's vx_module_load_bytes; the §6.6 module-residency cache
-    * is the next increment). */
-   VP_CHECK(vx_module_load_bytes(dev, vxbin, vxbin_size, &kmod),
-            "vx_module_load_bytes");
-   /* "main" is the public name vxbin.py assigns the single conventional
-    * kernel (the C entry is "kernel_main"); match the native runtime. */
-   VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf),
-            "vx_module_get_kernel");
+   /* Load the kernel image straight from memory — no /tmp round-trip — and
+    * leave it resident in the caller's slot, so a repeated dispatch of the same
+    * pipeline reuses it. "main" is the public name vxbin.py assigns the single
+    * conventional kernel (the C entry is "kernel_main"); match the native
+    * runtime. */
+   if (*module_io == NULL) {
+      VP_CHECK(vx_module_load_bytes(dev, vxbin, vxbin_size, module_io),
+               "vx_module_load_bytes");
+      VP_CHECK(vx_module_get_kernel(*module_io, "main", kernel_io),
+               "vx_module_get_kernel");
+   }
+   kbuf = *kernel_io;
 
    /* Relocate each descriptor into the staged descriptor blob:
     *  - VP_DESC_BUFFER: copy the resource into device memory, rewrite
@@ -849,8 +853,7 @@ done:
    for (unsigned i = 0; i < asc.n_stages; i++)
       free(asc.stages[i]);
    if (dbuf) vx_buffer_release(dbuf);
-   if (kbuf) vx_kernel_release(kbuf);
-   if (kmod) vx_module_release(kmod);
+   /* kbuf aliases *kernel_io and stays resident; the caller releases it. */
    if (q)    vx_queue_release(q);
    free(stage);
    return ok;

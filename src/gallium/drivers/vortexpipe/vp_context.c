@@ -98,6 +98,13 @@ vp_reg_del(const void *key)
 
 /* ---- compute-hook overrides ----------------------------------------- */
 
+/* Module residency, defined with the graphics hooks below. Compute needs both
+ * because a compute kernel and a fragment shader are loaded at the same fixed
+ * device address, so whichever is resident must give it up before the other
+ * can load. */
+static void vp_cso_evict_module(struct vp_cso *cso);
+static void vp_fs_variant_make_resident(struct vp_cso *cso, int want);
+
 /* create_compute_state returns a struct vp_cso* (llvmpipe's cso +
  * the compiled Vortex .vxbin); bind/delete unwrap it. */
 static void *
@@ -180,6 +187,10 @@ vp_bind_compute_state(struct pipe_context *pipe, void *p)
 {
    struct vp_context *vp  = vp_reg_get(pipe);
    struct vp_cso     *cso = p;
+   /* The compute device address is fixed (VP_STARTUP_FS); evict the previously
+    * resident compute kernel so the newly-bound one can load there. */
+   if (vp->cur_cso && vp->cur_cso != cso)
+      vp_cso_evict_module(vp->cur_cso);
    vp->cur_cso = cso;
    vp->lp_bind_compute_state(pipe, cso ? cso->lp_cso : NULL);
 }
@@ -191,6 +202,7 @@ vp_delete_compute_state(struct pipe_context *pipe, void *p)
    struct vp_cso     *cso = p;
    if (vp->cur_cso == cso)
       vp->cur_cso = NULL;
+   vp_cso_evict_module(cso);
    vp->lp_delete_compute_state(pipe, cso->lp_cso);
    vp_free_blob(cso->vxbin);
    FREE(cso);
@@ -372,7 +384,13 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
                 eff_grid[0], eff_grid[1], eff_grid[2],
                 eff_block[0], eff_block[1], eff_block[2],
                 cso->num_descs, num_ssbos);
+         /* Compute and fragment shaders both start at VP_STARTUP_FS, so a
+          * resident FS holds the address this kernel needs. Evict it before
+          * the kernel loads there. */
+         if (vp->cur_fs)
+            vp_fs_variant_make_resident(vp->cur_fs, -1);
          ran_on_vortex = vp_launch(vp->dev, cso->vxbin, cso->vxbin_size,
+                                   &cso->vx_module, &cso->vx_kernel,
                                    (uint8_t *)desc_host + vp->cbuf_off[1],
                                    desc_bytes, cso->descs, cso->num_descs,
                                    ssbos, num_ssbos,
@@ -800,6 +818,9 @@ vp_bind_fs_state(struct pipe_context *pipe, void *p)
     * can load there on the next draw. */
    if (vp->cur_fs && vp->cur_fs != cso)
       vp_fs_variant_make_resident(vp->cur_fs, -1);
+   /* A resident compute kernel occupies the same address. */
+   if (vp->cur_cso)
+      vp_cso_evict_module(vp->cur_cso);
    vp->cur_fs = cso;
    vp->lp_bind_fs_state(pipe, cso ? cso->lp_cso : NULL);
 }

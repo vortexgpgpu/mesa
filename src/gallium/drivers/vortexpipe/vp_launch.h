@@ -50,10 +50,18 @@ struct vp_ssbo {
  * the arg block. The kernel runs over grid x block; writable descriptor
  * buffers are copied back. `lmem_size` is the per-workgroup shared memory.
  *
+ * `module_io`/`kernel_io` are caller-owned residency slots, as on the draw
+ * path: the kernel image is loaded onto the device by the first dispatch that
+ * finds them NULL and reused by every dispatch after, so repeating a dispatch
+ * costs no module reload. The caller owns the release, and must evict before
+ * another shader takes the same device address -- compute and fragment shaders
+ * both start at VP_STARTUP_FS, so only one of them can be resident.
+ *
  * Returns true on success.
  */
 bool vp_launch(vx_device_h dev,
                const void *vxbin, size_t vxbin_size,
+               vx_module_h *module_io, vx_kernel_h *kernel_io,
                const void *desc_host, uint32_t desc_bytes,
                const struct vp_desc *descs, uint32_t num_descs,
                const struct vp_ssbo *ssbos, uint32_t num_ssbos,
