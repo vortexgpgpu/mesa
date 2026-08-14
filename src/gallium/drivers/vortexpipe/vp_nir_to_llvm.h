@@ -114,6 +114,12 @@ struct vp_desc {
     * lp_jit_buffer_from_pipe_const's DIV_ROUND_UP(size, sizeof(float))). Used
     * by the descriptor relocation to size the device upload; 0 for AS/image. */
    unsigned          elem_bytes;
+   /* True when this shader writes the descriptor: store_ssbo, an SSBO atomic,
+    * an image store, or an image atomic. Only then does the device copy need
+    * reading back into the host backing after the launch — a descriptor that is
+    * only ever loaded holds the bytes it was uploaded with, and copying those
+    * back is pure work. */
+   bool              writable;
 };
 #define VP_MAX_DESCS 16
 

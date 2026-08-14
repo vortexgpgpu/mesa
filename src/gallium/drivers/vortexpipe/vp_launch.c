@@ -675,10 +675,10 @@ vp_launch(vx_device_h dev,
 
       if (descs[i].kind == VP_DESC_IMAGE) {
          /* Storage image: copy the host backing to device memory and rewrite
-          * lp_jit_image.base, mirroring the buffer path. Registered in res[]
-          * so it is read back (the shader writes it) and released. Upload +
-          * readback is the correct full-duplex treatment for an accumulation
-          * image, which is both read and written each frame. */
+          * lp_jit_image.base, mirroring the buffer path. Upload + readback is
+          * the correct full-duplex treatment for an accumulation image, which
+          * is both read and written each frame; an image the shader only loads
+          * is uploaded and released without the readback. */
          uint64_t host_base = 0;
          uint16_t height    = 0;
          uint32_t row       = 0;
@@ -699,8 +699,10 @@ vp_launch(vx_device_h dev,
                                    isize, 0, NULL, NULL),
                   "vx_enqueue_write(image)");
          memcpy(slot + VP_JIT_IMG_BASE, &dev_addr, sizeof dev_addr);
-         res_host[i]  = (void *)(uintptr_t)host_base;
-         res_bytes[i] = isize;
+         if (descs[i].writable) {
+            res_host[i]  = (void *)(uintptr_t)host_base;
+            res_bytes[i] = isize;
+         }
          continue;
       }
 
@@ -722,8 +724,13 @@ vp_launch(vx_device_h dev,
                                 size, 0, NULL, NULL),
                "vx_enqueue_write(resource)");
       memcpy(slot + VP_JIT_BUF_PTR, &dev_addr, sizeof dev_addr);
-      res_host[i]  = (void *)(uintptr_t)host_ptr;
-      res_bytes[i] = size;
+      /* Only a descriptor the shader stores to needs its device copy brought
+       * back. A UBO cannot be written at all, and an SSBO this shader only
+       * loads returns exactly the bytes that were just uploaded. */
+      if (descs[i].writable) {
+         res_host[i]  = (void *)(uintptr_t)host_ptr;
+         res_bytes[i] = size;
+      }
    }
 
    /* upload the relocated descriptor buffer */
@@ -817,9 +824,9 @@ vp_launch(vx_device_h dev,
    };
    VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
 
-   /* copy every buffer back into its host backing */
+   /* copy every written buffer back into its host backing */
    for (uint32_t i = 0; i < num_descs; i++) {
-      if (!res[i])
+      if (!res[i] || !res_host[i])
          continue;
       VP_CHECK(vx_enqueue_read(q, res_host[i], res[i], 0, res_bytes[i],
                                0, NULL, NULL), "vx_enqueue_read(resource)");

@@ -5680,26 +5680,39 @@ vp_scan_descriptors(struct nir_shader *nir,
             enum vp_desc_kind kind = VP_DESC_BUFFER;
             unsigned elem_bytes = 1;            /* SSBO: num_elements is bytes */
             unsigned cbuf_index = 1;            /* default set-0 blob (index 1) */
+            bool writable = false;
             switch (in->intrinsic) {
             case nir_intrinsic_load_ssbo:
                off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                break;
             case nir_intrinsic_store_ssbo:
                off = vp_desc_addr_offset(in->src[1].ssa, &cbuf_index);
+               writable = true;
                break;
             case nir_intrinsic_ssbo_atomic:
             case nir_intrinsic_ssbo_atomic_swap:
                /* atomic RMW targets the same SSBO descriptor (src[0]); its
                 * data pointer must be relocated like a load/store_ssbo. */
                off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
+               writable = true;
                break;
-            case nir_intrinsic_image_load:
-            case nir_intrinsic_bindless_image_load:
             case nir_intrinsic_image_store:
             case nir_intrinsic_bindless_image_store:
+            case nir_intrinsic_image_atomic:
+            case nir_intrinsic_bindless_image_atomic:
+            case nir_intrinsic_image_atomic_swap:
+            case nir_intrinsic_bindless_image_atomic_swap:
+               writable = true;
+               FALLTHROUGH;
+            case nir_intrinsic_image_load:
+            case nir_intrinsic_bindless_image_load:
                /* storage image: src[0] is the bindless descriptor address, in
                 * the same const_buf_base+binding form as an SSBO. lp_jit_image
-                * sizing (height*row_stride) is done in the launch relocation. */
+                * sizing (height*row_stride) is done in the launch relocation.
+                * The atomics take the descriptor in src[0] as well, and a shader
+                * whose only access to an image is an atomic still needs the
+                * descriptor relocated for that atomic to land on the device
+                * copy rather than the host one. */
                off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                kind = VP_DESC_IMAGE;
                elem_bytes = 0;
@@ -5743,17 +5756,25 @@ vp_scan_descriptors(struct nir_shader *nir,
             if (off < 0)
                continue;
             /* Distinct by (cbuf_index, offset): the same byte offset in two sets
-             * is two different descriptors. */
+             * is two different descriptors. A descriptor that is both loaded
+             * and stored appears once per access, so writability accumulates
+             * onto the entry already recorded -- dropping the duplicate
+             * outright would lose the store when the load was seen first. */
             bool dup = false;
             for (unsigned k = 0; k < n; k++)
                if (out[k].offset == (unsigned)off &&
-                   out[k].cbuf_index == cbuf_index) { dup = true; break; }
+                   out[k].cbuf_index == cbuf_index) {
+                  out[k].writable |= writable;
+                  dup = true;
+                  break;
+               }
             if (dup || n >= VP_MAX_DESCS)
                continue;
             out[n].offset     = (unsigned)off;
             out[n].cbuf_index = cbuf_index;
             out[n].kind       = kind;
             out[n].elem_bytes = elem_bytes;
+            out[n].writable   = writable;
             n++;
          }
       }
