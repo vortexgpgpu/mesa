@@ -805,6 +805,10 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
          /* No on-device transform feedback / geometry streams. */
          features->transformFeedback           = false;
          features->geometryStreams             = false;
+         /* A non-zero vertex stream is produced only by a geometry shader or
+          * transform feedback, neither of which the device has, so the query
+          * can never be asked about one. The stream-0 query still works. */
+         features->primitivesGeneratedQueryWithNonZeroStreams = false;
          /* Multisampling is not plumbed on the device path: the fixed-function
           * output merger is single-sample and the rasterizer tests coverage at
           * pixel centers only, so a multisample framebuffer would render wrong
@@ -1383,6 +1387,38 @@ lvp_physical_device_init(struct lvp_physical_device *device,
 
    /* SNORM blending on llvmpipe fails CTS - disable by default */
    device->snorm_blend = debug_get_bool_option("LVP_SNORM_BLEND", false);
+
+   /*
+    * Extension-list honesty (vortexpipe / Vortex device path only).
+    *
+    * lvp_get_features() below reports every feature of the extensions listed
+    * here as unsupported on Vortex. An extension whose entire feature set is
+    * false still appears in vkEnumerateDeviceExtensionProperties, so an
+    * application can enable it, query its features, and get nothing usable --
+    * the declaration and the capability disagree. Withdraw the extension so
+    * the two say the same thing.
+    *
+    * Only extensions with no remaining usable feature are withdrawn. Line
+    * rasterization stays: wide lines are a core feature and are reported
+    * unsupported, but the rasterization modes the extension adds are reached
+    * through the software fallback. multiview stays for the reason
+    * lvp_get_features() gives -- only its geometry and tessellation variants
+    * are withheld.
+    */
+   {
+      const char *dev_name = device->pscreen->get_name(device->pscreen);
+      if (dev_name && !strncmp(dev_name, "vortexpipe", 10)) {
+         /* No mesh or task pipeline on device. */
+         device->vk.supported_extensions.EXT_mesh_shader = false;
+         /* No transform feedback or geometry streams on device. */
+         device->vk.supported_extensions.EXT_transform_feedback = false;
+         /* The device A extension has 32-bit integer AMOs only: no 64-bit
+          * integer atomics, and no float atomics of any width. */
+         device->vk.supported_extensions.KHR_shader_atomic_int64 = false;
+         device->vk.supported_extensions.EXT_shader_atomic_float = false;
+         device->vk.supported_extensions.EXT_shader_atomic_float2 = false;
+      }
+   }
 
    lvp_get_features(device, &device->vk.supported_features);
    lvp_get_properties(device, &device->vk.properties);
