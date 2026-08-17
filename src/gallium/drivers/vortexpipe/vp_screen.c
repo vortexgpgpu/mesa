@@ -113,7 +113,8 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
     * for the warp and let llvmpipe finalize the original for itself. */
    struct nir_shader *dev = NULL;
    if (vps->dev_nir && vps->hw_num_threads &&
-       nir->info.stage == MESA_SHADER_COMPUTE) {
+       (nir->info.stage == MESA_SHADER_COMPUTE ||
+        nir->info.stage == MESA_SHADER_VERTEX)) {
       dev = nir_shader_clone(NULL, nir);
       lp_build_opt_nir(dev, vps->hw_num_threads);
    }

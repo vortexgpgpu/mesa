@@ -496,12 +496,26 @@ vp_create_vs_state(struct pipe_context *pipe,
    struct vp_cso *cso = CALLOC_STRUCT(vp_cso);
    if (!cso)
       return NULL;   /* OOM -- vkCreateGraphicsPipelines fails cleanly */
+
+   /* The device's own copy of the shader, lowered for a warp rather than for
+    * llvmpipe's vector width (vp_finalize_nir). Taken before llvmpipe is handed
+    * the original, because Gallium transfers NIR ownership here and the passes
+    * below rewrite what they are given. A miss falls back to the shader
+    * llvmpipe finalized. */
+   struct nir_shader *vs_nir = NULL;
+   if (state->type == PIPE_SHADER_IR_NIR) {
+      vs_nir = vp_screen_take_dev_nir(pipe->screen,
+                                      (struct nir_shader *)state->ir.nir);
+      if (!vs_nir)
+         vs_nir = nir_shader_clone(NULL, (struct nir_shader *)state->ir.nir);
+   }
+
    cso->lp_cso = vp->lp_create_vs_state(pipe, state);
 
    /* Translate the vertex shader NIR -> LLVM IR -> Vortex .vxbin. */
-   if (state->type == PIPE_SHADER_IR_NIR) {
+   if (vs_nir) {
       char *ir = NULL;
-      if (vp_nir_to_llvm((struct nir_shader *)state->ir.nir, &ir,
+      if (vp_nir_to_llvm(vs_nir, &ir,
                          &cso->vs_layout, NULL, 1)) {
          /* VS links at a distinct base so it co-resides with the FS
           * (0x80000000) + front end (0x80200000) in one OP_DRAW. */
@@ -518,6 +532,7 @@ vp_create_vs_state(struct pipe_context *pipe,
          mesa_logw("vortexpipe: VS NIR->LLVM unavailable; "
                    "vertex stage runs on llvmpipe");
       }
+      ralloc_free(vs_nir);
    }
    return cso;
 }
