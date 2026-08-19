@@ -14,6 +14,8 @@
 #include <stdbool.h>
 
 #include "vortex2.h"
+
+struct pipe_screen;
 #include "vp_nir_to_llvm.h"      /* struct vp_desc */
 
 #ifdef __cplusplus
@@ -59,7 +61,7 @@ struct vp_ssbo {
  *
  * Returns true on success.
  */
-bool vp_launch(vx_device_h dev,
+bool vp_launch(struct pipe_screen *screen, vx_device_h dev,
                const void *vxbin, size_t vxbin_size,
                vx_module_h *module_io, vx_kernel_h *kernel_io,
                const void *desc_host, uint32_t desc_bytes,
@@ -98,7 +100,7 @@ struct vp_vertex_input {
  * must vx_buffer_release. The on-device front end (vp_raster_draw's expand_k)
  * consumes them directly; only the llvmpipe-raster fallback reads them back to
  * host (vp_buffer_readback). `out_bytes` is the logical count*stride size. */
-bool vp_launch_vs(vx_device_h dev,
+bool vp_launch_vs(struct pipe_screen *screen, vx_device_h dev,
                   const void *vxbin, size_t vxbin_size,
                   uint32_t vertex_count, uint32_t out_bytes,
                   const struct vp_vertex_input *vin,

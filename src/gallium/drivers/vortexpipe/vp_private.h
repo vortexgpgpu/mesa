@@ -29,6 +29,13 @@
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
 #include "gfx_fs_desc_abi.h"     /* GFX_OM_MAX_RT */
 
+/* vp_raster.cpp is C++; the declarations below are defined in C translation
+ * units, so their linkage has to be spelled out or the C++ caller looks for a
+ * mangled symbol that does not exist. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Per-screen vortexpipe state, keyed by the llvmpipe pipe_screen *. */
 struct vp_screen {
    vx_device_h dev;                       /* Vortex device, or NULL */
@@ -77,7 +84,69 @@ struct vp_screen {
                             * Gates the HW RT path (ray-query / trace-ray
                             * lowered to vx_rt_ ops) vs lavapipe's SW BVH
                             * walk. */
+
+   /* Device buffers that outlive the dispatch that first needed them, keyed by
+    * the host allocation they mirror. Without this a resource is allocated,
+    * uploaded and freed per dispatch -- per draw on the graphics path -- so an
+    * unchanged vertex buffer is re-uploaded every frame and a resource's device
+    * address moves between dispatches.
+    *
+    * Entries are removed from resource_destroy. A host allocation can be freed
+    * and a later one can land at the same address, so a table keyed on a raw
+    * pointer without eviction would serve a stale device buffer for a different
+    * resource -- this driver has already been bitten by pointer recycling
+    * aliasing a driver-side cache. */
+   struct vp_resident *resident;
+   unsigned            n_resident;
+   unsigned            resident_cap;
+   simple_mtx_t        resident_lock;
+   void (*lp_resource_destroy)(struct pipe_screen *, struct pipe_resource *);
 };
+
+/* One host allocation's device-resident mirror. `host_base`/`size` describe the
+ * host range it stands for, so a descriptor pointing anywhere inside that range
+ * resolves to this entry at the matching offset. */
+struct vp_resident {
+   const uint8_t *host_base;
+   uint32_t       size;
+   vx_buffer_h    buf;
+   uint64_t       dev_addr;
+   /* Whether the host bytes have changed since the device copy was last
+    * written. Starts true and is cleared only by a completed upload, so every
+    * path that has not been taught to invalidate errs towards re-uploading
+    * rather than towards serving stale data. */
+   bool           dirty;
+};
+
+/* The host bytes `pres` owns, for either a buffer or a texture. False when the
+ * range cannot be determined, and the resource must then be treated as holding
+ * nothing resident. */
+bool vp_resource_host_range(struct pipe_resource *pres, const uint8_t **out_base,
+                            uint32_t *out_size);
+
+/* Device address for `bytes` of host memory at `host`, allocating and recording
+ * a resident buffer on first use. Returns 0 on failure. `out_buf` receives the
+ * device buffer the range lives in (owned by the screen, not the caller) and
+ * `out_off` the byte offset of `host` within it. */
+uint64_t vp_screen_resident_addr(struct pipe_screen *screen, const void *host,
+                                 uint32_t bytes, vx_buffer_h *out_buf,
+                                 uint32_t *out_off, bool *out_dirty);
+
+/* Record that the device copy of `bytes` at `host` now matches the host bytes.
+ * Called after an upload completes, never before -- a range marked clean that
+ * was not actually written is served stale on the next dispatch. */
+void vp_screen_resident_clean(struct pipe_screen *screen, const void *host,
+                              uint32_t bytes);
+
+/* Mark every resident range overlapping [host, host+bytes) as needing a fresh
+ * upload. */
+void vp_screen_resident_dirty(struct pipe_screen *screen, const void *host,
+                              uint32_t bytes);
+
+/* Mark every resident range dirty. Used when work runs on llvmpipe: it writes
+ * host allocations directly, and nothing reports which ones, so the only sound
+ * answer is to distrust all of them. */
+void vp_screen_resident_dirty_all(struct pipe_screen *screen);
 
 /* A compiled compute state: llvmpipe's cso plus the Vortex kernel
  * image. vortexpipe's create_compute_state returns one of these
@@ -251,6 +320,19 @@ struct vp_velems_cso {
 /* Per-context vortexpipe state, keyed by the llvmpipe pipe_context *. */
 struct vp_context {
    vx_device_h dev;                       /* borrowed from vp_screen */
+   /* llvmpipe entry points vortexpipe interposes on to invalidate the device's
+    * copy of a resource the host just wrote. */
+   void (*lp_buffer_subdata)(struct pipe_context *, struct pipe_resource *,
+                             unsigned usage, unsigned offset, unsigned size,
+                             const void *data);
+   void (*lp_texture_subdata)(struct pipe_context *, struct pipe_resource *,
+                              unsigned level, unsigned usage,
+                              const struct pipe_box *, const void *data,
+                              unsigned stride, uintptr_t layer_stride);
+   void (*lp_buffer_unmap)(struct pipe_context *, struct pipe_transfer *);
+   void (*lp_clear_buffer)(struct pipe_context *, struct pipe_resource *,
+                           unsigned offset, unsigned size,
+                           const void *clear_value, int clear_value_size);
    struct vp_cso *cur_cso;                /* bound compute state */
    struct vp_cso *cur_vs;                 /* bound vertex shader */
    struct vp_cso *cur_fs;                 /* bound fragment shader */
@@ -466,5 +548,9 @@ void vp_dbg(const char *fmt, ...)
    __attribute__((__format__(__printf__, 1, 2)))
 #endif
    ;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* VP_PRIVATE_H */

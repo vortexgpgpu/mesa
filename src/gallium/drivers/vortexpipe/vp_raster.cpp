@@ -18,6 +18,7 @@
  */
 
 #include "vp_raster.h"
+#include "vp_private.h"        /* vp_screen_resident_addr */
 #include "vp_launch.h"           /* struct vp_vertex_input (folded-in VS stage) */
 #include "vp_compile.h"          /* VP_STARTUP_VS link base */
 
@@ -212,7 +213,8 @@ vp_pool_ensure(vx_device_h dev, struct vp_raster_pool *pool,
 }
 
 extern "C" bool
-vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
+vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
+               struct vp_raster_pool *pool,
                const void *vs_vxbin, size_t vs_vxbin_size,
                vx_module_h *vs_module_io, vx_kernel_h *vs_kernel_io,
                const void *fs_vxbin, size_t fs_vxbin_size,
@@ -295,7 +297,9 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
     * (pool- / context-owned); only the per-draw VS-output + vertex-input
     * buffers are owned here. */
    vx_buffer_h vsbuf = NULL, tbuf = NULL, fabuf = NULL;
-   vx_buffer_h vbufs_dev[8] = { NULL };   /* one per distinct vertex buffer */
+   /* Borrowed from the screen's residency table -- one per distinct vertex
+    * buffer, resident for the resource's life rather than the draw's. */
+   vx_buffer_h vbufs_dev[8] = { NULL };
    /* Per-draw FS descriptor table + one device buffer per bound fragment
     * constant buffer (push constants / UBOs / descriptor blob). */
    vx_buffer_h fs_desc_buf = NULL;
@@ -499,14 +503,28 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                                            ? fs_consts->descs[d].elem_bytes : 1u);
                if (!host_ptr || !rsz)
                   continue;
-               VP_CHECK(vx_buffer_create(dev, rsz, 0, &fs_res_bufs[d]),
-                        "vx_buffer_create(fs_res)");
-               uint64_t res_dev = 0;
-               VP_CHECK(vx_buffer_address(fs_res_bufs[d], &res_dev),
-                        "vx_buffer_address(fs_res)");
-               VP_CHECK(vx_enqueue_write(q, fs_res_bufs[d], 0,
-                                         (void *)(uintptr_t)host_ptr, rsz, 0, NULL, NULL),
-                        "vx_enqueue_write(fs_res)");
+               /* Resident: this is a host resource addressed by pointer, the
+                * same shape as the compute descriptor path, and the draw only
+                * uploads it -- nothing is read back, so reusing the device
+                * buffer across draws costs nothing and saves an allocation per
+                * draw. The handle is borrowed from the screen and must not be
+                * released with the draw. */
+               uint32_t res_off = 0;
+               bool res_dirty = true;
+               uint64_t res_dev = vp_screen_resident_addr(screen,
+                                                          (const void *)(uintptr_t)host_ptr,
+                                                          rsz, &fs_res_bufs[d], &res_off,
+                                                          &res_dirty);
+               if (!res_dev) {
+                  mesa_loge("vortexpipe: raster: no device memory for FS resource");
+                  goto done;
+               }
+               if (res_dirty) {
+                  VP_CHECK(vx_enqueue_write(q, fs_res_bufs[d], res_off,
+                                            (void *)(uintptr_t)host_ptr, rsz, 0, NULL, NULL),
+                           "vx_enqueue_write(fs_res)");
+                  vp_screen_resident_clean(screen, (const void *)(uintptr_t)host_ptr, rsz);
+               }
                memcpy(fs_desc_stage[i] + off + VP_JIT_BUF_PTR, &res_dev, sizeof res_dev);
             }
             upload = fs_desc_stage[i];
@@ -722,14 +740,28 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          /* Upload each distinct vertex-buffer resource once; an attribute then
           * points at its own buffer's device base + its byte offset. */
          uint64_t buf_dev[8] = { 0 };
+         uint32_t buf_off[8] = { 0 };
          for (uint32_t j = 0; j < vin->num_bufs; j++) {
-            VP_CHECK(vx_buffer_create(dev, vin->buf_size[j], 0, &vbufs_dev[j]),
-                     "vx_buffer_create(vbuf)");
-            VP_CHECK(vx_buffer_address(vbufs_dev[j], &buf_dev[j]),
-                     "vx_buffer_address(vbuf)");
-            VP_CHECK(vx_enqueue_write(q, vbufs_dev[j], 0, vin->buf_data[j],
-                                      vin->buf_size[j], 0, NULL, NULL),
-                     "vx_enqueue_write(vbuf)");
+            /* Resident: buf_data[j] is the whole vertex-buffer resource, so the
+             * entry keys on exactly the resource's range and every later draw
+             * from the same geometry resolves to the same device buffer instead
+             * of allocating a new one per draw. */
+            bool vdirty = true;
+            buf_dev[j] = vp_screen_resident_addr(screen, vin->buf_data[j],
+                                                 vin->buf_size[j],
+                                                 &vbufs_dev[j], &buf_off[j], &vdirty);
+            if (!buf_dev[j]) {
+               mesa_loge("vortexpipe: raster: no device memory for vertex buffer");
+               goto done;
+            }
+            if (vdirty) {
+               VP_CHECK(vx_enqueue_write(q, vbufs_dev[j], buf_off[j], vin->buf_data[j],
+                                         vin->buf_size[j], 0, NULL, NULL),
+                        "vx_enqueue_write(vbuf)");
+               vp_screen_resident_clean(screen, vin->buf_data[j], vin->buf_size[j]);
+            } else {
+               vp_dbg("vortexpipe: raster: vbuf upload skipped (clean)");
+            }
          }
          for (uint32_t i = 0; i < vin->num_attrs; i++) {
             uint32_t loc = vin->attr_loc[i];
@@ -1059,16 +1091,15 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
 done:
    /* the front-end working set, code modules and colour/depth/texture buffers
-    * are resident (pool- / context-cached) and persist across draws; only the
-    * per-draw VS-output + vertex-input buffers are released here. */
+    * are resident (pool- / context-cached) and persist across draws; the
+    * vertex-input and FS-resource buffers are now resident too (borrowed from
+    * the screen), so only the per-draw VS-output and staging buffers are
+    * released here. */
    if (tbuf) vx_buffer_release(tbuf);
-   for (vx_buffer_h &b : vbufs_dev) { if (b) vx_buffer_release(b); }
    if (vsbuf) vx_buffer_release(vsbuf);
    if (fabuf) vx_buffer_release(fabuf);
    if (fs_desc_buf) vx_buffer_release(fs_desc_buf);
    for (vx_buffer_h b : fs_cbuf_bufs)
-      if (b) vx_buffer_release(b);
-   for (vx_buffer_h b : fs_res_bufs)
       if (b) vx_buffer_release(b);
    for (uint8_t *s : fs_desc_stage)
       if (s) free(s);

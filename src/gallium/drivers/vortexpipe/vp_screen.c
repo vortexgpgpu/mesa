@@ -20,16 +20,227 @@
 #include "vp_public.h"
 #include "vp_private.h"
 #include "llvmpipe/lp_public.h"
+#include "llvmpipe/lp_texture.h"   /* struct llvmpipe_resource: a resource's host base */
 #include "nir.h"
 #include "gallivm/lp_bld_nir.h"
 #include "util/u_memory.h"
 #include "util/log.h"
+
+/* ---- resource residency -------------------------------------------------- *
+ * A device buffer per host allocation, living as long as the resource does
+ * rather than as long as one dispatch. See struct vp_screen for why eviction,
+ * not lookup, is the load-bearing half. */
+
+/* The host bytes a resource owns, whatever its shape. Both kinds reach the
+ * residency table -- a buffer through its descriptor's pointer, a texture
+ * through the base an image descriptor carries -- so a hook that understood
+ * only buffers would leave every resident image un-evicted and un-invalidated.
+ * llvmpipe stores the two in different members and asserts on the wrong one,
+ * which is why this cannot be a single accessor. Returns false when the range
+ * is unknown, and the caller must then treat the resource as not resident. */
+bool
+vp_resource_host_range(struct pipe_resource *pres, const uint8_t **out_base,
+                       uint32_t *out_size)
+{
+   const struct llvmpipe_resource *lpr = llvmpipe_resource_const(pres);
+
+   if (llvmpipe_resource_is_texture(pres)) {
+      *out_base = lpr->tex_data;
+      /* Zero for a display target, whose storage belongs to the winsys and is
+       * never handed to a shader as an image base. */
+      *out_size = (uint32_t)lpr->total_alloc_size;
+   } else {
+      *out_base = lpr->data;
+      *out_size = pres->width0;
+   }
+   return *out_base && *out_size;
+}
+
+/* Drop every entry whose host range overlaps [base, base+size). A descriptor
+ * may point partway into a resource, so an entry's host_base is the range that
+ * was first asked for and need not equal the resource's own base -- overlap is
+ * the test that catches all of them, equality would not. */
+static void
+vp_resident_evict_range(struct vp_screen *vps, const uint8_t *base, uint32_t size)
+{
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_resident; ) {
+      struct vp_resident *e = &vps->resident[i];
+      if (e->host_base < base + size && base < e->host_base + e->size) {
+         vx_buffer_release(e->buf);
+         vps->resident[i] = vps->resident[--vps->n_resident];
+      } else {
+         i++;
+      }
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+}
+
+/* Every entry overlapping [base, base+size) is marked as the caller asks. A
+ * range shared by two entries after a merge is reported for both, which is why
+ * this walks the whole table rather than stopping at the first hit. */
+static void
+vp_resident_set_dirty(struct vp_screen *vps, const uint8_t *base, uint32_t size,
+                      bool dirty)
+{
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_resident; i++) {
+      struct vp_resident *e = &vps->resident[i];
+      if (e->host_base < base + size && base < e->host_base + e->size) {
+         e->dirty = dirty;
+      }
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+}
+
+void
+vp_screen_resident_clean(struct pipe_screen *screen, const void *host,
+                         uint32_t bytes)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (vps) {
+      vp_resident_set_dirty(vps, host, bytes, false);
+   }
+}
+
+void
+vp_screen_resident_dirty(struct pipe_screen *screen, const void *host,
+                         uint32_t bytes)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (vps) {
+      vp_resident_set_dirty(vps, host, bytes, true);
+   }
+}
+
+void
+vp_screen_resident_dirty_all(struct pipe_screen *screen)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (!vps) {
+      return;
+   }
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_resident; i++) {
+      vps->resident[i].dirty = true;
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+}
+
+uint64_t
+vp_screen_resident_addr(struct pipe_screen *screen, const void *host,
+                        uint32_t bytes, vx_buffer_h *out_buf, uint32_t *out_off,
+                        bool *out_dirty)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   const uint8_t *p = host;
+
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_resident; i++) {
+      struct vp_resident *e = &vps->resident[i];
+      if (p >= e->host_base && p + bytes <= e->host_base + e->size) {
+         uint32_t off = (uint32_t)(p - e->host_base);
+         *out_buf = e->buf;
+         *out_off = off;
+         *out_dirty = e->dirty;
+         uint64_t addr = e->dev_addr + off;
+         simple_mtx_unlock(&vps->resident_lock);
+         return addr;
+      }
+   }
+
+   /* No entry contains the range. Any entry that merely *overlaps* it must be
+    * absorbed rather than left alongside a second buffer for the same host
+    * bytes: each dispatch uploads and reads back through whichever entry its
+    * descriptor resolved to, so two device copies of one host byte would make
+    * the last readback win and silently drop the other's write. Widen to the
+    * union of the request and every overlapping entry, and keep exactly one
+    * buffer for it. Uploads happen per dispatch regardless, so nothing is lost
+    * by dropping the old buffers' contents here. */
+   const uint8_t *lo = p;
+   const uint8_t *hi = p + bytes;
+   for (unsigned i = 0; i < vps->n_resident; ) {
+      struct vp_resident *e = &vps->resident[i];
+      if (e->host_base < hi && lo < e->host_base + e->size) {
+         if (e->host_base < lo) {
+            lo = e->host_base;
+         }
+         if (e->host_base + e->size > hi) {
+            hi = e->host_base + e->size;
+         }
+         vx_buffer_release(e->buf);
+         vps->resident[i] = vps->resident[--vps->n_resident];
+      } else {
+         i++;
+      }
+   }
+
+   if (vps->n_resident == vps->resident_cap) {
+      unsigned cap = vps->resident_cap ? vps->resident_cap * 2 : 16;
+      struct vp_resident *t = realloc(vps->resident, cap * sizeof *t);
+      if (!t) {
+         simple_mtx_unlock(&vps->resident_lock);
+         return 0;
+      }
+      vps->resident     = t;
+      vps->resident_cap = cap;
+   }
+
+   uint32_t span = (uint32_t)(hi - lo);
+   vx_buffer_h buf = NULL;
+   uint64_t addr = 0;
+   if (vx_buffer_create(vps->dev, span, 0, &buf) != VX_SUCCESS ||
+       vx_buffer_address(buf, &addr) != VX_SUCCESS) {
+      if (buf) {
+         vx_buffer_release(buf);
+      }
+      simple_mtx_unlock(&vps->resident_lock);
+      return 0;
+   }
+
+   vps->resident[vps->n_resident++] = (struct vp_resident){
+      .host_base = lo, .size = span, .buf = buf, .dev_addr = addr,
+      .dirty = true,   /* a buffer that has never been written holds nothing */
+   };
+   vp_dbg("vortexpipe: resident alloc %u bytes (%u live)", span, vps->n_resident);
+   simple_mtx_unlock(&vps->resident_lock);
+   *out_buf = buf;
+   *out_off = (uint32_t)(p - lo);
+   *out_dirty = true;
+   return addr + (uint32_t)(p - lo);
+}
+
+/* A destroyed resource's device mirror must go with it: the allocator is free
+ * to hand the same host address to the next resource, and a surviving entry
+ * would then serve that resource the previous one's device buffer. */
+static void
+vp_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pres)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   const uint8_t *base = NULL;
+   uint32_t size = 0;
+   if (vps->dev && vp_resource_host_range(pres, &base, &size)) {
+      vp_resident_evict_range(vps, base, size);
+   }
+   vps->lp_resource_destroy(screen, pres);
+}
 
 static void
 vp_screen_destroy(struct pipe_screen *screen)
 {
    struct vp_screen *vps = vp_reg_get(screen);
    void (*lp_destroy)(struct pipe_screen *) = vps->lp_screen_destroy;
+
+   /* Hand resource_destroy back to llvmpipe before the state it needs goes
+    * away: llvmpipe's own teardown below destroys whatever resources are still
+    * alive, and each of those would otherwise re-enter vp_resource_destroy
+    * after vps has been freed. */
+   screen->resource_destroy = vps->lp_resource_destroy;
+   for (unsigned i = 0; i < vps->n_resident; i++) {
+      vx_buffer_release(vps->resident[i].buf);
+   }
+   free(vps->resident);
+   simple_mtx_destroy(&vps->resident_lock);
 
    if (vps->dev) {
       /* Dump GPU perf counters at device teardown, matching pocl_vortex's
@@ -309,6 +520,8 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    vps->dev_nir = _mesa_pointer_hash_table_create(NULL);
    simple_mtx_init(&vps->dev_nir_lock, mtx_plain);
 
+   simple_mtx_init(&vps->resident_lock, mtx_plain);
+
    /* Open the Vortex device once, held for the screen's lifetime. */
    uint32_t ndev = 0;
    if (vx_device_count(&ndev) == VX_SUCCESS && ndev > 0 &&
@@ -349,6 +562,7 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    vps->lp_screen_get_name     = screen->get_name;
    vps->lp_finalize_nir        = screen->finalize_nir;
    vps->lp_is_format_supported = screen->is_format_supported;
+   vps->lp_resource_destroy    = screen->resource_destroy;
    vp_reg_put(screen, vps);
 
    screen->context_create      = vp_context_create;
@@ -356,6 +570,7 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    screen->get_name            = vp_screen_get_name;
    screen->finalize_nir        = vp_finalize_nir;
    screen->is_format_supported = vp_screen_is_format_supported;
+   screen->resource_destroy    = vp_resource_destroy;
 
    /* Clamp llvmpipe's compute caps to the Vortex hardware cap so well-
     * behaved Vulkan apps that read maxComputeWorkGroupSize /

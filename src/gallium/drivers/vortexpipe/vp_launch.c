@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE
 #include "vp_launch.h"
+#include "vp_private.h"        /* vp_screen_resident_addr */
 #include "gfx_fs_desc_abi.h"     /* GFX_FS_DESC_SLOTS (VS constant-buffer table) */
 
 #include <stdio.h>
@@ -618,7 +619,7 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
 }
 
 bool
-vp_launch(vx_device_h dev,
+vp_launch(struct pipe_screen *screen, vx_device_h dev,
           const void *vxbin, size_t vxbin_size,
           vx_module_h *module_io, vx_kernel_h *kernel_io,
           const void *desc_host, uint32_t desc_bytes,
@@ -633,7 +634,11 @@ vp_launch(vx_device_h dev,
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
    vx_buffer_h dbuf = NULL;
-   vx_buffer_h res[VP_MAX_DESCS]      = { 0 };  /* per-descriptor device buffer */
+   /* Resident device buffers are owned by the screen and outlive the dispatch,
+    * so these are borrowed handles -- released here they would be freed out
+    * from under the next dispatch that resolves to the same host range. */
+   vx_buffer_h res[VP_MAX_DESCS]      = { 0 };  /* borrowed resident buffer    */
+   uint32_t    res_off[VP_MAX_DESCS]  = { 0 };  /* range's offset within it    */
    void       *res_host[VP_MAX_DESCS] = { 0 };  /* its host backing            */
    uint32_t    res_bytes[VP_MAX_DESCS]= { 0 };
    vx_buffer_h sres[VP_MAX_SSBO]      = { 0 };  /* per-slot raw-SSBO device buffer */
@@ -721,14 +726,20 @@ vp_launch(vx_device_h dev,
          if (!host_base || !height || !row)
             continue;
          uint32_t isize = base_off + (uint32_t)height * row;
-         VP_CHECK(vx_buffer_create(dev, isize, 0, &res[i]),
-                  "vx_buffer_create(image)");
-         uint64_t dev_addr = 0;
-         VP_CHECK(vx_buffer_address(res[i], &dev_addr), "vx_buffer_address(image)");
          void *img_upload = (void *)(uintptr_t)host_base;
-         VP_CHECK(vx_enqueue_write(q, res[i], 0, img_upload,
-                                   isize, 0, NULL, NULL),
-                  "vx_enqueue_write(image)");
+         bool dirty = true;
+         uint64_t dev_addr = vp_screen_resident_addr(screen, img_upload, isize,
+                                                     &res[i], &res_off[i], &dirty);
+         if (!dev_addr) {
+            mesa_loge("vortexpipe: launch: no device memory for image");
+            goto done;
+         }
+         if (dirty) {
+            VP_CHECK(vx_enqueue_write(q, res[i], res_off[i], img_upload,
+                                      isize, 0, NULL, NULL),
+                     "vx_enqueue_write(image)");
+            vp_screen_resident_clean(screen, img_upload, isize);
+         }
          memcpy(slot + VP_JIT_IMG_BASE, &dev_addr, sizeof dev_addr);
          if (descs[i].writable) {
             res_host[i]  = (void *)(uintptr_t)host_base;
@@ -747,13 +758,20 @@ vp_launch(vx_device_h dev,
       /* lp_jit_buffer.num_elements is a COUNT: bytes for an SSBO (elem_bytes 1),
        * dwords for a UBO (elem_bytes 4, DIV_ROUND_UP(size, sizeof(float))). */
       uint32_t size = nelem * (descs[i].elem_bytes ? descs[i].elem_bytes : 1);
-      VP_CHECK(vx_buffer_create(dev, size, 0, &res[i]),
-               "vx_buffer_create(resource)");
-      uint64_t dev_addr = 0;
-      VP_CHECK(vx_buffer_address(res[i], &dev_addr), "vx_buffer_address");
-      VP_CHECK(vx_enqueue_write(q, res[i], 0, (void *)(uintptr_t)host_ptr,
-                                size, 0, NULL, NULL),
-               "vx_enqueue_write(resource)");
+      bool dirty = true;
+      uint64_t dev_addr = vp_screen_resident_addr(screen,
+                                                  (const void *)(uintptr_t)host_ptr,
+                                                  size, &res[i], &res_off[i], &dirty);
+      if (!dev_addr) {
+         mesa_loge("vortexpipe: launch: no device memory for resource");
+         goto done;
+      }
+      if (dirty) {
+         VP_CHECK(vx_enqueue_write(q, res[i], res_off[i], (void *)(uintptr_t)host_ptr,
+                                   size, 0, NULL, NULL),
+                  "vx_enqueue_write(resource)");
+         vp_screen_resident_clean(screen, (const void *)(uintptr_t)host_ptr, size);
+      }
       memcpy(slot + VP_JIT_BUF_PTR, &dev_addr, sizeof dev_addr);
       /* Only a descriptor the shader stores to needs its device copy brought
        * back. A UBO cannot be written at all, and an SSBO this shader only
@@ -859,7 +877,7 @@ vp_launch(vx_device_h dev,
    for (uint32_t i = 0; i < num_descs; i++) {
       if (!res[i] || !res_host[i])
          continue;
-      VP_CHECK(vx_enqueue_read(q, res_host[i], res[i], 0, res_bytes[i],
+      VP_CHECK(vx_enqueue_read(q, res_host[i], res[i], res_off[i], res_bytes[i],
                                0, NULL, NULL), "vx_enqueue_read(resource)");
    }
    VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish");
@@ -873,8 +891,6 @@ done:
       if (sbt_res[i]) vx_buffer_release(sbt_res[i]);
    for (uint32_t i = 0; i < VP_MAX_SSBO; i++)
       free(cmd_copy[i]);
-   for (uint32_t i = 0; i < VP_MAX_DESCS; i++)
-      if (res[i]) vx_buffer_release(res[i]);
    for (unsigned i = 0; i < asc.n_bufs; i++)
       if (asc.bufs[i]) vx_buffer_release(asc.bufs[i]);
    for (unsigned i = 0; i < asc.n_stages; i++)
@@ -892,7 +908,7 @@ done:
 #define VP_ATTR_TABLE_LOCS  8
 
 bool
-vp_launch_vs(vx_device_h dev,
+vp_launch_vs(struct pipe_screen *screen, vx_device_h dev,
              const void *vxbin, size_t vxbin_size,
              uint32_t vertex_count, uint32_t out_bytes,
              const struct vp_vertex_input *vin,
@@ -903,7 +919,9 @@ vp_launch_vs(vx_device_h dev,
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
    vx_buffer_h obuf = NULL, tbuf = NULL, dtbuf = NULL;
-   vx_buffer_h vbufs_dev[8] = { NULL };   /* one per distinct vertex buffer */
+   /* Borrowed from the screen's residency table -- one per distinct vertex
+    * buffer, resident for the resource's life rather than the draw's. */
+   vx_buffer_h vbufs_dev[8] = { NULL };
    char vxpath[512];
    const char *vs_tmpdir = getenv("TMPDIR");
    if (!vs_tmpdir || !*vs_tmpdir)
@@ -1020,14 +1038,22 @@ vp_launch_vs(vx_device_h dev,
       /* Upload each distinct vertex-buffer resource once; an attribute points at
        * its own buffer's device base + its byte offset. */
       uint64_t buf_dev[8] = { 0 };
+      uint32_t buf_off[8] = { 0 };
       for (uint32_t j = 0; j < vin->num_bufs; j++) {
-         VP_CHECK(vx_buffer_create(dev, vin->buf_size[j], 0, &vbufs_dev[j]),
-                  "vx_buffer_create(vbuf)");
-         VP_CHECK(vx_buffer_address(vbufs_dev[j], &buf_dev[j]),
-                  "vx_buffer_address(vbuf)");
-         VP_CHECK(vx_enqueue_write(q, vbufs_dev[j], 0, vin->buf_data[j],
-                                   vin->buf_size[j], 0, NULL, NULL),
-                  "vx_enqueue_write(vbuf)");
+         bool vdirty = true;
+         buf_dev[j] = vp_screen_resident_addr(screen, vin->buf_data[j],
+                                              vin->buf_size[j],
+                                              &vbufs_dev[j], &buf_off[j], &vdirty);
+         if (!buf_dev[j]) {
+            mesa_loge("vortexpipe: launch_vs: no device memory for vertex buffer");
+            goto done;
+         }
+         if (vdirty) {
+            VP_CHECK(vx_enqueue_write(q, vbufs_dev[j], buf_off[j], vin->buf_data[j],
+                                      vin->buf_size[j], 0, NULL, NULL),
+                     "vx_enqueue_write(vbuf)");
+            vp_screen_resident_clean(screen, vin->buf_data[j], vin->buf_size[j]);
+         }
       }
 
       for (uint32_t i = 0; i < vin->num_attrs; i++) {
@@ -1073,7 +1099,6 @@ vp_launch_vs(vx_device_h dev,
 done:
    if (tbuf) vx_buffer_release(tbuf);
    if (dtbuf) vx_buffer_release(dtbuf);
-   for (unsigned j = 0; j < 8; j++) if (vbufs_dev[j]) vx_buffer_release(vbufs_dev[j]);
    if (!ok && obuf) vx_buffer_release(obuf);   /* on success the caller owns obuf */
    if (kbuf) vx_kernel_release(kbuf);
    if (kmod) vx_module_release(kmod);

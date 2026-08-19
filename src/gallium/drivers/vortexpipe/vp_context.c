@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "vp_private.h"
+#include "llvmpipe/lp_texture.h"   /* llvmpipe_resource_is_texture */
 #include "vp_nir_to_llvm.h"
 #include "vp_compile.h"
 #include "vp_launch.h"
@@ -396,7 +397,7 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
          }
          vp->startup_fs_owner = cso;
          vp->startup_fs_is_compute = true;
-         ran_on_vortex = vp_launch(vp->dev, cso->vxbin, cso->vxbin_size,
+         ran_on_vortex = vp_launch(pipe->screen, vp->dev, cso->vxbin, cso->vxbin_size,
                                    &cso->vx_module, &cso->vx_kernel,
                                    (uint8_t *)desc_host + vp->cbuf_off[1],
                                    desc_bytes, cso->descs, cso->num_descs,
@@ -419,6 +420,11 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
 
 fallback:
    vp->launches_cpu++;
+   /* llvmpipe is about to execute this dispatch on the CPU, writing the host
+    * allocations directly. Nothing reports which ones, so every device copy
+    * must be treated as out of date from here on -- a resident buffer that
+    * skipped its upload afterwards would serve pre-dispatch bytes. */
+   vp_screen_resident_dirty_all(pipe->screen);
    if (vp_strict_mode()) {
       /* Refuse the silent llvmpipe fallback: the test harness catches
        * mesa_loge and fails the test, instead of green-lighting CPU
@@ -2951,7 +2957,7 @@ vp_draw_vbo(struct pipe_context *pipe,
             vp_fs_variant_make_resident(fs, (int)(fsv - fs->fs_variants));
             vp->startup_fs_owner = fs;
             vp->startup_fs_is_compute = false;
-            drew = vp_raster_draw(vp->dev, vp->raster_pool,
+            drew = vp_raster_draw(pipe->screen, vp->dev, vp->raster_pool,
                                   vs->vxbin, vs->vxbin_size,
                                   &vs->vx_module, &vs->vx_kernel,
                                   fsv->vxbin, fsv->vxbin_size,
@@ -2988,6 +2994,9 @@ vp_draw_vbo(struct pipe_context *pipe,
        * colour resource (so llvmpipe composites on top) and drop the resident
        * buffers (the next hw draw re-initialises from the resource). */
       vp_fb_invalidate(pipe, vp);
+      /* llvmpipe writes host allocations directly and reports none of them, so
+       * every resident device copy is now suspect and must re-upload. */
+      vp_screen_resident_dirty_all(pipe->screen);
 
       /* fallback: run the VS on Vortex as a standalone launch, read its output
        * back to a host vertex buffer and rasterize on llvmpipe (unsupported
@@ -2998,7 +3007,7 @@ vp_draw_vbo(struct pipe_context *pipe,
       if (vin_ok && !dev_indexed && info->instance_count == 1) {
          vx_buffer_h vsbuf  = NULL;
          uint64_t    vsaddr = 0;
-         if (vp_launch_vs(vp->dev, vs->vxbin, vs->vxbin_size,
+         if (vp_launch_vs(pipe->screen, vp->dev, vs->vxbin, vs->vxbin_size,
                           count, count * stride,
                           vs->vs_layout.needs_vertex_input ? &vin : NULL,
                           &vsbuf, &vsaddr)) {
@@ -3083,6 +3092,77 @@ vp_context_destroy(struct pipe_context *pipe)
    FREE(vp);
 }
 
+/* ---- host writes invalidate the device's copy ---------------------------- *
+ * A resident device buffer may only skip its upload while the host bytes it
+ * mirrors are unchanged. These four are every route by which gallium reports a
+ * host-side write; anything not listed here must leave the range dirty, which
+ * is why the flag defaults that way. */
+
+static void
+vp_buffer_subdata(struct pipe_context *pipe, struct pipe_resource *res,
+                  unsigned usage, unsigned offset, unsigned size,
+                  const void *data)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->lp_buffer_subdata(pipe, res, usage, offset, size, data);
+   const uint8_t *base = NULL;
+   uint32_t total = 0;
+   if (vp_resource_host_range(res, &base, &total)) {
+      vp_screen_resident_dirty(pipe->screen, base + offset, size);
+   }
+}
+
+static void
+vp_texture_subdata(struct pipe_context *pipe, struct pipe_resource *res,
+                   unsigned level, unsigned usage, const struct pipe_box *box,
+                   const void *data, unsigned stride, uintptr_t layer_stride)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->lp_texture_subdata(pipe, res, level, usage, box, data, stride,
+                          layer_stride);
+   /* A resident mirror is keyed on the host range an image descriptor handed
+    * over, which is a level's base rather than the resource's, so the whole
+    * resource is invalidated rather than the box: narrowing it would need the
+    * level's byte range, and being wrong there is a stale texel with no
+    * diagnostic. */
+   const uint8_t *base = NULL;
+   uint32_t total = 0;
+   if (vp_resource_host_range(res, &base, &total)) {
+      vp_screen_resident_dirty(pipe->screen, base, total);
+   }
+}
+
+static void
+vp_buffer_unmap(struct pipe_context *pipe, struct pipe_transfer *xfer)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   /* Read the transfer before handing it over -- unmap frees it. */
+   const bool wrote = (xfer->usage & PIPE_MAP_WRITE) != 0;
+   struct pipe_resource *res = xfer->resource;
+   const unsigned offset = xfer->box.x;
+   const unsigned size   = xfer->box.width;
+   vp->lp_buffer_unmap(pipe, xfer);
+   const uint8_t *base = NULL;
+   uint32_t total = 0;
+   if (wrote && res && vp_resource_host_range(res, &base, &total)) {
+      vp_screen_resident_dirty(pipe->screen, base + offset, size);
+   }
+}
+
+static void
+vp_clear_buffer(struct pipe_context *pipe, struct pipe_resource *res,
+                unsigned offset, unsigned size, const void *clear_value,
+                int clear_value_size)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->lp_clear_buffer(pipe, res, offset, size, clear_value, clear_value_size);
+   const uint8_t *base = NULL;
+   uint32_t total = 0;
+   if (vp_resource_host_range(res, &base, &total)) {
+      vp_screen_resident_dirty(pipe->screen, base + offset, size);
+   }
+}
+
 /* ---- context creation ----------------------------------------------- */
 
 struct pipe_context *
@@ -3133,6 +3213,15 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_flush                = pipe->flush;
    vp->lp_context_destroy      = pipe->destroy;
    vp_reg_put(pipe, vp);
+
+   vp->lp_buffer_subdata  = pipe->buffer_subdata;
+   vp->lp_texture_subdata = pipe->texture_subdata;
+   vp->lp_buffer_unmap    = pipe->buffer_unmap;
+   vp->lp_clear_buffer    = pipe->clear_buffer;
+   pipe->buffer_subdata   = vp_buffer_subdata;
+   pipe->texture_subdata  = vp_texture_subdata;
+   pipe->buffer_unmap     = vp_buffer_unmap;
+   pipe->clear_buffer     = vp_clear_buffer;
 
    pipe->create_compute_state = vp_create_compute_state;
    pipe->bind_compute_state   = vp_bind_compute_state;

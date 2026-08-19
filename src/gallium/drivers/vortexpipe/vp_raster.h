@@ -19,6 +19,8 @@
 #include <stdbool.h>
 
 #include "vortex2.h"
+
+struct pipe_screen;
 #include "VX_types.h"            /* VX_TEX_LOD_MAX */
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
 #include "gfx_fs_desc_abi.h"     /* GFX_FS_DESC_SLOTS */
@@ -165,7 +167,8 @@ struct vp_tex_params {
  * straight into them — no per-draw colour upload / readback, no per-draw depth
  * clear (the caller clears/initialises them once per pass). tex_dev is the
  * resident texture buffer (0 = untextured). */
-bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
+bool vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
+                    struct vp_raster_pool *pool,
                     const void *vs_vxbin, size_t vs_vxbin_size,
                     vx_module_h *vs_module_io, vx_kernel_h *vs_kernel_io,
                     const void *fs_vxbin, size_t fs_vxbin_size,
