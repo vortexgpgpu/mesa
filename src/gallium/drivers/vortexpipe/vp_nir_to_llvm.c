@@ -5536,6 +5536,25 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       t.vid = LLVMBuildAdd(t.b,
                 LLVMBuildMul(t.b, vid_block_id, vid_block_dim, "blkofs"),
                 vid_thread_id, "vid");
+      /* Stop the threads the padding created, before anything they would touch.
+       * The padded output slots are harmless -- the buffer is sized for them and
+       * the host stops reading at the real count -- but the index-buffer load
+       * below and any store the shader itself performs are addressed by the
+       * vertex id, and for a thread past the end both land outside the draw. */
+      LLVMValueRef vcnt_idx = LLVMConstInt(t.i32, VP_ARG_VS_COUNT, false);
+      LLVMValueRef vcnt_p   = LLVMBuildGEP2(t.b, t.i64, t.arg, &vcnt_idx, 1, "");
+      LLVMValueRef vcnt64   = LLVMBuildLoad2(t.b, t.i64, vcnt_p, "vcount64");
+      LLVMValueRef vcnt     = LLVMBuildTrunc(t.b, vcnt64, t.i32, "vcount");
+      LLVMValueRef in_draw  = LLVMBuildICmp(t.b, LLVMIntULT, t.vid, vcnt,
+                                            "vs_in_draw");
+      LLVMBasicBlockRef vs_go_bb  =
+         LLVMAppendBasicBlockInContext(t.ctx, fn, "vs_go");
+      LLVMBasicBlockRef vs_end_bb =
+         LLVMAppendBasicBlockInContext(t.ctx, fn, "vs_end");
+      LLVMBuildCondBr(t.b, in_draw, vs_go_bb, vs_end_bb);
+      LLVMPositionBuilderAtEnd(t.b, vs_end_bb);
+      LLVMBuildRetVoid(t.b);
+      LLVMPositionBuilderAtEnd(t.b, vs_go_bb);
       /* %arg[0] / %arg[1] are i64 device addresses from the host runtime.
        * On rv64 the device stack base is 0x1FFFF0000 (33-bit), so we keep
        * iptr width: cast the i64 down only on rv32. */

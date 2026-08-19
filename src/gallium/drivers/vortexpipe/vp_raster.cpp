@@ -324,6 +324,18 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
    uint8_t    *vs_desc_stage[GFX_FS_DESC_SLOTS] = { NULL };
    vx_buffer_h mrtbuf = NULL;                          /* gfx_sw_omcolor_t[] */
 
+   /* Descriptors the shaders write. A store executes against the device copy of
+    * the resource, so without a copy back into the host backing the write is
+    * real on device and invisible to the application. Both stages can carry
+    * one, hence room for both stages' descriptor sets. */
+   struct {
+      vx_buffer_h buf;
+      uint64_t    host;
+      uint32_t    off;
+      uint32_t    size;
+   } wb[2 * VP_MAX_DESCS];
+   uint32_t n_wb = 0;
+
    /* kernels resolved from the residency caches below (the modules persist
     * across draws — caller-owned VS/FS slots + the pool's front end). */
    vx_kernel_h k_vs = NULL, kbuf = NULL, k_expand = NULL, k_setup = NULL,
@@ -539,6 +551,13 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
                   vp_screen_resident_clean(screen, (const void *)(uintptr_t)host_ptr, rsz);
                }
                memcpy(fs_desc_stage[i] + off + VP_JIT_BUF_PTR, &res_dev, sizeof res_dev);
+               if (fs_consts->descs[d].writable && n_wb < ARRAY_SIZE(wb)) {
+                  wb[n_wb].buf  = fs_res_bufs[d];
+                  wb[n_wb].host = host_ptr;
+                  wb[n_wb].off  = res_off;
+                  wb[n_wb].size = rsz;
+                  n_wb++;
+               }
             }
             upload = fs_desc_stage[i];
          }
@@ -860,6 +879,15 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
                                          (void *)(uintptr_t)host_ptr, rsz, 0, NULL, NULL),
                         "vx_enqueue_write(vs_res)");
                memcpy(vs_desc_stage[i] + off + VP_JIT_BUF_PTR, &res_dev, sizeof res_dev);
+               if (vs_consts->descs[d].writable && n_wb < ARRAY_SIZE(wb)) {
+                  /* This path allocates a buffer per descriptor and writes it
+                   * at 0, so the readback starts there too. */
+                  wb[n_wb].buf  = vs_res_bufs[d];
+                  wb[n_wb].host = host_ptr;
+                  wb[n_wb].off  = 0;
+                  wb[n_wb].size = rsz;
+                  n_wb++;
+               }
             }
             upload = vs_desc_stage[i];
          }
@@ -881,6 +909,7 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
       VP_CHECK(vx_enqueue_write(q, vs_desc_buf, 0, vs_desc_table,
                                 sizeof(vs_desc_table), 0, NULL, NULL),
                "vx_enqueue_write(vs_desc)");
+      vs_argblk[VP_ARG_VS_COUNT] = total_verts;
       vs_argblk[VP_ARG_VS_DESC] = vs_desc_dev;
 
       /* FS launch fills every HW lane: block = threads × warps (one CTA/core),
@@ -1098,6 +1127,15 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
        * FF-config→FS on-device, draining each stage with no host round-trip. */
       VP_CHECK(vx_enqueue_draw(q, cmds.data(), (uint32_t)cmds.size(),
                                0, NULL, NULL), "vx_enqueue_draw");
+
+      /* Bring every written descriptor home. Enqueued after the draw and before
+       * the finish so the copy rides the same submission, and so a later draw
+       * uploading the same resource starts from the bytes this one produced. */
+      for (uint32_t i = 0; i < n_wb; i++) {
+         VP_CHECK(vx_enqueue_read(q, (void *)(uintptr_t)wb[i].host, wb[i].buf,
+                                  wb[i].off, wb[i].size, 0, NULL, NULL),
+                  "vx_enqueue_read(desc)");
+      }
 
       /* The render lands in the resident colour buffer (color_dev); the caller
        * syncs it back to the framebuffer resource at present / pass end. No

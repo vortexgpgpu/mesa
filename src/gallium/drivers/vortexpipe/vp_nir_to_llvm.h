@@ -96,6 +96,12 @@ void vp_free_ir(char *ir);
 #define VP_ARG_VS_DESC   (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
 #define VP_ARG_SLOTS     (VP_ARG_VS_DESC + 1)
 
+/* Vertex stage: how many vertex invocations the draw actually has. Warps and
+ * CTAs are filled, so more threads launch than that, and a thread past the end
+ * has no vertex to shade. It sits in the first slot the vertex meanings above
+ * leave free; the compute SSBO slots it overlaps are never read by a VS. */
+#define VP_ARG_VS_COUNT  6
+
 /* A descriptor a compute kernel reaches through set-0's descriptor
  * buffer (constant-buffer index 1):
  *  - VP_DESC_BUFFER: an SSBO -- lp_jit_buffer{ptr,size} at `offset`.

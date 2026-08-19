@@ -479,6 +479,15 @@ vp_create_vs_state(struct pipe_context *pipe,
          vs_nir = nir_shader_clone(NULL, (struct nir_shader *)state->ir.nir);
    }
 
+   /* The set-0 descriptors the VS reaches, recorded before Gallium takes the
+    * NIR. The draw rewrites each one's pointer to the device copy of the
+    * resource; a descriptor missing from this list is left holding the host
+    * pointer llvmpipe put there, which the device cannot follow. */
+   if (state->type == PIPE_SHADER_IR_NIR) {
+      vp_scan_descriptors((struct nir_shader *)state->ir.nir,
+                          cso->descs, &cso->num_descs);
+   }
+
    cso->lp_cso = vp->lp_create_vs_state(pipe, state);
 
    /* Translate the vertex shader NIR -> LLVM IR -> Vortex .vxbin. */
