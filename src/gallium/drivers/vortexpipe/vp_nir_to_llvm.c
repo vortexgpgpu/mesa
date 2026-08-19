@@ -4391,22 +4391,22 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
    unsigned fs_scalars = 0;
    nir_foreach_shader_in_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
-      /* Only smooth interpolation is implemented. A flat varying would have to
-       * bypass the interpolator entirely -- its bit pattern is not necessarily
-       * a number, which is why every integer varying is flat -- and the plane
-       * path would premultiply it by 1/w and quantise it to Q7.24, turning a
-       * small integer into zero. noperspective needs a plane that is not
-       * premultiplied at all. Neither is a value this path can carry, so refuse
-       * the shader rather than interpolate something that was never meant to
-       * be. */
-      if (var->data.interpolation == INTERP_MODE_FLAT ||
-          var->data.interpolation == INTERP_MODE_NOPERSPECTIVE) {
-         mesa_logw("vortexpipe: FS input at location %u uses %s interpolation, "
-                   "which the device varying path does not implement; "
-                   "this draw runs on llvmpipe",
-                   var->data.location,
-                   var->data.interpolation == INTERP_MODE_FLAT ? "flat"
-                                                               : "noperspective");
+      /* A flat varying bypasses the interpolator: its bit pattern is not
+       * necessarily a number -- which is why every integer varying is flat --
+       * and the plane path would premultiply it by 1/w and quantise it to
+       * Q7.24, turning a small integer into zero. Setup carries the provoking
+       * vertex's words verbatim in a side array instead, which the fill below
+       * reads without arithmetic.
+       *
+       * noperspective has no such carry: it needs a plane that is interpolated
+       * but not premultiplied, which is a third path neither side implements.
+       * Refuse it rather than treat it as smooth -- silently mistreating an
+       * interpolation mode is what this whole path exists to stop doing. */
+      if (var->data.interpolation == INTERP_MODE_NOPERSPECTIVE) {
+         mesa_logw("vortexpipe: FS input at location %u uses noperspective "
+                   "interpolation, which the device varying path does not "
+                   "implement; this draw runs on llvmpipe",
+                   var->data.location);
          t->ok = false; return;
       }
       fs_scalars += glsl_get_components(var->type);
@@ -4679,7 +4679,7 @@ emit_arg_i32(struct vp_tr *t, LLVMValueRef arg, unsigned k)
  * gfx-v1 fixed-function varying mapping -- a real GPU interpolates
  * arbitrary user varyings, gfx-v1 has exactly these planes. */
 static void
-emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
+emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim, LLVMValueRef flat,
                       LLVMValueRef in_addr,
                       LLVMValueRef dxq, LLVMValueRef dyq)
 {
@@ -4715,7 +4715,18 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
          continue;
       unsigned nc = glsl_get_components(var->type);
       LLVMValueRef slot = addk(t, in_addr, (unsigned)t->vars[i].out_off);
+      /* A flat varying is held constant over the primitive, so it is read from
+       * the words setup copied out of the provoking vertex rather than
+       * interpolated. No arithmetic is applied on the way: the value may be an
+       * integer whose float reinterpretation is a denormal, and the plane path
+       * would quantise that to zero. */
+      const bool is_flat = (var->data.interpolation == INTERP_MODE_FLAT);
       for (unsigned c = 0; c < nc && li < VP_RAST_MAX_PLANES; c++, li++) {
+         if (is_flat) {
+            emit_store_i32(t, addk(t, slot, c * 4),
+                           emit_load_i32(t, addk(t, flat, li * 4)));
+            continue;
+         }
          LLVMValueRef q = emit_interp(t, addk(t, prim, lane[li]), dxq, dyq);
          LLVMValueRef f = LLVMBuildFMul(t->b, emit_fixed_to_float(t, q, 24),
                                         inv_rhw, "");
@@ -4809,7 +4820,8 @@ emit_om_aperture_load(struct vp_tr *t, LLVMValueRef arg)
 static void
 emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
                  LLVMValueRef fs_main, LLVMTypeRef fs_main_ty,
-                 LLVMValueRef prim, LLVMValueRef in_scr, LLVMValueRef out_scr,
+                 LLVMValueRef prim, LLVMValueRef flat,
+                 LLVMValueRef in_scr, LLVMValueRef out_scr,
                  LLVMValueRef in_addr, LLVMValueRef out_addr,
                  LLVMValueRef texstate_ptr, LLVMValueRef omstate_ptr,
                  LLVMValueRef desc_ptr, LLVMValueRef mrt_ptr,
@@ -4840,7 +4852,7 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
 
       /* interpolate the RASTER attribute planes into the FS input
        * varyings (colour and/or texcoord, by declaration). */
-      emit_fs_fill_varyings(t, prim, in_addr, dxq, dyq);
+      emit_fs_fill_varyings(t, prim, flat, in_addr, dxq, dyq);
 
       /* run the programmable fragment shader (3rd arg = SW texstate table,
        * 4th = resident FS descriptor table, 5th = the discard/demote flag). A
@@ -5061,6 +5073,7 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
     * DCRs, so the kernel only needs the primitive buffer (arg[0]). */
    LLVMPositionBuilderAtEnd(t->b, entry);
    LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
+   LLVMValueRef flat_base = emit_arg_i32(t, arg, GFX_FS_ARG_FLAT);
    /* arg[1] is the resident gfx_sw_texstate_t[] device address (host-filled for
     * any textured draw). The SW sampler reads the whole descriptor; the HW-tex FS
     * reads only logdim from it to compute the mip LOD. Untextured draws leave
@@ -5118,11 +5131,17 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
       LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base,
                                     vp_to_iptr(t, poff), "prim");
+   /* The provoking vertex's flat words for this primitive, in a side array the
+    * front end fills in step with the primitive buffer and indexed by the same
+    * id. Zero when nothing bound declares a flat input, and then never read. */
+   LLVMValueRef flat = LLVMBuildAdd(t->b, flat_base,
+      vp_to_iptr(t, LLVMBuildMul(t->b, pid,
+         LLVMConstInt(t->i32, GFX_FS_FLAT_WORDS * 4u, false), "")), "flat");
 
    /* HW raster: edge values are recomputed in-shader from prim[pid]'s edge planes
     * (the window carries only pos + pid; P2 dropped the bcoord payload). */
    struct vp_bc_src bc = { .from_window = true, .quad_addr = NULL, .sub = NULL };
-   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
+   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, flat, in_scr, out_scr,
                     in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
                     mrt_ptr, mrt_colors_addr, live, px, py, cov, &bc);
 
@@ -5186,6 +5205,7 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
     * mem2reg promotes the loop induction; no hand-built phi). */
    LLVMPositionBuilderAtEnd(t->b, entry);
    LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
+   LLVMValueRef flat_base = emit_arg_i32(t, arg, GFX_FS_ARG_FLAT);
    /* arg[1] = resident texstate for any textured draw (HW-tex reads logdim from
     * it for the mip LOD, SW sampler reads all of it); zero + unused if untextured. */
    LLVMValueRef texstate_ptr = LLVMBuildIntToPtr(t->b,
@@ -5278,6 +5298,9 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMValueRef poff = LLVMBuildMul(t->b, pid,
       LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base, vp_to_iptr(t, poff), "prim");
+   LLVMValueRef flat = LLVMBuildAdd(t->b, flat_base,
+      vp_to_iptr(t, LLVMBuildMul(t->b, pid,
+         LLVMConstInt(t->i32, GFX_FS_FLAT_WORDS * 4u, false), "")), "flat");
    LLVMTypeRef wparams[9] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
                               t->i32, t->i32, t->ptr, t->i32 };
    LLVMTypeRef wty = LLVMFunctionType(t->i32, wparams, 9, false);
@@ -5376,7 +5399,7 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
                            .sub = sub,
                            .bcoord_word0 = ms ? 5u : 1u,
                            .sample_mask = smask };
-   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
+   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, flat, in_scr, out_scr,
                     in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
                     mrt_ptr, mrt_colors_addr, live, px, py, cov, &bc);
    /* builder is now at emit_shade_pixel's trailing fall-through block. */

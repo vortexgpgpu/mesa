@@ -102,13 +102,18 @@ vp_log2u(uint32_t n)
 }
 
 /* ---- persistent front-end working set -------------------------- *
- * The 17 binning buffers laid out once and reused across the frame's draws
+ * The front-end buffers laid out once and reused across the frame's draws
  * instead of allocated per draw. prim + tilebuf (the RASTER AXI master's
  * inputs) are pinned over VX_MEM_PHYS; the rest is device-resident scratch.
  * The pool grows monotonically when a draw needs more capacity. addr caches
  * the device addresses (its count fields are unused — set per draw). */
+/* One entry per row of the layout table in vp_raster_pool_ensure. Named because
+ * the table and the array have to agree and a bare literal in two places is one
+ * edit away from silently truncating the pool. */
+#define VP_RASTER_POOL_BUFS 18
+
 struct vp_raster_pool {
-   vx_buffer_h bufs[17];
+   vx_buffer_h bufs[VP_RASTER_POOL_BUFS];
    pipe_arg_t  addr;
    uint32_t    cap_tris;
    uint32_t    cap_bins;
@@ -196,8 +201,12 @@ vp_pool_ensure(vx_device_h dev, struct vp_raster_pool *pool,
       { (uint64_t)B * 4,                           &a.binbase_addr,   W   },
       { (uint64_t)TILEBUF_SZ,                      &a.tilebuf_addr,   RWP },
       { (uint64_t)3 * 4,                           &a.meta_addr,      W   },
+      /* Flat varyings: the provoking vertex's words per emitted primitive.
+       * RASTER never fetches it -- only the fragment kernel does -- so it needs
+       * no physical mapping, unlike the primitive buffer it parallels. */
+      { (uint64_t)P_max * GFX_FS_FLAT_WORDS * 4,   &a.flat_addr,      W   },
    };
-   for (uint32_t i = 0; i < 17; i++) {
+   for (uint32_t i = 0; i < VP_RASTER_POOL_BUFS; i++) {
       if (vx_buffer_create(dev, spec[i].bytes ? spec[i].bytes : 1,
                            spec[i].flags, &pool->bufs[i]) != VX_SUCCESS) {
          mesa_loge("vortexpipe: raster: front-end pool alloc failed");
@@ -442,8 +451,12 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
        * texstate/omstate descriptors (arg[1]/[2]); SW raster adds the tile-walk
        * counts (arg[3..8]); and the resident FS descriptor table
        * (arg[GFX_FS_ARG_DESC]). The HW path reaches colour/depth via the OM DCRs. */
-      uint64_t argblk[GFX_FS_ARG_APERTURE + 1] = { 0 };
+      uint64_t argblk[GFX_FS_ARG_FLAT + 1] = { 0 };
       argblk[0] = prim_dev;
+      /* Flat varyings ride beside the primitive buffer, indexed by the same
+       * primitive id. The fragment kernel reads it only for a shader that
+       * declares a flat input; every other kernel leaves the slot untouched. */
+      argblk[GFX_FS_ARG_FLAT] = arg.flat_addr;
 
       /* OM aperture geometry: pad the render target to a power of two on each axis
        * so a fragment export's address is a shift, not a multiply. record_shift 3 =
