@@ -185,10 +185,6 @@ struct vp_cso {
    void  *vxbin;           /* compiled Vortex kernel image, or NULL */
    size_t vxbin_size;
    unsigned lmem_size;     /* compute: shared-memory bytes (nir shared_size) */
-   /* compute: the workgroup carries no cross-invocation semantics (no shared
-    * memory, no control barrier, fixed size), so a workgroup larger than the
-    * device CTA cap can be re-tiled into several device CTAs at launch. */
-   bool workgroup_shape_invariant;
    /* compute: bitmask of set_shader_buffers slots the kernel reads as a
     * const-index load_ssbo(imm slot, off) -- the RT trace-ray command buffer,
     * whose embedded SBT shader-record pointers need device relocation. */
