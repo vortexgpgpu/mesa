@@ -771,6 +771,12 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
                                    size, 0, NULL, NULL),
                   "vx_enqueue_write(resource)");
          vp_screen_resident_clean(screen, (const void *)(uintptr_t)host_ptr, size);
+      } else {
+         /* Reported, not silent: an upload skip that cannot be observed cannot
+          * be shown to work, and two residency changes in this driver have
+          * already measured zero because nothing said whether they fired. */
+         vp_dbg("vortexpipe: launch: resource upload skipped, %u bytes already "
+                "resident and clean", size);
       }
       memcpy(slot + VP_JIT_BUF_PTR, &dev_addr, sizeof dev_addr);
       /* Only a descriptor the shader stores to needs its device copy brought
