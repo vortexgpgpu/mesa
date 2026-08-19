@@ -648,7 +648,8 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
           * so the pitch it reads is the multisample row stride, not the pixel
           * row width. At one sample the two are the same. */
          omstate.zbuf_pitch     = width * 4 * om->samples;
-         omstate.cbuf_pitch     = width * 4 * om->samples;
+         omstate.cbuf_pitch     = width * om->color_bpp * om->samples;
+         omstate.color_format   = om->color_format;
          omstate.cbuf_writemask4 = om->colormask;
          /* resolve_om_state (host-side derivation, mirrors gfx_sw.h) */
          omstate.depth_enabled = !((omstate.depth_func == (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS)
@@ -707,6 +708,7 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
              * same values the scalar path uses. */
             rt[k].blend_const    = om->blend_const;
             rt[k].logic_op       = om->logic_op;
+            rt[k].color_format   = om->color_format;
             rt[k].cbuf_writemask4 = mrt->colormask[k];
             rt[k].blend_enabled  = !((rt[k].blend_mode_rgb == (uint32_t)VX_OM_BLEND_MODE_ADD)
                                   && (rt[k].blend_mode_a   == (uint32_t)VX_OM_BLEND_MODE_ADD)

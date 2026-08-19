@@ -424,6 +424,14 @@ vp_format_render_target(enum pipe_format format)
    case PIPE_FORMAT_B8G8R8X8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8X8_UNORM:
+   /* Narrower and sRGB attachments merge in software: the fixed-function
+    * merger has no colour-format register, so it can only write A8R8G8B8.
+    * The software merger addresses a texel at its own width and applies the
+    * transfer function on both sides of the blend. */
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
       return true;
    default:
       return false;

@@ -369,6 +369,14 @@ struct vp_context {
     * selects the blue-first order the fragment variant is compiled for. */
    bool           fb_color_ok;
    bool           fb_color_bgra;
+   /* The attachment's storage format, as the merger encodes it, and its texel
+    * width. Anything but A8R8G8B8 forces the software merger -- the
+    * fixed-function one has no colour-format register -- and the width is what
+    * every buffer size, pitch and readback below is measured in. One value for
+    * the whole framebuffer: a mixed-format one falls back, like a mixed-order
+    * one. */
+   uint32_t       fb_color_format;   /* VX_OM_COLOR_FORMAT_* */
+   uint32_t       fb_color_bpp;      /* bytes per texel */
    /* compute constant buffers, by index -- lavapipe binds the
     * descriptor buffer for descriptor set N at index N+1. */
    struct pipe_resource *cbuf[8];
@@ -451,6 +459,10 @@ struct vp_context {
    struct pipe_resource *rfb_res;
    unsigned              rfb_w, rfb_h;
    unsigned              rfb_s;   /* samples the resident buffers were sized for */
+   /* Texel width the resident colour buffers were sized for. Carried separately
+    * from fb_color_bpp because the flush back to the resource runs as part of
+    * binding the *next* framebuffer, when fb_color_bpp already describes it. */
+   unsigned              rfb_bpp;
    bool                  rfb_dirty;
    /* Extra resident colour buffers for attachments 1.. (RT0 uses rcb).
     * rmrt_res[k] is the framebuffer resource each is synced back to. */

@@ -82,6 +82,12 @@ struct vp_om_params {
    uint32_t stencil_writemask;
    uint32_t blend_const;    /* ARGB8888 constant-colour blend operand */
    uint32_t logic_op;       /* VX_OM_LOGIC_OP_* */
+   /* Colour attachment storage, for the software merger: how a texel is encoded
+    * and how wide it is. The fixed-function merger has no format register and
+    * writes A8R8G8B8 at four bytes, so anything else must have been routed to
+    * software before it gets here. */
+   uint32_t color_format;   /* VX_OM_COLOR_FORMAT_* */
+   uint32_t color_bpp;      /* bytes per colour texel */
    bool     earlyz_safe;    /* the rasterizer may cull provably-occluded quads */
 };
 
