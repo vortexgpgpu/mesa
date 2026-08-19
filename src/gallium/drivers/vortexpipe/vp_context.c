@@ -822,10 +822,26 @@ vp_create_fs_state(struct pipe_context *pipe,
       cso->has_tex_desc = vp_scan_tex_descriptor(
          (struct nir_shader *)state->ir.nir,
          &cso->tex_desc_cbuf, &cso->tex_desc_offset);
-      /* Clone the NIR so a variant can still be translated after this call.
-       * Taken here, after lp_create_fs_state, so it captures the same
-       * post-nir_lower_fragcolor shader the first translation sees. */
-      cso->fs_nir = nir_shader_clone(NULL, (struct nir_shader *)state->ir.nir);
+      /* The device's own copy of the shader, lowered for a warp rather than for
+       * llvmpipe's vector width. Subgroup lowering constant-folds
+       * gl_SubgroupSize and sizes ballot/shuffle, so a shader llvmpipe finalized
+       * reports llvmpipe's width from the fragment stage -- and this driver
+       * advertises subgroup operations there.
+       *
+       * The device copy is taken before llvmpipe finalizes, which is the only
+       * point the width is still open, so it has not been through
+       * nir_lower_fragcolor. Apply that one pass here with the argument
+       * llvmpipe uses, so the clone matches what the first translation would
+       * otherwise have seen. A miss falls back to cloning llvmpipe's shader,
+       * which is correct in everything but the subgroup width. */
+      cso->fs_nir = vp_screen_take_dev_nir(pipe->screen,
+                                           (struct nir_shader *)state->ir.nir);
+      if (cso->fs_nir) {
+         NIR_PASS_V(cso->fs_nir, nir_lower_fragcolor,
+                    cso->fs_nir->info.fs.color_is_dual_source ? 1 : 8);
+      } else {
+         cso->fs_nir = nir_shader_clone(NULL, (struct nir_shader *)state->ir.nir);
+      }
       /* Prime the single-sample red-first variant here, through the same path a
        * draw resolves, so a pipeline that only ever needs one pays its compile
        * at creation rather than inside its first draw. No framebuffer is bound

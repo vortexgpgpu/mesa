@@ -323,11 +323,19 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
     * finalizes for the width it executes at; the device needs its warp width.
     * One shader object cannot carry both, and it has two consumers here --
     * llvmpipe runs every dispatch that falls back. Keep a device copy lowered
-    * for the warp and let llvmpipe finalize the original for itself. */
+    * for the warp and let llvmpipe finalize the original for itself.
+    *
+    * The fragment stage needs this as much as the other two -- the driver
+    * advertises subgroup operations in it -- but its copy is not finished here:
+    * llvmpipe lowers FRAG_RESULT_COLOR when the state is created, after this
+    * runs, so vp_create_fs_state applies that one pass to the clone before
+    * using it. Taking the clone later instead would be too late for the
+    * subgroup width, which is constant-folded in and cannot be re-lowered. */
    struct nir_shader *dev = NULL;
    if (vps->dev_nir && vps->hw_num_threads &&
        (nir->info.stage == MESA_SHADER_COMPUTE ||
-        nir->info.stage == MESA_SHADER_VERTEX)) {
+        nir->info.stage == MESA_SHADER_VERTEX ||
+        nir->info.stage == MESA_SHADER_FRAGMENT)) {
       dev = nir_shader_clone(NULL, nir);
       lp_build_opt_nir(dev, vps->hw_num_threads);
    }
