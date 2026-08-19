@@ -163,6 +163,7 @@ void vp_screen_resident_dirty_all(struct pipe_screen *screen);
 struct vp_fs_variant_key {
    struct vp_sw_routing routing;
    unsigned             samples;   /* 1, or the pass' sample count */
+   bool                 bgra;      /* colour attachments are blue-first */
 };
 
 /* One compiled fragment shader: its image, and the device residency handles
@@ -175,9 +176,10 @@ struct vp_fs_variant {
    vx_kernel_h vx_kernel;
 };
 
-/* Routing is fixed per shader (caps + env + NIR), so the only live dimension is
- * the sample count, and Vulkan offers few of those. A small fixed array needs no
- * recency bookkeeping. */
+/* Routing is fixed per shader (caps + env + NIR) and the channel order is fixed
+ * by the render pass the pipeline was created against, so the only live
+ * dimension is the sample count, and Vulkan offers few of those. A small fixed
+ * array needs no recency bookkeeping. */
 #define VP_MAX_FS_VARIANTS 4
 
 struct vp_cso {
@@ -358,12 +360,15 @@ struct vp_context {
     * loader refuses an overlapping claim. Naming the holder here keeps eviction
     * independent of which CSO is bound: the claimant releases whoever holds the
     * address, rather than guessing that it is cur_fs. NULL when free. */
-   /* Whether every bound colour attachment has a channel order the device
-    * fragment path actually produces. False sends the render pass to llvmpipe
-    * rather than permuting its colours. */
-   bool           fb_color_ok;
    struct vp_cso *startup_fs_owner;
    bool           startup_fs_is_compute;  /* holder is a compute module */
+   /* Colour attachment channel order for the bound framebuffer, decided once
+    * per bind. fb_color_ok is false when an attachment has an order the device
+    * cannot produce, or when the attachments disagree, and sends the whole
+    * render pass to llvmpipe rather than permuting its colours; fb_color_bgra
+    * selects the blue-first order the fragment variant is compiled for. */
+   bool           fb_color_ok;
+   bool           fb_color_bgra;
    /* compute constant buffers, by index -- lavapipe binds the
     * descriptor buffer for descriptor set N at index N+1. */
    struct pipe_resource *cbuf[8];

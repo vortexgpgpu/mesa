@@ -184,6 +184,7 @@ struct vp_tr {
    /* fragment-shader state (is_fs only) */
    bool           is_fs;
    unsigned       fs_samples;   /* samples per pixel; 1 = single-sample */
+   bool           fs_bgra;      /* attachment is blue-first, not red-first */
    LLVMValueRef   fs_in_base;   /* iptr interpolated-varyings area */
    LLVMValueRef   fs_out_base;  /* iptr output-colour area */
    struct vp_var  vars[VP_MAXV];
@@ -4854,17 +4855,23 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
       cov = LLVMBuildAnd(t->b, cov,
          LLVMBuildLoad2(t->b, t->i32, live, "live.v"), "cov_live");
 
-      /* pack a render target's FS output (4 floats at out_addr + rt*16) into an
-       * R8G8B8A8 pixel. */
+      /* pack a render target's FS output (4 floats at out_addr + rt*16) into a
+       * single pixel word, in the attachment's own channel order: red in the
+       * low byte, or blue there when the attachment is blue-first. The merger
+       * stores the word unmodified and the host reads the buffer back byte for
+       * byte, so this is the only place the order is decided. Alpha stays in
+       * the high byte either way, which is what keeps every alpha blend factor
+       * order-independent. */
       unsigned num_color = t->fs_num_color ? t->fs_num_color : 1;
       LLVMValueRef rgba_rt[GFX_OM_MAX_RT];
       for (unsigned rt = 0; rt < num_color && rt < GFX_OM_MAX_RT; rt++) {
          LLVMValueRef rgba = LLVMConstInt(t->i32, 0, false);
          for (unsigned c = 0; c < 4; c++) {
+            const unsigned byte = (t->fs_bgra && c < 3) ? (2u - c) : c;
             LLVMValueRef fc = LLVMBuildBitCast(t->b,
                emit_load_i32(t, addk(t, out_addr, rt * 16 + c * 4)), t->f32, "");
             LLVMValueRef bc8 = LLVMBuildShl(t->b, emit_to_byte(t, fc),
-               LLVMConstInt(t->i32, c * 8, false), "");
+               LLVMConstInt(t->i32, byte * 8, false), "");
             rgba = LLVMBuildOr(t->b, rgba, bc8, "");
          }
          rgba_rt[rt] = rgba;
@@ -5393,7 +5400,7 @@ bool
 vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
                struct vp_vs_layout *out_vs,
                const struct vp_sw_routing *routing,
-               unsigned samples)
+               unsigned samples, bool bgra)
 {
    if (out_ir)
       *out_ir = NULL;
@@ -5420,6 +5427,10 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
     * and the coverage the rasterizer hands over is a sample mask rather than a
     * single bit, so it changes what is emitted, not just what is passed in. */
    t.fs_samples = (t.is_fs && samples > 1) ? samples : 1u;
+   /* Colour attachment channel order. The wrapper stores the merged pixel as a
+    * word and nothing downstream reinterprets it, so the order the shader packs
+    * is the order that reaches memory. */
+   t.fs_bgra = (t.is_fs && bgra);
    t.ctx   = LLVMContextCreate();
    t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
    LLVMSetTarget(t.mod, vp_target_triple());

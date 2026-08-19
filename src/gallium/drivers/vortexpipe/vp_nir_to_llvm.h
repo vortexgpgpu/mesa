@@ -46,14 +46,16 @@ struct vp_sw_routing {
  * allocated LLVM-IR text string in *out_ir (release with
  * vp_free_ir). For a vertex shader, *out_vs (when non-NULL) is
  * filled with the output-record layout. `routing` (may be NULL) selects the
- * per-unit HW/SW path for a fragment shader, and `samples` its sample count
- * (0 or 1 = single-sample); both are ignored for VS/compute. Two fragment
- * shaders differing only in these are different kernels, which is why they are
- * translation inputs rather than draw-time arguments. */
+ * per-unit HW/SW path for a fragment shader, `samples` its sample count
+ * (0 or 1 = single-sample), and `bgra` the colour attachment's channel order
+ * (false = red in the low byte, true = blue); all three are ignored for
+ * VS/compute. Two fragment shaders differing only in these are different
+ * kernels, which is why they are translation inputs rather than draw-time
+ * arguments. */
 bool vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
                     struct vp_vs_layout *out_vs,
                     const struct vp_sw_routing *routing,
-                    unsigned samples);
+                    unsigned samples, bool bgra);
 
 /* Release a string returned via vp_nir_to_llvm()'s out_ir. */
 void vp_free_ir(char *ir);
