@@ -46,9 +46,11 @@ vp_resource_host_range(struct pipe_resource *pres, const uint8_t **out_base,
 
    if (llvmpipe_resource_is_texture(pres)) {
       *out_base = lpr->tex_data;
-      /* Zero for a display target, whose storage belongs to the winsys and is
-       * never handed to a shader as an image base. */
-      *out_size = (uint32_t)lpr->total_alloc_size;
+      /* size_required, not total_alloc_size: the latter is left at zero for a
+       * texture allocated through the backing-memory path, which is how an
+       * ordinary storage image arrives, and a zero size reads as "no range" and
+       * silently skips the invalidation this exists to perform. */
+      *out_size = (uint32_t)lpr->size_required;
    } else {
       *out_base = lpr->data;
       *out_size = pres->width0;

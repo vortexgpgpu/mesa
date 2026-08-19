@@ -326,9 +326,30 @@ struct vp_context {
                               const struct pipe_box *, const void *data,
                               unsigned stride, uintptr_t layer_stride);
    void (*lp_buffer_unmap)(struct pipe_context *, struct pipe_transfer *);
+   void (*lp_texture_unmap)(struct pipe_context *, struct pipe_transfer *);
    void (*lp_clear_buffer)(struct pipe_context *, struct pipe_resource *,
                            unsigned offset, unsigned size,
                            const void *clear_value, int clear_value_size);
+   void (*lp_clear_texture)(struct pipe_context *, struct pipe_resource *,
+                            unsigned level, const struct pipe_box *,
+                            const void *data);
+   void (*lp_clear_render_target)(struct pipe_context *, struct pipe_surface *,
+                                  const union pipe_color_union *,
+                                  unsigned dstx, unsigned dsty,
+                                  unsigned width, unsigned height,
+                                  bool render_condition_enabled);
+   void (*lp_clear_depth_stencil)(struct pipe_context *, struct pipe_surface *,
+                                  unsigned clear_flags, double depth,
+                                  unsigned stencil,
+                                  unsigned dstx, unsigned dsty,
+                                  unsigned width, unsigned height,
+                                  bool render_condition_enabled);
+   void (*lp_resource_copy_region)(struct pipe_context *,
+                                   struct pipe_resource *dst, unsigned dst_level,
+                                   unsigned dstx, unsigned dsty, unsigned dstz,
+                                   struct pipe_resource *src, unsigned src_level,
+                                   const struct pipe_box *src_box);
+   void (*lp_blit)(struct pipe_context *, const struct pipe_blit_info *);
    struct vp_cso *cur_cso;                /* bound compute state */
    struct vp_cso *cur_vs;                 /* bound vertex shader */
    struct vp_cso *cur_fs;                 /* bound fragment shader */

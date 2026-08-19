@@ -3063,9 +3063,27 @@ vp_context_destroy(struct pipe_context *pipe)
 
 /* ---- host writes invalidate the device's copy ---------------------------- *
  * A resident device buffer may only skip its upload while the host bytes it
- * mirrors are unchanged. These four are every route by which gallium reports a
- * host-side write; anything not listed here must leave the range dirty, which
- * is why the flag defaults that way. */
+ * mirrors are unchanged. The wrappers below are every route by which gallium
+ * hands llvmpipe a write to a resource's contents; anything not listed here
+ * must leave the range dirty, which is why the flag defaults that way.
+ *
+ * The list is the contract, and it is easy to under-fill: a buffer-to-image
+ * copy reaches resource_copy_region rather than any of the subdata or map
+ * entry points, and a driver that stopped at those would serve a storage image
+ * its previous dispatch's texels with nothing to indicate it. Where the write
+ * region is not trivially a byte range in the resource -- a texel box, a
+ * surface rectangle -- the whole resource is invalidated rather than guessed
+ * at: over-invalidating costs an upload, under-invalidating is silent. */
+
+static void
+vp_dirty_resource(struct pipe_context *pipe, struct pipe_resource *res)
+{
+   const uint8_t *base = NULL;
+   uint32_t total = 0;
+   if (res && vp_resource_host_range(res, &base, &total)) {
+      vp_screen_resident_dirty(pipe->screen, base, total);
+   }
+}
 
 static void
 vp_buffer_subdata(struct pipe_context *pipe, struct pipe_resource *res,
@@ -3101,21 +3119,89 @@ vp_texture_subdata(struct pipe_context *pipe, struct pipe_resource *res,
    }
 }
 
+/* Serves both buffer_unmap and texture_unmap -- llvmpipe implements them with
+ * one function, and the difference that matters here is that a buffer's box is
+ * a byte range while a texture's is in texels. */
 static void
-vp_buffer_unmap(struct pipe_context *pipe, struct pipe_transfer *xfer)
+vp_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *xfer)
 {
    struct vp_context *vp = vp_reg_get(pipe);
    /* Read the transfer before handing it over -- unmap frees it. */
    const bool wrote = (xfer->usage & PIPE_MAP_WRITE) != 0;
    struct pipe_resource *res = xfer->resource;
+   const bool is_buffer = res && res->target == PIPE_BUFFER;
    const unsigned offset = xfer->box.x;
    const unsigned size   = xfer->box.width;
    vp->lp_buffer_unmap(pipe, xfer);
+   if (!wrote) {
+      return;
+   }
    const uint8_t *base = NULL;
    uint32_t total = 0;
-   if (wrote && res && vp_resource_host_range(res, &base, &total)) {
-      vp_screen_resident_dirty(pipe->screen, base + offset, size);
+   if (res && vp_resource_host_range(res, &base, &total)) {
+      if (is_buffer) {
+         vp_screen_resident_dirty(pipe->screen, base + offset, size);
+      } else {
+         vp_screen_resident_dirty(pipe->screen, base, total);
+      }
    }
+}
+
+static void
+vp_clear_texture(struct pipe_context *pipe, struct pipe_resource *res,
+                 unsigned level, const struct pipe_box *box, const void *data)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->lp_clear_texture(pipe, res, level, box, data);
+   vp_dirty_resource(pipe, res);
+}
+
+static void
+vp_clear_render_target(struct pipe_context *pipe, struct pipe_surface *dst,
+                       const union pipe_color_union *color,
+                       unsigned dstx, unsigned dsty,
+                       unsigned width, unsigned height,
+                       bool render_condition_enabled)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->lp_clear_render_target(pipe, dst, color, dstx, dsty, width, height,
+                              render_condition_enabled);
+   vp_dirty_resource(pipe, dst ? dst->texture : NULL);
+}
+
+static void
+vp_clear_depth_stencil(struct pipe_context *pipe, struct pipe_surface *dst,
+                       unsigned clear_flags, double depth, unsigned stencil,
+                       unsigned dstx, unsigned dsty,
+                       unsigned width, unsigned height,
+                       bool render_condition_enabled)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->lp_clear_depth_stencil(pipe, dst, clear_flags, depth, stencil,
+                              dstx, dsty, width, height,
+                              render_condition_enabled);
+   vp_dirty_resource(pipe, dst ? dst->texture : NULL);
+}
+
+static void
+vp_resource_copy_region(struct pipe_context *pipe,
+                        struct pipe_resource *dst, unsigned dst_level,
+                        unsigned dstx, unsigned dsty, unsigned dstz,
+                        struct pipe_resource *src, unsigned src_level,
+                        const struct pipe_box *src_box)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->lp_resource_copy_region(pipe, dst, dst_level, dstx, dsty, dstz,
+                               src, src_level, src_box);
+   vp_dirty_resource(pipe, dst);
+}
+
+static void
+vp_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->lp_blit(pipe, info);
+   vp_dirty_resource(pipe, info ? info->dst.resource : NULL);
 }
 
 static void
@@ -3183,14 +3269,26 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_context_destroy      = pipe->destroy;
    vp_reg_put(pipe, vp);
 
-   vp->lp_buffer_subdata  = pipe->buffer_subdata;
-   vp->lp_texture_subdata = pipe->texture_subdata;
-   vp->lp_buffer_unmap    = pipe->buffer_unmap;
-   vp->lp_clear_buffer    = pipe->clear_buffer;
-   pipe->buffer_subdata   = vp_buffer_subdata;
-   pipe->texture_subdata  = vp_texture_subdata;
-   pipe->buffer_unmap     = vp_buffer_unmap;
-   pipe->clear_buffer     = vp_clear_buffer;
+   vp->lp_buffer_subdata       = pipe->buffer_subdata;
+   vp->lp_texture_subdata      = pipe->texture_subdata;
+   vp->lp_buffer_unmap         = pipe->buffer_unmap;
+   vp->lp_texture_unmap        = pipe->texture_unmap;
+   vp->lp_clear_buffer         = pipe->clear_buffer;
+   vp->lp_clear_texture        = pipe->clear_texture;
+   vp->lp_clear_render_target  = pipe->clear_render_target;
+   vp->lp_clear_depth_stencil  = pipe->clear_depth_stencil;
+   vp->lp_resource_copy_region = pipe->resource_copy_region;
+   vp->lp_blit                 = pipe->blit;
+   pipe->buffer_subdata        = vp_buffer_subdata;
+   pipe->texture_subdata       = vp_texture_subdata;
+   pipe->buffer_unmap          = vp_transfer_unmap;
+   pipe->texture_unmap         = vp_transfer_unmap;
+   pipe->clear_buffer          = vp_clear_buffer;
+   pipe->clear_texture         = vp_clear_texture;
+   pipe->clear_render_target   = vp_clear_render_target;
+   pipe->clear_depth_stencil   = vp_clear_depth_stencil;
+   pipe->resource_copy_region  = vp_resource_copy_region;
+   pipe->blit                  = vp_blit;
 
    pipe->create_compute_state = vp_create_compute_state;
    pipe->bind_compute_state   = vp_bind_compute_state;
