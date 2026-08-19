@@ -704,11 +704,12 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
             rt[k].blend_src_a    = (mrt->blend_func[k] >> 8)  & 0xff;
             rt[k].blend_dst_rgb  = (mrt->blend_func[k] >> 16) & 0xff;
             rt[k].blend_dst_a    = (mrt->blend_func[k] >> 24) & 0xff;
-            /* Both are pipeline-wide in Vulkan, so every attachment carries the
-             * same values the scalar path uses. */
-            rt[k].blend_const    = om->blend_const;
+            /* The logic op is pipeline-wide in Vulkan, so every attachment
+             * carries the value the scalar path uses. Storage and the blend
+             * constant are the attachment's own -- the constant because its
+             * channel order follows the target it is blended into. */
             rt[k].logic_op       = om->logic_op;
-            /* Storage, unlike the blend state, is the attachment's own. */
+            rt[k].blend_const    = mrt->blend_const[k];
             rt[k].color_format   = mrt->color_format[k];
             rt[k].cbuf_writemask4 = mrt->colormask[k];
             rt[k].blend_enabled  = !((rt[k].blend_mode_rgb == (uint32_t)VX_OM_BLEND_MODE_ADD)

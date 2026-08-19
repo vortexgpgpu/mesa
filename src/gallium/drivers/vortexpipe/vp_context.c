@@ -156,7 +156,7 @@ vp_create_compute_state(struct pipe_context *pipe,
       /* raw const-index shader-buffer slots (RT trace-ray command buffer) ->
        * SBT shader-record pointer relocation at launch. */
       cso->trace_cmd_slots = vp_scan_trace_cmd_slots(cs_nir);
-      if (vp_nir_to_llvm(cs_nir, &ir, NULL, NULL, 1, false)) {
+      if (vp_nir_to_llvm(cs_nir, &ir, NULL, NULL, 1, 0)) {
          if (vp_compile_vxbin(ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
                       cso->vxbin_size);
@@ -485,7 +485,7 @@ vp_create_vs_state(struct pipe_context *pipe,
    if (vs_nir) {
       char *ir = NULL;
       if (vp_nir_to_llvm(vs_nir, &ir,
-                         &cso->vs_layout, NULL, 1, false)) {
+                         &cso->vs_layout, NULL, 1, 0)) {
          /* VS links at a distinct base so it co-resides with the FS
           * (0x80000000) + front end (0x80200000) in one OP_DRAW. */
          if (vp_compile_vxbin(ir, VP_STARTUP_VS, false, &cso->vxbin, &cso->vxbin_size))
@@ -668,13 +668,14 @@ vp_fs_uses_sw_texop(struct nir_shader *nir)
  * without sw_om, so the implied bits are forced here rather than at each call
  * site. */
 static struct vp_fs_variant_key
-vp_fs_key_make(const struct vp_sw_routing *routing, unsigned samples, bool bgra)
+vp_fs_key_make(const struct vp_sw_routing *routing, unsigned samples,
+               uint8_t bgra_mask)
 {
    struct vp_fs_variant_key k;
    memset(&k, 0, sizeof(k));
    k.routing = *routing;
    k.samples = samples ? samples : 1u;
-   k.bgra    = bgra;
+   k.bgra_mask = bgra_mask;
    if (k.samples > 1) {
       k.routing.sw_raster = true;
    }
@@ -691,7 +692,7 @@ vp_fs_key_equal(const struct vp_fs_variant_key *a,
                 const struct vp_fs_variant_key *b)
 {
    return a->samples == b->samples
-       && a->bgra == b->bgra
+       && a->bgra_mask == b->bgra_mask
        && a->routing.sw_tex == b->routing.sw_tex
        && a->routing.sw_om == b->routing.sw_om
        && a->routing.sw_raster == b->routing.sw_raster;
@@ -711,7 +712,7 @@ vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v,
     * also report as a warning. Only the toolchain failing afterwards is an
     * error, and the caller needs the two apart to say which happened. */
    if (!vp_nir_to_llvm(cso->fs_nir, &ir, NULL, &v->key.routing, v->key.samples,
-                       v->key.bgra))
+                       v->key.bgra_mask))
       return false;
    /* Co-compile the gfx_sw ABI whenever this variant could call it -- a
     * routed-to-SW unit, or a HW-TEX shader that samples a texture (a mipmapped
@@ -759,10 +760,10 @@ vp_fs_variant_get(struct vp_cso *cso, const struct vp_fs_variant_key *key)
       return NULL;
    }
    vp_dbg("vortexpipe: compiled FS variant %u -> %zu bytes "
-          "(sw_tex=%d sw_om=%d sw_raster=%d samples=%u bgra=%d)",
+          "(sw_tex=%d sw_om=%d sw_raster=%d samples=%u bgra_mask=0x%x)",
           cso->num_fs_variants - 1, v->vxbin_size,
           v->key.routing.sw_tex, v->key.routing.sw_om,
-          v->key.routing.sw_raster, v->key.samples, v->key.bgra);
+          v->key.routing.sw_raster, v->key.samples, v->key.bgra_mask);
    return v;
 }
 
@@ -831,7 +832,7 @@ vp_create_fs_state(struct pipe_context *pipe,
        * yet, so a pipeline that turns out to render blue-first compiles its
        * variant on its first draw instead. */
       const struct vp_fs_variant_key k0 =
-         vp_fs_key_make(&cso->fs_routing, 1, false);
+         vp_fs_key_make(&cso->fs_routing, 1, 0);
       if (!vp_fs_variant_get(cso, &k0)) {
          mesa_logw("vortexpipe: FS NIR->LLVM unavailable; "
                    "fragment stage runs on llvmpipe");
@@ -1246,21 +1247,19 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
          vp->fb_cbufs[i] = fb->cbufs[i] ? fb->cbufs[i]->texture : NULL;
       vp->fb_nr_cbufs = n;
    }
-   /* How the fragment variant is compiled to pack a pixel and how the merger
-    * is told to store each attachment. Every render target carries its own
-    * merger state, so the formats and texel widths are recorded per attachment
-    * and may differ across the set. The *pack order* cannot: the wrapper emits
-    * one order per kernel, so a framebuffer whose attachments want different
-    * orders has no single answer and takes the fallback. Decided here rather
-    * than per draw because a framebuffer is bound far less often than it is
-    * drawn to, and a per-draw warning about a whole render pass is unreadable. */
-   vp->fb_color_ok   = true;
-   vp->fb_color_bgra = false;
+   /* How the fragment variant is compiled to pack each pixel and how the merger
+    * is told to store it. Every render target carries its own merger state and
+    * the wrapper packs each one separately, so the format, the texel width and
+    * the channel order are all recorded per attachment and may differ across
+    * the set. Decided here rather than per draw because a framebuffer is bound
+    * far less often than it is drawn to, and a per-draw warning about a whole
+    * render pass is unreadable. */
+   vp->fb_color_ok        = true;
+   vp->fb_color_bgra_mask = 0;
    for (unsigned i = 0; i < GFX_OM_MAX_RT; i++) {
       vp->fb_color_format[i] = VX_OM_COLOR_FORMAT_A8R8G8B8;
       vp->fb_color_bpp[i]    = 4;
    }
-   bool order_seen = false;
    for (unsigned i = 0; fb && i < vp->fb_nr_cbufs; i++) {
       if (!fb->cbufs[i]) {
          continue;
@@ -1277,14 +1276,6 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
          vp->fb_color_ok = false;
          break;
       }
-      if (order_seen && bgra != vp->fb_color_bgra) {
-         mesa_logw("vortexpipe: colour attachment %u is format %d, whose "
-                   "channel order is not the one the attachments before it "
-                   "need, and one fragment kernel packs one order; this render "
-                   "pass runs on llvmpipe", i, (int)cf);
-         vp->fb_color_ok = false;
-         break;
-      }
       /* The resident planes are expanded across samples a 32-bit word at a
        * time, and the pass-end resolve is written for that width. A narrow
        * attachment would be expanded as if it were four bytes wide. */
@@ -1297,8 +1288,9 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
       }
       vp->fb_color_format[i] = vxfmt;
       vp->fb_color_bpp[i]    = bpp;
-      vp->fb_color_bgra      = bgra;
-      order_seen = true;
+      if (bgra) {
+         vp->fb_color_bgra_mask |= (uint8_t)(1u << i);
+      }
    }
    /* A refused framebuffer leaves the pass-through description behind, so a
     * variant keyed on it while the draw is on its way to llvmpipe is at least
@@ -1308,7 +1300,7 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
          vp->fb_color_format[i] = VX_OM_COLOR_FORMAT_A8R8G8B8;
          vp->fb_color_bpp[i]    = 4;
       }
-      vp->fb_color_bgra = false;
+      vp->fb_color_bgra_mask = 0;
    }
    vp->lp_set_framebuffer_state(pipe, fb);
 }
@@ -2758,7 +2750,7 @@ vp_draw_vbo(struct pipe_context *pipe,
             }
          }
          const struct vp_fs_variant_key key =
-            vp_fs_key_make(&routing, vp->fb_samples, vp->fb_color_bgra);
+            vp_fs_key_make(&routing, vp->fb_samples, vp->fb_color_bgra_mask);
          fsv = vp_fs_variant_get(fs, &key);
       }
 
@@ -2906,12 +2898,12 @@ vp_draw_vbo(struct pipe_context *pipe,
          }
          if (vp->cur_blend) {
             om.blend_const = vp_om_color_order(vp->cur_blend_color,
-                                               vp->fb_color_bgra);
+                                               vp->fb_color_bgra_mask & 1u);
             om.logic_op    = vp->cur_blend->logic_op;
             om.blend_mode = vp->cur_blend->blend_mode;
             om.blend_func = vp->cur_blend->blend_func;
             om.colormask  = vp_om_colormask_order(vp->cur_blend->colormask,
-                                                  vp->fb_color_bgra);
+                                                  vp->fb_color_bgra_mask & 1u);
          } else {
             /* no blend cso bound: passthrough (src*ONE + dst*ZERO) */
             om.blend_mode = (VX_OM_BLEND_MODE_ADD << 16)
@@ -3049,14 +3041,22 @@ vp_draw_vbo(struct pipe_context *pipe,
             mrt.color_dev[0] = color_dev;   /* RT0 shares the resident colour buf */
             drew = vp_fb_ensure_mrt(pipe, vp, w, h, num_color, mrt.color_dev);
             for (unsigned k = 0; k < num_color; k++) {
+               /* Every per-attachment value expressed in channel order is
+                * swizzled to that attachment's own, so the merger and the DCR
+                * writes downstream stay a mechanical widening of what they are
+                * handed. The blend constant is pipeline-wide in Vulkan, but its
+                * order is not, so each target gets its own permutation of it. */
+               const bool kbgra = (vp->fb_color_bgra_mask >> k) & 1u;
                mrt.pitch[k]        = w * vp->fb_color_bpp[k];
                mrt.color_format[k] = vp->fb_color_format[k];
+               mrt.blend_const[k]  = vp_om_color_order(vp->cur_blend_color,
+                                                       kbgra);
                if (vp->cur_blend) {
                   mrt.blend_mode[k] = vp->cur_blend->rt_blend_mode[k];
                   mrt.blend_func[k] = vp->cur_blend->rt_blend_func[k];
                   mrt.colormask[k]  =
                      vp_om_colormask_order(vp->cur_blend->rt_colormask[k],
-                                           vp->fb_color_bgra);
+                                           kbgra);
                } else {
                   mrt.blend_mode[k] = (VX_OM_BLEND_MODE_ADD << 16) | VX_OM_BLEND_MODE_ADD;
                   mrt.blend_func[k] = (VX_OM_BLEND_FUNC_ZERO << 24)

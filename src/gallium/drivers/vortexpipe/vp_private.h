@@ -163,7 +163,10 @@ void vp_screen_resident_dirty_all(struct pipe_screen *screen);
 struct vp_fs_variant_key {
    struct vp_sw_routing routing;
    unsigned             samples;   /* 1, or the pass' sample count */
-   bool                 bgra;      /* colour attachments are blue-first */
+   /* One bit per render target: set when that attachment's format wants its
+    * blue channel in the low byte. A mask rather than a flag because the set
+    * may mix formats that disagree, and it is still one scalar to compare. */
+   uint8_t              bgra_mask;
 };
 
 /* One compiled fragment shader: its image, and the device residency handles
@@ -364,11 +367,16 @@ struct vp_context {
    bool           startup_fs_is_compute;  /* holder is a compute module */
    /* Colour attachment channel order for the bound framebuffer, decided once
     * per bind. fb_color_ok is false when an attachment has an order the device
-    * cannot produce, or when the attachments disagree, and sends the whole
-    * render pass to llvmpipe rather than permuting its colours; fb_color_bgra
-    * selects the blue-first order the fragment variant is compiled for. */
+    * cannot produce, and sends the whole render pass to llvmpipe rather than
+    * permuting its colours. fb_color_bgra_mask carries one bit per attachment:
+    * set means that target's format wants its blue channel in the low byte,
+    * which is the order the fragment variant is compiled to pack it in.
+    *
+    * The bit follows the format's encoder, not the attachment's name -- R8 and
+    * RG8 set it because the merger reads their channels from the high lanes,
+    * not because those attachments are blue-first. */
    bool           fb_color_ok;
-   bool           fb_color_bgra;
+   uint8_t        fb_color_bgra_mask;
    /* Each attachment's storage format, as the merger encodes it, and its texel
     * width. Anything but A8R8G8B8 forces the software merger -- the
     * fixed-function one has no colour-format register -- and the width is what
