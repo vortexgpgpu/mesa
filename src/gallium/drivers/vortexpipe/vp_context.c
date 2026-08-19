@@ -699,9 +699,15 @@ vp_fs_key_equal(const struct vp_fs_variant_key *a,
  * false and leaves the slot empty when the shader cannot be built for this key;
  * the caller then falls through to llvmpipe. */
 static bool
-vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v)
+vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v,
+                      bool *out_toolchain_failed)
 {
    char *ir = NULL;
+   *out_toolchain_failed = false;
+   /* No translation means the shader uses something the device path does not
+    * implement -- a feature-coverage gap, which the compute and vertex paths
+    * also report as a warning. Only the toolchain failing afterwards is an
+    * error, and the caller needs the two apart to say which happened. */
    if (!vp_nir_to_llvm(cso->fs_nir, &ir, NULL, &v->key.routing, v->key.samples))
       return false;
    /* Co-compile the gfx_sw ABI whenever this variant could call it -- a
@@ -713,6 +719,7 @@ vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v)
    const bool ok = vp_compile_vxbin(ir, VP_STARTUP_FS, uses_sw,
                                     &v->vxbin, &v->vxbin_size);
    vp_free_ir(ir);
+   *out_toolchain_failed = !ok;
    return ok;
 }
 
@@ -738,8 +745,14 @@ vp_fs_variant_get(struct vp_cso *cso, const struct vp_fs_variant_key *key)
    memset(v, 0, sizeof(*v));
    v->key = *key;
    cso->num_fs_variants++;
-   if (!vp_fs_variant_compile(cso, v)) {
-      mesa_loge("vortexpipe: FS variant .vxbin compile failed");
+   bool toolchain_failed = false;
+   if (!vp_fs_variant_compile(cso, v, &toolchain_failed)) {
+      if (toolchain_failed) {
+         mesa_loge("vortexpipe: FS variant .vxbin compile failed");
+      } else {
+         mesa_logw("vortexpipe: fragment shader has no device path; "
+                   "this draw runs on llvmpipe");
+      }
       return NULL;
    }
    vp_dbg("vortexpipe: compiled FS variant %u -> %zu bytes "

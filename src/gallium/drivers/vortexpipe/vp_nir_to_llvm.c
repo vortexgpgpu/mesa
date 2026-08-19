@@ -111,6 +111,11 @@
 #define VP_RAST_ATTR_W4     180
 #define VP_RAST_ATTR_W5     192
 
+/* Scalar planes available to carry varyings: [u,v,r,g,b,a] plus w0..w5. The
+ * VS packs into them in declaration order and the FS reads back the same way,
+ * so this bounds the two together. */
+#define VP_RAST_MAX_PLANES   12
+
 /* TEX unit: coordinates are S.23 fixed-point (VX_types.h VX_TEX_FXD_FRAC). */
 #define VP_TEX_FXD_FRAC      23
 
@@ -4331,6 +4336,7 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
                 struct vp_vs_layout *out_vs)
 {
    unsigned next = 16;   /* slot 0 reserved for gl_Position */
+   unsigned vs_scalars = 0;
    nir_foreach_shader_out_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
       int off;
@@ -4339,18 +4345,35 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
       } else {
          off = (int)next;
          next += 16;
-         if (out_vs && out_vs->num_varyings < VP_VS_MAX_VARYINGS) {
+         if (out_vs) {
+            if (out_vs->num_varyings >= VP_VS_MAX_VARYINGS) {
+               mesa_logw("vortexpipe: VS declares more than %u generic "
+                         "varyings; this draw runs on llvmpipe",
+                         VP_VS_MAX_VARYINGS);
+               t->ok = false; return;
+            }
             out_vs->varying_loc[out_vs->num_varyings]   = var->data.location;
             out_vs->varying_comps[out_vs->num_varyings] =
                glsl_get_components(var->type);
-         }
-         if (out_vs)
             out_vs->num_varyings++;
+            vs_scalars += glsl_get_components(var->type);
+         }
       }
       t->vars[t->nvars].var     = var;
       t->vars[t->nvars].alloca  = NULL;
       t->vars[t->nvars].out_off = off;
       t->nvars++;
+   }
+   /* The front end carries varyings in VP_RAST_MAX_PLANES scalar interpolation
+    * planes and drops whatever does not fit, so a shader that writes more than
+    * that loses varyings with no diagnostic and the fragment reads a
+    * fixed-function default in their place. Refuse it here instead: the draw
+    * takes the llvmpipe fallback and produces the right answer slowly. */
+   if (vs_scalars > VP_RAST_MAX_PLANES) {
+      mesa_logw("vortexpipe: VS varyings need %u interpolation planes, "
+                "device carries %u; this draw runs on llvmpipe",
+                vs_scalars, VP_RAST_MAX_PLANES);
+      t->ok = false; return;
    }
    t->out_stride = next;   /* 16 * (1 + num_varyings) */
    if (out_vs)
@@ -4364,13 +4387,42 @@ static void
 fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
 {
    unsigned off = 0;
+   unsigned fs_scalars = 0;
    nir_foreach_shader_in_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      /* Only smooth interpolation is implemented. A flat varying would have to
+       * bypass the interpolator entirely -- its bit pattern is not necessarily
+       * a number, which is why every integer varying is flat -- and the plane
+       * path would premultiply it by 1/w and quantise it to Q7.24, turning a
+       * small integer into zero. noperspective needs a plane that is not
+       * premultiplied at all. Neither is a value this path can carry, so refuse
+       * the shader rather than interpolate something that was never meant to
+       * be. */
+      if (var->data.interpolation == INTERP_MODE_FLAT ||
+          var->data.interpolation == INTERP_MODE_NOPERSPECTIVE) {
+         mesa_logw("vortexpipe: FS input at location %u uses %s interpolation, "
+                   "which the device varying path does not implement; "
+                   "this draw runs on llvmpipe",
+                   var->data.location,
+                   var->data.interpolation == INTERP_MODE_FLAT ? "flat"
+                                                               : "noperspective");
+         t->ok = false; return;
+      }
+      fs_scalars += glsl_get_components(var->type);
       t->vars[t->nvars].var     = var;
       t->vars[t->nvars].alloca  = NULL;
       t->vars[t->nvars].out_off = (int)off;
       t->nvars++;
       off += 16;
+   }
+   /* Same plane budget as the VS side, checked here too because the two are
+    * compiled independently: a fragment shader reading past the last plane is
+    * left holding the fixed-function default, silently. */
+   if (fs_scalars > VP_RAST_MAX_PLANES) {
+      mesa_logw("vortexpipe: FS inputs need %u interpolation planes, "
+                "device carries %u; this draw runs on llvmpipe",
+                fs_scalars, VP_RAST_MAX_PLANES);
+      t->ok = false; return;
    }
    /* Output slots are keyed by render-target index: a colour output at
     * FRAG_RESULT_DATA0+k lands at out slot k*16, so the wrapper can pack colours
@@ -4636,7 +4688,7 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
     * draw may carry any mix of varyings (a texcoord + a scalar lod, or a
     * samplerCube textureGrad's coord + dPdx + dPdy = 9 scalars) without the planes
     * colliding. Twelve planes are the [u,v,r,g,b,a] six plus w0..w5. */
-   static const unsigned lane[12] = {
+   static const unsigned lane[VP_RAST_MAX_PLANES] = {
       VP_RAST_ATTR_U,  VP_RAST_ATTR_V,
       VP_RAST_ATTR_R,  VP_RAST_ATTR_G,  VP_RAST_ATTR_B,  VP_RAST_ATTR_A,
       VP_RAST_ATTR_W0, VP_RAST_ATTR_W1, VP_RAST_ATTR_W2,
@@ -4662,7 +4714,7 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
          continue;
       unsigned nc = glsl_get_components(var->type);
       LLVMValueRef slot = addk(t, in_addr, (unsigned)t->vars[i].out_off);
-      for (unsigned c = 0; c < nc && li < 12u; c++, li++) {
+      for (unsigned c = 0; c < nc && li < VP_RAST_MAX_PLANES; c++, li++) {
          LLVMValueRef q = emit_interp(t, addk(t, prim, lane[li]), dxq, dyq);
          LLVMValueRef f = LLVMBuildFMul(t->b, emit_fixed_to_float(t, q, 24),
                                         inv_rhw, "");
