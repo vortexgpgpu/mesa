@@ -104,6 +104,8 @@ vp_reg_del(const void *key)
  * can load. */
 static void vp_cso_evict_module(struct vp_cso *cso);
 static void vp_fs_variant_make_resident(struct vp_cso *cso, int want);
+static void vp_release_startup_fs(struct vp_context *vp);
+static void vp_forget_startup_fs(struct vp_context *vp, const struct vp_cso *cso);
 
 /* create_compute_state returns a struct vp_cso* (llvmpipe's cso +
  * the compiled Vortex .vxbin); bind/delete unwrap it. */
@@ -202,6 +204,7 @@ vp_delete_compute_state(struct pipe_context *pipe, void *p)
    struct vp_cso     *cso = p;
    if (vp->cur_cso == cso)
       vp->cur_cso = NULL;
+   vp_forget_startup_fs(vp, cso);
    vp_cso_evict_module(cso);
    vp->lp_delete_compute_state(pipe, cso->lp_cso);
    vp_free_blob(cso->vxbin);
@@ -384,11 +387,15 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
                 eff_grid[0], eff_grid[1], eff_grid[2],
                 eff_block[0], eff_block[1], eff_block[2],
                 cso->num_descs, num_ssbos);
-         /* Compute and fragment shaders both start at VP_STARTUP_FS, so a
-          * resident FS holds the address this kernel needs. Evict it before
-          * the kernel loads there. */
-         if (vp->cur_fs)
-            vp_fs_variant_make_resident(vp->cur_fs, -1);
+         /* Compute and fragment shaders both start at VP_STARTUP_FS, so
+          * whatever holds the address has to give it up before this kernel
+          * loads there -- unless this very kernel is already the holder, which
+          * is the repeated-dispatch case the residency slot exists to serve. */
+         if (vp->startup_fs_owner != cso || !vp->startup_fs_is_compute) {
+            vp_release_startup_fs(vp);
+         }
+         vp->startup_fs_owner = cso;
+         vp->startup_fs_is_compute = true;
          ran_on_vortex = vp_launch(vp->dev, cso->vxbin, cso->vxbin_size,
                                    &cso->vx_module, &cso->vx_kernel,
                                    (uint8_t *)desc_host + vp->cbuf_off[1],
@@ -547,6 +554,35 @@ vp_cso_evict_module(struct vp_cso *cso)
       return;
    if (cso->vx_kernel) { vx_kernel_release(cso->vx_kernel); cso->vx_kernel = NULL; }
    if (cso->vx_module) { vx_module_release(cso->vx_module); cso->vx_module = NULL; }
+}
+
+/* Release whichever image holds the VP_STARTUP_FS device address so the caller
+ * can load its own there. The owner is cleared first: releasing runs arbitrary
+ * teardown, and the address is free from this point on either way. */
+static void
+vp_release_startup_fs(struct vp_context *vp)
+{
+   struct vp_cso *owner = vp->startup_fs_owner;
+   if (!owner) {
+      return;
+   }
+   const bool was_compute = vp->startup_fs_is_compute;
+   vp->startup_fs_owner = NULL;
+   if (was_compute) {
+      vp_cso_evict_module(owner);
+   } else {
+      vp_fs_variant_make_resident(owner, -1);
+   }
+}
+
+/* A CSO being destroyed must not stay named as the address holder: the next
+ * claimant would evict through a freed pointer. */
+static void
+vp_forget_startup_fs(struct vp_context *vp, const struct vp_cso *cso)
+{
+   if (vp->startup_fs_owner == cso) {
+      vp->startup_fs_owner = NULL;
+   }
 }
 
 static void
@@ -847,6 +883,7 @@ vp_delete_fs_state(struct pipe_context *pipe, void *p)
    struct vp_cso     *cso = p;
    if (vp->cur_fs == cso)
       vp->cur_fs = NULL;
+   vp_forget_startup_fs(vp, cso);
    vp_fs_variant_make_resident(cso, -1);   /* release whatever is resident */
    for (unsigned i = 0; i < cso->num_fs_variants; i++)
       vp_free_blob(cso->fs_variants[i].vxbin);
@@ -2902,9 +2939,18 @@ vp_draw_vbo(struct pipe_context *pipe,
          }
          if (drew) {
             /* Claim the fixed FS device address for this variant, releasing
-             * whichever one held it: the draw below loads the module only when
-             * the handle is null, and an overlapping reservation is rejected. */
+             * whichever image held it -- a compute kernel included, since both
+             * stages link at that base: the draw below loads the module only
+             * when the handle is null, and an overlapping reservation is
+             * rejected. Switching variants inside this CSO is left to
+             * vp_fs_variant_make_resident, which releases only on a real
+             * change. */
+            if (vp->startup_fs_owner != fs || vp->startup_fs_is_compute) {
+               vp_release_startup_fs(vp);
+            }
             vp_fs_variant_make_resident(fs, (int)(fsv - fs->fs_variants));
+            vp->startup_fs_owner = fs;
+            vp->startup_fs_is_compute = false;
             drew = vp_raster_draw(vp->dev, vp->raster_pool,
                                   vs->vxbin, vs->vxbin_size,
                                   &vs->vx_module, &vs->vx_kernel,

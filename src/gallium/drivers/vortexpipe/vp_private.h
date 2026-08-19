@@ -254,6 +254,13 @@ struct vp_context {
    struct vp_cso *cur_cso;                /* bound compute state */
    struct vp_cso *cur_vs;                 /* bound vertex shader */
    struct vp_cso *cur_fs;                 /* bound fragment shader */
+   /* Holder of the VP_STARTUP_FS device address. Compute kernels and fragment
+    * shaders link at that one base, so exactly one image occupies it and the
+    * loader refuses an overlapping claim. Naming the holder here keeps eviction
+    * independent of which CSO is bound: the claimant releases whoever holds the
+    * address, rather than guessing that it is cur_fs. NULL when free. */
+   struct vp_cso *startup_fs_owner;
+   bool           startup_fs_is_compute;  /* holder is a compute module */
    /* compute constant buffers, by index -- lavapipe binds the
     * descriptor buffer for descriptor set N at index N+1. */
    struct pipe_resource *cbuf[8];
