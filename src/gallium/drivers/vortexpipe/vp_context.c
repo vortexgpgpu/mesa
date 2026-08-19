@@ -1200,6 +1200,27 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
          vp->fb_cbufs[i] = fb->cbufs[i] ? fb->cbufs[i]->texture : NULL;
       vp->fb_nr_cbufs = n;
    }
+   /* The fragment wrapper packs component c at bit c*8 -- R8G8B8A8's memory
+    * layout -- with no reference to the attachment's format, so any other
+    * channel order comes out permuted. Decided here rather than per draw
+    * because a framebuffer is bound far less often than it is drawn to, and a
+    * per-draw warning about a whole render pass is unreadable. */
+   vp->fb_color_ok = true;
+   for (unsigned i = 0; fb && i < vp->fb_nr_cbufs; i++) {
+      if (!fb->cbufs[i]) {
+         continue;
+      }
+      /* The surface's format, not the resource's: a view may reinterpret the
+       * texels, and it is the view the draw renders through. */
+      const enum pipe_format cf = fb->cbufs[i]->format;
+      if (cf != PIPE_FORMAT_R8G8B8A8_UNORM && cf != PIPE_FORMAT_R8G8B8X8_UNORM) {
+         mesa_logw("vortexpipe: colour attachment %u is format %d, which the "
+                   "device fragment path would render with its channels "
+                   "permuted; this render pass runs on llvmpipe", i, (int)cf);
+         vp->fb_color_ok = false;
+         break;
+      }
+   }
    vp->lp_set_framebuffer_state(pipe, fb);
 }
 
@@ -2662,7 +2683,7 @@ vp_draw_vbo(struct pipe_context *pipe,
          vp_min_z = vp->vp_min_z; vp_max_z = vp->vp_max_z;
       }
 
-      bool hw_path = vin_ok && !sw_raster && gfx_hw && fsv &&
+      bool hw_path = vin_ok && !sw_raster && gfx_hw && fsv && vp->fb_color_ok &&
                      vp->fb_color && vp->fb_width && vp->fb_height;
 
       /* Vortex hardware raster + OM path: the VS is folded into the draw —

@@ -358,6 +358,10 @@ struct vp_context {
     * loader refuses an overlapping claim. Naming the holder here keeps eviction
     * independent of which CSO is bound: the claimant releases whoever holds the
     * address, rather than guessing that it is cur_fs. NULL when free. */
+   /* Whether every bound colour attachment has a channel order the device
+    * fragment path actually produces. False sends the render pass to llvmpipe
+    * rather than permuting its colours. */
+   bool           fb_color_ok;
    struct vp_cso *startup_fs_owner;
    bool           startup_fs_is_compute;  /* holder is a compute module */
    /* compute constant buffers, by index -- lavapipe binds the

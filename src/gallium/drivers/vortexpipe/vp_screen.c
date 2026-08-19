@@ -409,7 +409,13 @@ vp_format_sampled(enum pipe_format format)
 
 /* Colour attachments. The output merger packs A8R8G8B8 and the pass-end transfer
  * moves four bytes per texel, so a narrower attachment is not merely converted
- * wrongly -- the transfer walks past the end of each row. 32-bit only. */
+ * wrongly -- the transfer walks past the end of each row. 32-bit only.
+ *
+ * The BGRA orders stay advertised even though the device fragment path cannot
+ * produce them: vp_set_framebuffer_state routes a pass that uses one to
+ * llvmpipe, which renders it correctly, so the support is real. Withdrawing
+ * them here would remove a working capability rather than an untruthful
+ * claim. */
 static bool
 vp_format_render_target(enum pipe_format format)
 {
