@@ -104,6 +104,12 @@ struct vp_mrt_params {
    uint32_t blend_mode[GFX_OM_MAX_RT];       /* VX_DCR_OM_BLEND_MODE packed word */
    uint32_t blend_func[GFX_OM_MAX_RT];       /* VX_DCR_OM_BLEND_FUNC packed word */
    uint32_t colormask[GFX_OM_MAX_RT];        /* VX_DCR_OM_CBUF_WRITEMASK (RGBA) */
+   /* Per-attachment storage format: every render target carries its own merger
+    * state, so a set may mix formats and texel widths. Only the channel order
+    * is shared, since one fragment kernel packs one order. The texel width is
+    * not carried -- the merger derives it from the format, and the row stride
+    * it needs is already in pitch[]. */
+   uint32_t color_format[GFX_OM_MAX_RT];     /* VX_OM_COLOR_FORMAT_* */
 };
 
 /* The texture bound for a draw -- mip 0 dims + the sampler's filter/wrap.

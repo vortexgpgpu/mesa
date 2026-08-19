@@ -708,7 +708,8 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
              * same values the scalar path uses. */
             rt[k].blend_const    = om->blend_const;
             rt[k].logic_op       = om->logic_op;
-            rt[k].color_format   = om->color_format;
+            /* Storage, unlike the blend state, is the attachment's own. */
+            rt[k].color_format   = mrt->color_format[k];
             rt[k].cbuf_writemask4 = mrt->colormask[k];
             rt[k].blend_enabled  = !((rt[k].blend_mode_rgb == (uint32_t)VX_OM_BLEND_MODE_ADD)
                                   && (rt[k].blend_mode_a   == (uint32_t)VX_OM_BLEND_MODE_ADD)

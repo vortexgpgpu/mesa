@@ -369,14 +369,15 @@ struct vp_context {
     * selects the blue-first order the fragment variant is compiled for. */
    bool           fb_color_ok;
    bool           fb_color_bgra;
-   /* The attachment's storage format, as the merger encodes it, and its texel
+   /* Each attachment's storage format, as the merger encodes it, and its texel
     * width. Anything but A8R8G8B8 forces the software merger -- the
     * fixed-function one has no colour-format register -- and the width is what
-    * every buffer size, pitch and readback below is measured in. One value for
-    * the whole framebuffer: a mixed-format one falls back, like a mixed-order
-    * one. */
-   uint32_t       fb_color_format;   /* VX_OM_COLOR_FORMAT_* */
-   uint32_t       fb_color_bpp;      /* bytes per texel */
+    * every buffer size, pitch and readback below is measured in. Per attachment
+    * because a multi-target framebuffer may mix them: every render target gets
+    * its own merger state, so each can be stored in its own format. Entries
+    * past fb_nr_cbufs hold the pass-through description. */
+   uint32_t       fb_color_format[GFX_OM_MAX_RT];   /* VX_OM_COLOR_FORMAT_* */
+   uint32_t       fb_color_bpp[GFX_OM_MAX_RT];      /* bytes per texel */
    /* compute constant buffers, by index -- lavapipe binds the
     * descriptor buffer for descriptor set N at index N+1. */
    struct pipe_resource *cbuf[8];
@@ -465,9 +466,12 @@ struct vp_context {
    unsigned              rfb_bpp;
    bool                  rfb_dirty;
    /* Extra resident colour buffers for attachments 1.. (RT0 uses rcb).
-    * rmrt_res[k] is the framebuffer resource each is synced back to. */
+    * rmrt_res[k] is the framebuffer resource each is synced back to, and
+    * rmrt_bpp[k] the texel width it was sized for -- carried for the same
+    * reason as rfb_bpp, and per attachment because the set may mix widths. */
    vx_buffer_h           rcb_extra[GFX_OM_MAX_RT];
    struct pipe_resource *rmrt_res[GFX_OM_MAX_RT];
+   unsigned              rmrt_bpp[GFX_OM_MAX_RT];
    unsigned              rmrt_nr;
    void (*lp_flush)(struct pipe_context *, struct pipe_fence_handle **, unsigned);
    /* Texture residency: the converted + uploaded TEX-stage-0 texels kept

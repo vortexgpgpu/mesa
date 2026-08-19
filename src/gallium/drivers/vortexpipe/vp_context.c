@@ -1247,17 +1247,20 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
       vp->fb_nr_cbufs = n;
    }
    /* How the fragment variant is compiled to pack a pixel and how the merger
-    * is told to store it. The wrapper emits one order per kernel, and the OM
-    * write-mask, blend constant, buffer sizes and pitches are all expressed in
-    * the same terms, so a framebuffer whose attachments disagree has no single
-    * answer and takes the fallback. Decided here rather than per draw because a
-    * framebuffer is bound far less often than it is drawn to, and a per-draw
-    * warning about a whole render pass is unreadable. */
-   vp->fb_color_ok     = true;
-   vp->fb_color_bgra   = false;
-   vp->fb_color_format = VX_OM_COLOR_FORMAT_A8R8G8B8;
-   vp->fb_color_bpp    = 4;
-   bool format_seen = false;
+    * is told to store each attachment. Every render target carries its own
+    * merger state, so the formats and texel widths are recorded per attachment
+    * and may differ across the set. The *pack order* cannot: the wrapper emits
+    * one order per kernel, so a framebuffer whose attachments want different
+    * orders has no single answer and takes the fallback. Decided here rather
+    * than per draw because a framebuffer is bound far less often than it is
+    * drawn to, and a per-draw warning about a whole render pass is unreadable. */
+   vp->fb_color_ok   = true;
+   vp->fb_color_bgra = false;
+   for (unsigned i = 0; i < GFX_OM_MAX_RT; i++) {
+      vp->fb_color_format[i] = VX_OM_COLOR_FORMAT_A8R8G8B8;
+      vp->fb_color_bpp[i]    = 4;
+   }
+   bool order_seen = false;
    for (unsigned i = 0; fb && i < vp->fb_nr_cbufs; i++) {
       if (!fb->cbufs[i]) {
          continue;
@@ -1274,35 +1277,38 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
          vp->fb_color_ok = false;
          break;
       }
-      if (format_seen &&
-          (vxfmt != vp->fb_color_format || bgra != vp->fb_color_bgra)) {
-         mesa_logw("vortexpipe: colour attachment %u is format %d, which does "
-                   "not match the attachments before it, and one fragment "
-                   "kernel packs one format; this render pass runs on llvmpipe",
-                   i, (int)cf);
+      if (order_seen && bgra != vp->fb_color_bgra) {
+         mesa_logw("vortexpipe: colour attachment %u is format %d, whose "
+                   "channel order is not the one the attachments before it "
+                   "need, and one fragment kernel packs one order; this render "
+                   "pass runs on llvmpipe", i, (int)cf);
          vp->fb_color_ok = false;
          break;
       }
-      vp->fb_color_format = vxfmt;
-      vp->fb_color_bpp    = bpp;
-      vp->fb_color_bgra   = bgra;
-      format_seen = true;
-   }
-   /* The resident planes are expanded across samples a 32-bit word at a time,
-    * and the pass-end resolve is written for that width. A narrow attachment
-    * would be expanded as if it were four bytes wide. */
-   if (vp->fb_color_bpp != 4 && vp->fb_samples > 1) {
-      mesa_logw("vortexpipe: a %u-byte colour attachment has no multisample "
-                "path; this render pass runs on llvmpipe", vp->fb_color_bpp);
-      vp->fb_color_ok = false;
+      /* The resident planes are expanded across samples a 32-bit word at a
+       * time, and the pass-end resolve is written for that width. A narrow
+       * attachment would be expanded as if it were four bytes wide. */
+      if (bpp != 4 && vp->fb_samples > 1) {
+         mesa_logw("vortexpipe: colour attachment %u is %u bytes per texel, "
+                   "which has no multisample path; this render pass runs on "
+                   "llvmpipe", i, bpp);
+         vp->fb_color_ok = false;
+         break;
+      }
+      vp->fb_color_format[i] = vxfmt;
+      vp->fb_color_bpp[i]    = bpp;
+      vp->fb_color_bgra      = bgra;
+      order_seen = true;
    }
    /* A refused framebuffer leaves the pass-through description behind, so a
     * variant keyed on it while the draw is on its way to llvmpipe is at least
     * the one the rest of the suite already compiles. */
    if (!vp->fb_color_ok) {
-      vp->fb_color_format = VX_OM_COLOR_FORMAT_A8R8G8B8;
-      vp->fb_color_bpp    = 4;
-      vp->fb_color_bgra   = false;
+      for (unsigned i = 0; i < GFX_OM_MAX_RT; i++) {
+         vp->fb_color_format[i] = VX_OM_COLOR_FORMAT_A8R8G8B8;
+         vp->fb_color_bpp[i]    = 4;
+      }
+      vp->fb_color_bgra = false;
    }
    vp->lp_set_framebuffer_state(pipe, fb);
 }
@@ -1339,7 +1345,7 @@ static bool
 vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
 {
    return vp_resource_rw(pipe, vp->fb_color, vp->fb_width, vp->fb_height,
-                         vp->fb_color_bpp, dst, false);
+                         vp->fb_color_bpp[0], dst, false);
 }
 
 /* Expand a single-sample w*h plane in place into the sample-major multisample
@@ -1515,18 +1521,32 @@ vp_fb_sync_out(struct pipe_context *pipe, struct vp_context *vp)
    if (!vp->rfb_dirty || !vp->rcb || !vp->rfb_res)
       return;
    const uint32_t bytes = vp->rfb_w * vp->rfb_h * vp->rfb_bpp;
-   void *host = malloc(bytes);
+   /* One staging buffer serves every attachment, so it has to be as wide as the
+    * widest of them. The widths come from rmrt_bpp, not from the framebuffer
+    * state: this flush runs while the *next* framebuffer is being bound, and
+    * fb_color_bpp already describes that one. */
+   uint32_t stage = bytes;
+   for (unsigned k = 1; k < vp->rmrt_nr; k++) {
+      const uint32_t kb = vp->rfb_w * vp->rfb_h * vp->rmrt_bpp[k];
+      if (kb > stage) {
+         stage = kb;
+      }
+   }
+   void *host = malloc(stage);
    if (host &&
        vp_buffer_readback(vp->dev, vp->rcb, host, bytes)) {
       vp_resource_rw(pipe, vp->rfb_res, vp->rfb_w, vp->rfb_h, vp->rfb_bpp,
                      host, true);
       /* Write each extra colour attachment (1..) back to its resource. */
       for (unsigned k = 1; k < vp->rmrt_nr; k++) {
-         if (!vp->rcb_extra[k] || !vp->rmrt_res[k])
+         if (!vp->rcb_extra[k] || !vp->rmrt_res[k] || !vp->rmrt_bpp[k]) {
             continue;
-         if (vp_buffer_readback(vp->dev, vp->rcb_extra[k], host, bytes))
+         }
+         const uint32_t kb = vp->rfb_w * vp->rfb_h * vp->rmrt_bpp[k];
+         if (vp_buffer_readback(vp->dev, vp->rcb_extra[k], host, kb)) {
             vp_resource_rw(pipe, vp->rmrt_res[k], vp->rfb_w, vp->rfb_h,
-                           vp->rfb_bpp, host, true);
+                           vp->rmrt_bpp[k], host, true);
+         }
       }
    }
    free(host);
@@ -1545,6 +1565,7 @@ vp_fb_invalidate(struct pipe_context *pipe, struct vp_context *vp)
    for (unsigned k = 0; k < GFX_OM_MAX_RT; k++) {
       if (vp->rcb_extra[k]) { vx_buffer_release(vp->rcb_extra[k]); vp->rcb_extra[k] = NULL; }
       vp->rmrt_res[k] = NULL;
+      vp->rmrt_bpp[k] = 0;
    }
    vp->rmrt_nr = 0;
    vp->rfb_res = NULL;
@@ -1566,7 +1587,7 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * sized for the old one. */
    if (vp->rcb && vp->rfb_res == vp->fb_color &&
        vp->rfb_w == w && vp->rfb_h == h && vp->rfb_s == vp->fb_samples &&
-       vp->rfb_bpp == vp->fb_color_bpp) {
+       vp->rfb_bpp == vp->fb_color_bpp[0]) {
       /* reuse the resident pass buffers (preserve colour + depth across draws) */
       if (vx_buffer_address(vp->rcb, color_dev) != VX_SUCCESS) return false;
       if (vx_buffer_address(vp->rzb, depth_dev) != VX_SUCCESS) return false;
@@ -1581,7 +1602,7 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * The two planes are sized separately: the depth/stencil word is always
     * four bytes, while a colour texel is as wide as its attachment. */
    const uint32_t S = vp->fb_samples ? vp->fb_samples : 1u;
-   const uint32_t cbpp = vp->fb_color_bpp ? vp->fb_color_bpp : 4u;
+   const uint32_t cbpp = vp->fb_color_bpp[0] ? vp->fb_color_bpp[0] : 4u;
    const uint32_t cbytes = w * h * cbpp;
    const uint32_t zbytes = w * h * 4;
    const uint32_t cdev_bytes = cbytes * S;
@@ -1637,22 +1658,28 @@ vp_fb_ensure_mrt(struct pipe_context *pipe, struct vp_context *vp,
                  uint64_t color_dev[GFX_OM_MAX_RT])
 {
    if (num > GFX_OM_MAX_RT) num = GFX_OM_MAX_RT;
-   /* Every attachment of a framebuffer shares one format here -- a mixed one
-    * never reaches the device path -- so one texel width sizes them all. */
-   const uint32_t bpp = vp->fb_color_bpp ? vp->fb_color_bpp : 4u;
-   const uint32_t bytes = w * h * bpp;
 
+   /* An attachment keeps its buffer only if it is still the same resource at
+    * the same texel width: a set that rebinds one target in a narrower format
+    * reuses a buffer sized for the old one otherwise. */
    bool have = (vp->rmrt_nr == num);
-   for (unsigned k = 1; k < num && have; k++)
-      if (!vp->rcb_extra[k] || vp->rmrt_res[k] != vp->fb_cbufs[k])
+   for (unsigned k = 1; k < num && have; k++) {
+      const uint32_t bpp = vp->fb_color_bpp[k] ? vp->fb_color_bpp[k] : 4u;
+      if (!vp->rcb_extra[k] || vp->rmrt_res[k] != vp->fb_cbufs[k] ||
+          vp->rmrt_bpp[k] != bpp) {
          have = false;
+      }
+   }
 
    if (!have) {
       for (unsigned k = 1; k < GFX_OM_MAX_RT; k++) {
          if (vp->rcb_extra[k]) { vx_buffer_release(vp->rcb_extra[k]); vp->rcb_extra[k] = NULL; }
          vp->rmrt_res[k] = NULL;
+         vp->rmrt_bpp[k] = 0;
       }
       for (unsigned k = 1; k < num; k++) {
+         const uint32_t bpp = vp->fb_color_bpp[k] ? vp->fb_color_bpp[k] : 4u;
+         const uint32_t bytes = w * h * bpp;
          uint64_t dev = 0;
          void *cinit = malloc(bytes);
          bool ok = cinit && vp->fb_cbufs[k] &&
@@ -1662,6 +1689,7 @@ vp_fb_ensure_mrt(struct pipe_context *pipe, struct vp_context *vp,
          free(cinit);
          if (!ok) { vp->rmrt_nr = 0; return false; }
          vp->rmrt_res[k] = vp->fb_cbufs[k];
+         vp->rmrt_bpp[k] = bpp;
       }
       vp->rmrt_nr = num;
    }
@@ -2723,8 +2751,11 @@ vp_draw_vbo(struct pipe_context *pipe,
           * being read at draw time from a kernel already compiled for the
           * other one. */
          struct vp_sw_routing routing = fs->fs_routing;
-         if (vp->fb_color_format != VX_OM_COLOR_FORMAT_A8R8G8B8) {
-            routing.sw_om = true;
+         for (unsigned i = 0; i < vp->fb_nr_cbufs; i++) {
+            if (vp->fb_color_format[i] != VX_OM_COLOR_FORMAT_A8R8G8B8) {
+               routing.sw_om = true;
+               break;
+            }
          }
          const struct vp_fs_variant_key key =
             vp_fs_key_make(&routing, vp->fb_samples, vp->fb_color_bgra);
@@ -2840,8 +2871,8 @@ vp_draw_vbo(struct pipe_context *pipe,
          struct vp_om_params om = { 0 };
          /* Never zero: the merger multiplies its row stride by this. */
          om.samples = vp->fb_samples ? vp->fb_samples : 1u;
-         om.color_format = vp->fb_color_format;
-         om.color_bpp    = vp->fb_color_bpp;
+         om.color_format = vp->fb_color_format[0];
+         om.color_bpp    = vp->fb_color_bpp[0];
          if (vp->cur_dsa) {
             om.depth_test  = vp->cur_dsa->depth_test;
             om.depth_func  = vp->cur_dsa->depth_func;
@@ -3018,7 +3049,8 @@ vp_draw_vbo(struct pipe_context *pipe,
             mrt.color_dev[0] = color_dev;   /* RT0 shares the resident colour buf */
             drew = vp_fb_ensure_mrt(pipe, vp, w, h, num_color, mrt.color_dev);
             for (unsigned k = 0; k < num_color; k++) {
-               mrt.pitch[k] = w * vp->fb_color_bpp;
+               mrt.pitch[k]        = w * vp->fb_color_bpp[k];
+               mrt.color_format[k] = vp->fb_color_format[k];
                if (vp->cur_blend) {
                   mrt.blend_mode[k] = vp->cur_blend->rt_blend_mode[k];
                   mrt.blend_func[k] = vp->cur_blend->rt_blend_func[k];
