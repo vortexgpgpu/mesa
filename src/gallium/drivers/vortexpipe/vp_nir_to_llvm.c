@@ -1431,6 +1431,8 @@ static LLVMValueRef emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene,
                                       LLVMValueRef ray[8]);
 static LLVMValueRef emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle);
 static void         emit_vx_rt_cb_ret(struct vp_tr *t, LLVMValueRef action);
+static void         emit_vx_rt_continue(struct vp_tr *t, LLVMValueRef action,
+                                        LLVMValueRef tval, LLVMValueRef attr);
 
 /* Emit an atomicrmw / cmpxchg at device pointer p, setting the intrinsic's def
  * to the old value. Data sources start at src index `di` (rmw: [di]=value;
@@ -2308,6 +2310,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       emit_vx_rt_cb_ret(t, ssa_get(t, in->src[0].ssa->index, 0));
       break;
 
+   case nir_intrinsic_vortex_rt_continue:
+      emit_vx_rt_continue(t, ssa_get(t, in->src[0].ssa->index, 0),
+                             ssa_get(t, in->src[1].ssa->index, 0),
+                             ssa_get(t, in->src[2].ssa->index, 0));
+      break;
+
    /* Screen-space derivatives: the difference against this lane's quad neighbour
     * (dir 1 = horizontal, 2 = vertical). One lane is one pixel and a quad is four
     * adjacent lanes, so this is a single SHFL -- fine and coarse are the same
@@ -2895,6 +2903,28 @@ emit_vx_rt_cb_ret(struct vp_tr *t, LLVMValueRef action)
                                       LLVMInlineAsmDialectATT, false);
    LLVMValueRef a[1] = { action };
    LLVMBuildCall2(t->b, fnty, ia, a, 1, "");
+}
+
+/* CONTINUE: resume traversal for the candidate this lane was handed, with its
+ * verdict in rs1, the hit distance in the FP operand and the attribute in rs3.
+ * An any-hit lane computes no distance of its own and passes the candidate's
+ * back. No result — the next vx_rt_wait on the handle collects the response. */
+static void
+emit_vx_rt_continue(struct vp_tr *t, LLVMValueRef action, LLVMValueRef tval,
+                    LLVMValueRef attr)
+{
+   const char *s = ".insn r4 43, 6, 0, x0, $0, $1, $2";
+   LLVMTypeRef args[3] = { t->i32, t->f32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), args, 3, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,f,r", 5,
+                                      /*HasSideEffects*/ true, false,
+                                      LLVMInlineAsmDialectATT, false);
+   /* The hit window is read as untyped 32-bit words, so a distance arrives as
+    * an integer-shaped value and has to be reinterpreted for the FP operand. */
+   if (LLVMTypeOf(tval) != t->f32)
+      tval = LLVMBuildBitCast(t->b, tval, t->f32, "rtcont_t");
+   LLVMValueRef a[3] = { action, tval, attr };
+   LLVMBuildCall2(t->b, fnty, ia, a, 3, "");
 }
 
 /* llvm.ctlz.i64: leading-zero count (is_zero_undef=false). */

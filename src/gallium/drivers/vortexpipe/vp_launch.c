@@ -181,7 +181,26 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
 #define LVP_NODE_INVALID      0xFFFFFFFFu
 #define LVP_BOX_CHILDREN_OFF  48   /* vk_aabb bounds[2] precede children[2] */
 #define LVP_TRI_GEOMFLAGS_OFF 44   /* coords[3][3]+padding+primitive_id      */
+#define LVP_INST_SBTFLAGS_OFF 12   /* bvh_ptr + custom_instance_and_mask      */
 #define LVP_INST_OTW_OFF      72   /* otw_matrix (object→world, mat3x4)       */
+
+/* Opacity lives in the top bits of two words: the geometry's own flag in a
+ * triangle node's geometry_id_and_flags, and the instance's overrides in
+ * sbt_offset_and_flags. A hit is opaque when the geometry (or the instance's
+ * force) says so AND the instance does not force it non-opaque. Geometry-opaque
+ * and instance-force-opaque deliberately occupy the same bit, so ORing the two
+ * words and testing both bits is the whole rule -- the form
+ * lvp_build_hit_is_opaque uses, kept identical here so the device and the CPU
+ * traversal never disagree about which triangles need an any-hit decision. */
+#define LVP_GEOMETRY_OPAQUE              (1u << 31)
+#define LVP_INSTANCE_FORCE_OPAQUE        (1u << 31)
+#define LVP_INSTANCE_NO_FORCE_NOT_OPAQUE (1u << 30)
+#define LVP_OPAQUE_BITS \
+   (LVP_GEOMETRY_OPAQUE | LVP_INSTANCE_FORCE_OPAQUE | LVP_INSTANCE_NO_FORCE_NOT_OPAQUE)
+
+/* A BLAS walked without an enclosing instance takes the flags a default
+ * instance would carry, so geometry opacity alone decides. */
+#define LVP_INSTANCE_FLAGS_DEFAULT       LVP_INSTANCE_NO_FORCE_NOT_OPAQUE
 
 /* RTU scene constants (rtu_types.h / rtu_bvh.h). */
 #define RTU_SCENE_HDR_BYTES   16
@@ -235,7 +254,7 @@ vp_xform_compose(const float A[12], const float B[12], float C[12])
 
 static void
 vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
-            const float v2[3], uint32_t prim_id, uint32_t geom_id)
+            const float v2[3], uint32_t prim_id, uint32_t geom_id, bool opaque)
 {
    if (tl->count == tl->cap) {
       uint32_t ncap = tl->cap ? tl->cap * 2 : 64;
@@ -253,7 +272,7 @@ vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
    t[0]=v0[0]; t[1]=v0[1]; t[2]=v0[2];
    t[3]=v1[0]; t[4]=v1[1]; t[5]=v1[2];
    t[6]=v2[0]; t[7]=v2[1]; t[8]=v2[2];
-   uint32_t flags = RTU_TRI_FLAG_OPAQUE;
+   uint32_t flags = opaque ? RTU_TRI_FLAG_OPAQUE : 0u;
    memcpy(&t[9], &flags, 4);
    tl->prim[idx] = prim_id;
    tl->geom[idx] = geom_id;
@@ -263,7 +282,7 @@ vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
  * transform M, appending world-space triangles to tl. */
 static void
 vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
-             struct vp_tri_list *tl, int depth)
+             uint32_t inst_flags, struct vp_tri_list *tl, int depth)
 {
    if (node_ptr == LVP_NODE_INVALID || depth > 64 || !tl->ok)
       return;
@@ -274,8 +293,8 @@ vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
       uint32_t c0, c1;
       memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
       memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
-      vp_walk_node(bvh, c0, M, tl, depth + 1);
-      vp_walk_node(bvh, c1, M, tl, depth + 1);
+      vp_walk_node(bvh, c0, M, inst_flags, tl, depth + 1);
+      vp_walk_node(bvh, c1, M, inst_flags, tl, depth + 1);
       break;
    }
    case LVP_NODE_TRIANGLE: {
@@ -292,20 +311,26 @@ vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
       vp_xform_point(M, &coords[0], w0);
       vp_xform_point(M, &coords[3], w1);
       vp_xform_point(M, &coords[6], w2);
-      vp_tri_push(tl, w0, w1, w2, prim_id, geom_flags & 0x0fffffffu);
+      /* A non-opaque triangle is one the RTU must return as a candidate so the
+       * shader's any-hit decision runs; marking it opaque would commit it
+       * unconditionally. */
+      bool opaque = ((geom_flags | inst_flags) & LVP_OPAQUE_BITS) == LVP_OPAQUE_BITS;
+      vp_tri_push(tl, w0, w1, w2, prim_id, geom_flags & 0x0fffffffu, opaque);
       break;
    }
    case LVP_NODE_INSTANCE: {
       uint64_t blas_host = 0;
+      uint32_t sbt_flags = 0;
       float otw[12];
       memcpy(&blas_host, node, 8);
+      memcpy(&sbt_flags, node + LVP_INST_SBTFLAGS_OFF, 4);
       memcpy(otw, node + LVP_INST_OTW_OFF, 48);
       if (blas_host) {
          float Mc[12];
          vp_xform_compose(M, otw, Mc);     /* world = M ∘ otw */
          const uint8_t *blas = (const uint8_t *)(uintptr_t)blas_host;
          uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
-         vp_walk_node(blas, root, Mc, tl, depth + 1);
+         vp_walk_node(blas, root, Mc, sbt_flags, tl, depth + 1);
       }
       break;
    }
@@ -477,8 +502,9 @@ vp_bvh_serialize(struct vp_bvh *b, int root, const float (*tris)[10],
          lh[3] = prim[n->tri];         /* prim_base = source gl_PrimitiveID */
          const float *t = tris[n->tri];
          memcpy(p + RTU_BVH_LEAF_HDR_BYTES, t, 36);   /* 9 coords */
-         uint32_t flags = RTU_TRI_FLAG_OPAQUE;
-         memcpy(p + RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_FLAGS_OFFSET, &flags, 4);
+         /* t[9] carries the flags the walk computed from the source geometry
+          * and instance; re-deriving them here would let the two disagree. */
+         memcpy(p + RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_FLAGS_OFFSET, &t[9], 4);
       } else {
          uint32_t *kind = (uint32_t *)p;
          *kind = RTU_BVH_KIND_INTERNAL |
@@ -559,7 +585,8 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    struct vp_tri_list tl = { .ok = true };
    static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
    uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
-   vp_walk_node((const uint8_t *)tlas_host, root, kIdentity, &tl, 0);
+   vp_walk_node((const uint8_t *)tlas_host, root, kIdentity,
+                LVP_INSTANCE_FLAGS_DEFAULT, &tl, 0);
    if (!tl.ok) {
       free(tl.tris); free(tl.prim); free(tl.geom);
       c->ok = false;
