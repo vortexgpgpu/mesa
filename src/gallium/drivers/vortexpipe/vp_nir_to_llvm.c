@@ -1843,7 +1843,9 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
       LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase");
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 1), t->i64, "");
-      LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
+      /* A suppressed fragment may not touch memory, and an atomic is a write
+       * like any other -- steer it to the sink exactly as store_ssbo is. */
+      LLVMValueRef addr = emit_store_addr(t, LLVMBuildAdd(t->b, base, off, ""));
       LLVMValueRef p    = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
       if (in->intrinsic == nir_intrinsic_ssbo_atomic_swap) {
          /* compare-and-swap: src[2]=compare, src[3]=new. cmpxchg returns
@@ -1894,7 +1896,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
     * at src[1] (swap: src[1]=compare, src[2]=new). */
    case nir_intrinsic_global_atomic:
    case nir_intrinsic_global_atomic_swap: {
-      LLVMValueRef p = LLVMBuildIntToPtr(t->b, intr_src(t, in, 0), t->ptr, "");
+      LLVMValueRef p = LLVMBuildIntToPtr(t->b,
+         emit_store_addr(t, intr_src(t, in, 0)), t->ptr, "");
       emit_atomic_at(t, in, p, 1,
                      in->intrinsic == nir_intrinsic_global_atomic_swap);
       break;
@@ -1908,7 +1911,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMBuildAdd(t->b, t->lmem_base,
             vp_iptr_const(t, nir_intrinsic_base(in)), ""),
          vp_to_iptr(t, intr_src(t, in, 0)), "shatomaddr");
-      LLVMValueRef p = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
+      LLVMValueRef p = LLVMBuildIntToPtr(t->b, emit_store_addr(t, addr),
+                                         t->ptr, "");
       emit_atomic_at(t, in, p, 1,
                      in->intrinsic == nir_intrinsic_shared_atomic_swap);
       break;
