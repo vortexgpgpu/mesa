@@ -1341,12 +1341,13 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
  * attachment, run the raster/OM path, write the result back. */
 static bool
 vp_resource_rw(struct pipe_context *pipe, struct pipe_resource *res,
-               unsigned w, unsigned h, unsigned bpp, void *host, bool write)
+               unsigned layer, unsigned w, unsigned h, unsigned bpp,
+               void *host, bool write)
 {
    if (!res)
       return false;
    struct pipe_transfer *xfer = NULL;
-   uint8_t *map = pipe_texture_map(pipe, res, 0, 0,
+   uint8_t *map = pipe_texture_map(pipe, res, 0, layer,
                                    write ? PIPE_MAP_WRITE : PIPE_MAP_READ,
                                    0, 0, w, h, &xfer);
    if (!map)
@@ -1364,9 +1365,10 @@ vp_resource_rw(struct pipe_context *pipe, struct pipe_resource *res,
 }
 
 static bool
-vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp, void *dst)
+vp_fb_color_read(struct pipe_context *pipe, struct vp_context *vp,
+                 unsigned layer, void *dst)
 {
-   return vp_resource_rw(pipe, vp->fb_color, vp->fb_width, vp->fb_height,
+   return vp_resource_rw(pipe, vp->fb_color, layer, vp->fb_width, vp->fb_height,
                          vp->fb_color_bpp[0], dst, false);
 }
 
@@ -1402,7 +1404,7 @@ vp_fb_expand_samples(void *buf, unsigned w, unsigned h, unsigned samples)
  * depth plane would corrupt every draw in the pass rather than fail visibly. */
 static bool
 vp_fb_depth_read(struct pipe_context *pipe, struct vp_context *vp,
-                 unsigned w, unsigned h, void *dst)
+                 unsigned layer, unsigned w, unsigned h, void *dst)
 {
    struct pipe_resource *res = vp->fb_depth;
    if (!res)
@@ -1421,7 +1423,7 @@ vp_fb_depth_read(struct pipe_context *pipe, struct vp_context *vp,
    }
 
    struct pipe_transfer *xfer = NULL;
-   uint8_t *map = pipe_texture_map(pipe, res, 0, 0, PIPE_MAP_READ, 0, 0, w, h,
+   uint8_t *map = pipe_texture_map(pipe, res, 0, layer, PIPE_MAP_READ, 0, 0, w, h,
                                    &xfer);
    if (!map)
       return false;
@@ -1557,8 +1559,8 @@ vp_fb_sync_out(struct pipe_context *pipe, struct vp_context *vp)
    void *host = malloc(stage);
    if (host &&
        vp_buffer_readback(vp->dev, vp->rcb, host, bytes)) {
-      vp_resource_rw(pipe, vp->rfb_res, vp->rfb_w, vp->rfb_h, vp->rfb_bpp,
-                     host, true);
+      vp_resource_rw(pipe, vp->rfb_res, vp->rfb_layer, vp->rfb_w, vp->rfb_h,
+                     vp->rfb_bpp, host, true);
       /* Write each extra colour attachment (1..) back to its resource. */
       for (unsigned k = 1; k < vp->rmrt_nr; k++) {
          if (!vp->rcb_extra[k] || !vp->rmrt_res[k] || !vp->rmrt_bpp[k]) {
@@ -1566,7 +1568,7 @@ vp_fb_sync_out(struct pipe_context *pipe, struct vp_context *vp)
          }
          const uint32_t kb = vp->rfb_w * vp->rfb_h * vp->rmrt_bpp[k];
          if (vp_buffer_readback(vp->dev, vp->rcb_extra[k], host, kb)) {
-            vp_resource_rw(pipe, vp->rmrt_res[k], vp->rfb_w, vp->rfb_h,
+            vp_resource_rw(pipe, vp->rmrt_res[k], 0, vp->rfb_w, vp->rfb_h,
                            vp->rmrt_bpp[k], host, true);
          }
       }
@@ -1601,7 +1603,8 @@ vp_fb_invalidate(struct pipe_context *pipe, struct vp_context *vp)
  * the far value) once per pass. Returns the device addresses, or false. */
 static bool
 vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
-             uint32_t w, uint32_t h, const struct vp_om_params *om,
+             uint32_t w, uint32_t h, uint32_t layer,
+             const struct vp_om_params *om,
              uint64_t *color_dev, uint64_t *depth_dev)
 {
    /* The sample count and the texel width are part of the key: the buffers are
@@ -1609,6 +1612,7 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * sized for the old one. */
    if (vp->rcb && vp->rfb_res == vp->fb_color &&
        vp->rfb_w == w && vp->rfb_h == h && vp->rfb_s == vp->fb_samples &&
+       vp->rfb_layer == layer &&
        vp->rfb_bpp == vp->fb_color_bpp[0]) {
       /* reuse the resident pass buffers (preserve colour + depth across draws) */
       if (vx_buffer_address(vp->rcb, color_dev) != VX_SUCCESS) return false;
@@ -1634,7 +1638,7 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * loadOp=CLEAR already cleared the resource via llvmpipe). The attachment is
     * single-sample, so every sample of a pixel starts at that pixel's value. */
    void *cinit = malloc(cdev_bytes);
-   bool cok = cinit && vp_fb_color_read(pipe, vp, cinit);
+   bool cok = cinit && vp_fb_color_read(pipe, vp, layer, cinit);
    if (cok && S > 1)
       vp_fb_expand_samples(cinit, w, h, S);
    if (cok)
@@ -1648,7 +1652,7 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
     * GEQUAL count 0 as far, everything else max). */
    void *zinit = malloc(zdev_bytes);
    bool zok = zinit != NULL;
-   if (zok && !vp_fb_depth_read(pipe, vp, w, h, zinit)) {
+   if (zok && !vp_fb_depth_read(pipe, vp, layer, w, h, zinit)) {
       uint8_t zfill = (om->depth_func == VX_OM_DEPTH_FUNC_GREATER ||
                        om->depth_func == VX_OM_DEPTH_FUNC_GEQUAL) ? 0x00 : 0xFF;
       memset(zinit, zfill, zbytes);
@@ -1664,6 +1668,7 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
 
    vp->rfb_res = vp->fb_color;
    vp->rfb_w = w; vp->rfb_h = h; vp->rfb_s = vp->fb_samples;
+   vp->rfb_layer = layer;
    vp->rfb_bpp = cbpp;
    vp->rfb_dirty = false;
    return true;
@@ -1705,7 +1710,7 @@ vp_fb_ensure_mrt(struct pipe_context *pipe, struct vp_context *vp,
          uint64_t dev = 0;
          void *cinit = malloc(bytes);
          bool ok = cinit && vp->fb_cbufs[k] &&
-                   vp_resource_rw(pipe, vp->fb_cbufs[k], w, h, bpp, cinit, false);
+                   vp_resource_rw(pipe, vp->fb_cbufs[k], 0, w, h, bpp, cinit, false);
          if (ok)
             ok = vp_dev_upload(vp->dev, cinit, bytes, &vp->rcb_extra[k], &dev);
          free(cinit);
@@ -2765,16 +2770,14 @@ vp_draw_vbo(struct pipe_context *pipe,
       if (vp->fb_samples != 1 && vp->fb_samples != 4)
          goto llvmpipe;
 
-      /* A multiview pass replays each draw once per view, every replay landing
-       * in its own attachment layer. The device renders a pass once, into a
-       * single w*h plane that resolves to one layer, so every view but the
-       * first would keep the clear -- no error, no fallback, because a view
-       * mask is framebuffer state and never reaches the translator that
-       * refuses what it cannot compile. Until the per-view replay exists, more
-       * than one view goes to llvmpipe, which carries the mask down to the draw
-       * module and loops it there. (gl_ViewIndex needs no test of its own: it
-       * is an unhandled intrinsic, so a shader reading it already refuses.) */
-      if ((vp->fb_viewmask & (vp->fb_viewmask - 1u)) != 0u)
+      /* A multiview pass replays each draw once per view, into its own layer.
+       * The replay is done below, around the device draw; the extra colour
+       * attachments of an MRT pass are the part that is not layered -- they
+       * resolve to layer 0 only -- so that combination still goes to llvmpipe.
+       * (gl_ViewIndex needs no test of its own: it is an unhandled intrinsic,
+       * so a shader reading it already refuses the device path.) */
+      if ((vp->fb_viewmask & (vp->fb_viewmask - 1u)) != 0u &&
+          vp->fb_nr_cbufs > 1)
          goto llvmpipe;
 
       struct vp_fs_variant *fsv = NULL;
@@ -3028,11 +3031,23 @@ vp_draw_vbo(struct pipe_context *pipe,
             }
          }
 
+         /* A multiview pass renders each view into its own attachment layer;
+          * the draw below is replayed once per set bit. The resident planes
+          * mirror one layer at a time, so the pass starts on the lowest view's
+          * layer and each later view swaps them over. A zero mask is the
+          * ordinary single-layer pass. */
+         const uint8_t vmask = vp->fb_viewmask;
+         uint32_t first_layer = 0;
+         while (vmask && !(vmask & (1u << first_layer))) {
+            first_layer++;
+         }
+
          /* Resident colour/depth (cleared/initialised once per pass) + resident
           * texture: the OM renders straight into the device buffers, no per-draw
           * framebuffer round-trip or texture re-upload. */
          uint64_t color_dev = 0, depth_dev = 0, tex_dev = 0;
-         bool drew = vp_fb_ensure(pipe, vp, w, h, &om, &color_dev, &depth_dev);
+         bool drew = vp_fb_ensure(pipe, vp, w, h, first_layer, &om,
+                                  &color_dev, &depth_dev);
          if (drew && tex_used) {
             uint32_t tex_bpp = 4;
             (void)vp_vx_tex_format(vp->cur_tex->format, &tex_bpp);
@@ -3158,21 +3173,48 @@ vp_draw_vbo(struct pipe_context *pipe,
             vp_fs_variant_make_resident(fs, (int)(fsv - fs->fs_variants));
             vp->startup_fs_owner = fs;
             vp->startup_fs_is_compute = false;
-            drew = vp_raster_draw(pipe->screen, vp->dev, vp->raster_pool,
-                                  vs->vxbin, vs->vxbin_size,
-                                  &vs->vx_module, &vs->vx_kernel,
-                                  fsv->vxbin, fsv->vxbin_size,
-                                  &fsv->vx_module, &fsv->vx_kernel,
-                                  count, dev_indexed ? 0u : draws[0].start,
-                                  info->instance_count, info->start_instance,
-                                  &vs->vs_layout,
-                                  vs->vs_layout.needs_vertex_input ? &vin : NULL,
-                                  index_dev,
-                                  color_dev, depth_dev, w, h, &om,
-                                  tex_used ? tex_dev : 0, tex_used ? &tex : NULL,
-                                  cull_mode, fs_sw_tex, fs_sw_om, fs_sw_raster,
-                                  vp_sx, vp_tx, vp_sy, vp_ty, vp_min_z, vp_max_z,
-                                  &fs_consts, &vs_consts, use_mrt ? &mrt : NULL);
+            /* One replay per view. Every view runs the same draw -- a shader
+             * that varied with the view would be reading gl_ViewIndex, which
+             * refuses the device path -- so only the target layer changes.
+             * Marking the planes dirty before swapping layers is what carries
+             * the finished view back to its own layer: vp_fb_ensure resolves
+             * the current planes whenever the key it is asked for differs. */
+            for (unsigned v = first_layer; v < 8u; v++) {
+               if (vmask && !(vmask & (1u << v))) {
+                  continue;
+               }
+               if (v != first_layer) {
+                  vp->rfb_dirty = true;
+                  drew = vp_fb_ensure(pipe, vp, w, h, v, &om,
+                                      &color_dev, &depth_dev);
+                  if (!drew) {
+                     break;
+                  }
+               }
+               drew = vp_raster_draw(pipe->screen, vp->dev, vp->raster_pool,
+                                     vs->vxbin, vs->vxbin_size,
+                                     &vs->vx_module, &vs->vx_kernel,
+                                     fsv->vxbin, fsv->vxbin_size,
+                                     &fsv->vx_module, &fsv->vx_kernel,
+                                     count, dev_indexed ? 0u : draws[0].start,
+                                     info->instance_count, info->start_instance,
+                                     &vs->vs_layout,
+                                     vs->vs_layout.needs_vertex_input ? &vin
+                                                                      : NULL,
+                                     index_dev,
+                                     color_dev, depth_dev, w, h, &om,
+                                     tex_used ? tex_dev : 0,
+                                     tex_used ? &tex : NULL,
+                                     cull_mode, fs_sw_tex, fs_sw_om,
+                                     fs_sw_raster,
+                                     vp_sx, vp_tx, vp_sy, vp_ty,
+                                     vp_min_z, vp_max_z,
+                                     &fs_consts, &vs_consts,
+                                     use_mrt ? &mrt : NULL);
+               if (!drew || !vmask) {
+                  break;
+               }
+            }
          }
          for (unsigned i = 0; i < GFX_FS_DESC_SLOTS; i++)
             if (cbxfer[i]) pipe_buffer_unmap(pipe, cbxfer[i]);

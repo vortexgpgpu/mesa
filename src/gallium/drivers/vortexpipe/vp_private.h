@@ -489,6 +489,10 @@ struct vp_context {
     * from fb_color_bpp because the flush back to the resource runs as part of
     * binding the *next* framebuffer, when fb_color_bpp already describes it. */
    unsigned              rfb_bpp;
+   /* The attachment layer the resident planes mirror. Part of their key, so a
+    * multiview pass moving to the next view resolves the current one back to
+    * its own layer before loading the next. */
+   unsigned              rfb_layer;
    bool                  rfb_dirty;
    /* Extra resident colour buffers for attachments 1.. (RT0 uses rcb).
     * rmrt_res[k] is the framebuffer resource each is synced back to, and
