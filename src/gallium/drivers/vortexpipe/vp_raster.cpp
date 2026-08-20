@@ -908,16 +908,57 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
          const void *upload = vs_consts->data[i];
          bool has_desc = false;
          for (uint32_t d = 0; d < vs_consts->num_descs && d < VP_MAX_DESCS; d++)
-            if (vs_consts->descs[d].kind == VP_DESC_BUFFER &&
+            if ((vs_consts->descs[d].kind == VP_DESC_BUFFER ||
+                 vs_consts->descs[d].kind == VP_DESC_IMAGE) &&
                 vs_consts->descs[d].cbuf_index == i) { has_desc = true; break; }
          if (has_desc) {
             vs_desc_stage[i] = (uint8_t *)malloc(vs_consts->size[i]);
             if (!vs_desc_stage[i]) { mesa_loge("vortexpipe: raster: vs desc OOM"); goto done; }
             memcpy(vs_desc_stage[i], vs_consts->data[i], vs_consts->size[i]);
             for (uint32_t d = 0; d < vs_consts->num_descs && d < VP_MAX_DESCS; d++) {
-               if (vs_consts->descs[d].kind != VP_DESC_BUFFER ||
-                   vs_consts->descs[d].cbuf_index != i)
+               if (vs_consts->descs[d].cbuf_index != i)
                   continue;
+               if (vs_consts->descs[d].kind == VP_DESC_IMAGE) {
+                  /* Storage image, over lp_jit_image's layout. This loop gives
+                   * each descriptor its own buffer written at 0, so the image
+                   * follows that rather than the screen's residency table. */
+                  const uint32_t ioff = vs_consts->descs[d].offset;
+                  if (ioff + VP_JIT_IMG_BASE_OFFSET + 4u > vs_consts->size[i]) {
+                     continue;
+                  }
+                  uint8_t *slot = vs_desc_stage[i] + ioff;
+                  uint64_t img_host = 0; uint16_t img_h = 0;
+                  uint32_t img_row = 0, img_base_off = 0;
+                  memcpy(&img_host,     slot + VP_JIT_IMG_BASE,        sizeof img_host);
+                  memcpy(&img_h,        slot + VP_JIT_IMG_HEIGHT,      sizeof img_h);
+                  memcpy(&img_row,      slot + VP_JIT_IMG_ROW_STRIDE,  sizeof img_row);
+                  memcpy(&img_base_off, slot + VP_JIT_IMG_BASE_OFFSET, sizeof img_base_off);
+                  if (!img_host || !img_h || !img_row) {
+                     continue;
+                  }
+                  const uint32_t isize = img_base_off + (uint32_t)img_h * img_row;
+                  VP_CHECK(vx_buffer_create(dev, isize, 0, &vs_res_bufs[d]),
+                           "vx_buffer_create(vs_image)");
+                  uint64_t idev = 0;
+                  VP_CHECK(vx_buffer_address(vs_res_bufs[d], &idev),
+                           "vx_buffer_address(vs_image)");
+                  VP_CHECK(vx_enqueue_write(q, vs_res_bufs[d], 0,
+                                            (void *)(uintptr_t)img_host, isize,
+                                            0, NULL, NULL),
+                           "vx_enqueue_write(vs_image)");
+                  memcpy(slot + VP_JIT_IMG_BASE, &idev, sizeof idev);
+                  if (vs_consts->descs[d].writable && n_wb < ARRAY_SIZE(wb)) {
+                     wb[n_wb].buf  = vs_res_bufs[d];
+                     wb[n_wb].host = img_host;
+                     wb[n_wb].off  = 0;
+                     wb[n_wb].size = isize;
+                     n_wb++;
+                  }
+                  continue;
+               }
+               if (vs_consts->descs[d].kind != VP_DESC_BUFFER) {
+                  continue;
+               }
                uint32_t off = vs_consts->descs[d].offset;
                if (off + VP_JIT_BUF_SIZE + 4u > vs_consts->size[i])
                   continue;
