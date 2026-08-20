@@ -494,6 +494,11 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
        * pinned by the static_assert above so a llvmpipe layout change fails the
        * build instead of silently corrupting every UBO/SSBO base. */
       const uint32_t VP_JIT_BUF_PTR = 0u, VP_JIT_BUF_SIZE = 8u;
+      /* A storage image's lp_jit_image shares the slot: base pointer at +0
+       * (aliasing lp_jit_buffer.ptr), height at +12, row stride at +24, base
+       * offset at +40. Same layout the compute path reads. */
+      const uint32_t VP_JIT_IMG_BASE = 0u, VP_JIT_IMG_HEIGHT = 12u,
+                     VP_JIT_IMG_ROW_STRIDE = 24u, VP_JIT_IMG_BASE_OFFSET = 40u;
       uint64_t fs_desc_table[GFX_FS_DESC_SLOTS] = { 0 };
       for (uint32_t i = 0; fs_consts && i < GFX_FS_DESC_SLOTS; i++) {
          if (!fs_consts->data[i] || !fs_consts->size[i])
@@ -507,16 +512,69 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
           * AS descriptors are left untouched (ray-query-in-FS is deferred). */
          bool has_desc = false;
          for (uint32_t d = 0; d < fs_consts->num_descs && d < VP_MAX_DESCS; d++)
-            if (fs_consts->descs[d].kind == VP_DESC_BUFFER &&
+            if ((fs_consts->descs[d].kind == VP_DESC_BUFFER ||
+                 fs_consts->descs[d].kind == VP_DESC_IMAGE) &&
                 fs_consts->descs[d].cbuf_index == i) { has_desc = true; break; }
          if (has_desc) {
             fs_desc_stage[i] = (uint8_t *)malloc(fs_consts->size[i]);
             if (!fs_desc_stage[i]) { mesa_loge("vortexpipe: raster: fs desc OOM"); goto done; }
             memcpy(fs_desc_stage[i], fs_consts->data[i], fs_consts->size[i]);
             for (uint32_t d = 0; d < fs_consts->num_descs && d < VP_MAX_DESCS; d++) {
-               if (fs_consts->descs[d].kind != VP_DESC_BUFFER ||
-                   fs_consts->descs[d].cbuf_index != i)
+               if (fs_consts->descs[d].cbuf_index != i)
                   continue;
+               if (fs_consts->descs[d].kind == VP_DESC_IMAGE) {
+                  /* Storage image: the same treatment as a buffer, over the
+                   * image's own layout. Its extent is height x row stride from
+                   * the base offset, the fields llvmpipe filled in. */
+                  const uint32_t ioff = fs_consts->descs[d].offset;
+                  if (ioff + VP_JIT_IMG_BASE_OFFSET + 4u > fs_consts->size[i]) {
+                     continue;
+                  }
+                  uint8_t *slot = fs_desc_stage[i] + ioff;
+                  uint64_t img_host = 0; uint16_t img_h = 0;
+                  uint32_t img_row = 0, img_base_off = 0;
+                  memcpy(&img_host,     slot + VP_JIT_IMG_BASE,        sizeof img_host);
+                  memcpy(&img_h,        slot + VP_JIT_IMG_HEIGHT,      sizeof img_h);
+                  memcpy(&img_row,      slot + VP_JIT_IMG_ROW_STRIDE,  sizeof img_row);
+                  memcpy(&img_base_off, slot + VP_JIT_IMG_BASE_OFFSET, sizeof img_base_off);
+                  if (!img_host || !img_h || !img_row) {
+                     continue;
+                  }
+                  const uint32_t isize = img_base_off + (uint32_t)img_h * img_row;
+                  uint32_t ires_off = 0;
+                  bool ires_dirty = true;
+                  uint64_t idev = vp_screen_resident_addr(screen,
+                                                          (const void *)(uintptr_t)img_host,
+                                                          isize, &fs_res_bufs[d],
+                                                          &ires_off, &ires_dirty);
+                  if (!idev) {
+                     mesa_loge("vortexpipe: raster: no device memory for FS image");
+                     goto done;
+                  }
+                  /* Uploaded even when only written: a shader may store to part
+                   * of an image and leave the rest, and the untouched part has
+                   * to come back as it went in. */
+                  if (ires_dirty) {
+                     VP_CHECK(vx_enqueue_write(q, fs_res_bufs[d], ires_off,
+                                               (void *)(uintptr_t)img_host, isize,
+                                               0, NULL, NULL),
+                              "vx_enqueue_write(fs_image)");
+                     vp_screen_resident_clean(screen,
+                                              (const void *)(uintptr_t)img_host, isize);
+                  }
+                  memcpy(slot + VP_JIT_IMG_BASE, &idev, sizeof idev);
+                  if (fs_consts->descs[d].writable && n_wb < ARRAY_SIZE(wb)) {
+                     wb[n_wb].buf  = fs_res_bufs[d];
+                     wb[n_wb].host = img_host;
+                     wb[n_wb].off  = ires_off;
+                     wb[n_wb].size = isize;
+                     n_wb++;
+                  }
+                  continue;
+               }
+               if (fs_consts->descs[d].kind != VP_DESC_BUFFER) {
+                  continue;
+               }
                uint32_t off = fs_consts->descs[d].offset;
                if (off + VP_JIT_BUF_SIZE + 4u > fs_consts->size[i])
                   continue;
