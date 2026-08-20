@@ -618,6 +618,64 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    return dev_addr;
 }
 
+/* A draw reaches its descriptors through its own loops and tears them down at
+ * its own point, but the relocation itself is the same work as a dispatch's.
+ * The context stays opaque to the draw: every device buffer and staging blob
+ * the copy allocates has to outlive vx_queue_finish, and handing out the struct
+ * would make that lifetime the caller's to reconstruct rather than to observe. */
+struct vp_as_ctx *
+vp_as_begin(vx_device_h dev, vx_queue_h q, bool has_rtu)
+{
+   struct vp_as_ctx *c = calloc(1, sizeof *c);
+   if (!c) {
+      return NULL;
+   }
+   c->dev     = dev;
+   c->q       = q;
+   c->has_rtu = has_rtu;
+   c->ok      = true;
+   return c;
+}
+
+/* Device address of the acceleration structure whose host root is `tlas_host`,
+ * transcoded to the RTU's scene format where the device has one and copied
+ * verbatim otherwise. Returns 0 without recording a failure for a null handle,
+ * which is a descriptor the shader never binds rather than an error. */
+uint64_t
+vp_as_relocate(struct vp_as_ctx *c, uint64_t tlas_host)
+{
+   if (!c || !c->ok || !tlas_host) {
+      return 0;
+   }
+   return c->has_rtu ? vp_transcode_as(c, (const void *)(uintptr_t)tlas_host)
+                     : vp_copy_as(c, (const void *)(uintptr_t)tlas_host);
+}
+
+bool
+vp_as_ok(const struct vp_as_ctx *c)
+{
+   return c && c->ok;
+}
+
+/* Release everything the relocations allocated. Called after vx_queue_finish,
+ * never before: the uploads are asynchronous and read the staging blobs. */
+void
+vp_as_end(struct vp_as_ctx *c)
+{
+   if (!c) {
+      return;
+   }
+   for (unsigned i = 0; i < c->n_bufs; i++) {
+      if (c->bufs[i]) {
+         vx_buffer_release(c->bufs[i]);
+      }
+   }
+   for (unsigned i = 0; i < c->n_stages; i++) {
+      free(c->stages[i]);
+   }
+   free(c);
+}
+
 bool
 vp_launch(struct pipe_screen *screen, vx_device_h dev,
           const void *vxbin, size_t vxbin_size,

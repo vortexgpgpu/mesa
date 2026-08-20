@@ -336,6 +336,11 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
    } wb[2 * VP_MAX_DESCS];
    uint32_t n_wb = 0;
 
+   /* Acceleration structures the shaders reach, brought across on first use and
+    * released once the queue has drained. Both stages share the one context, so
+    * a structure bound to both is copied once. */
+   struct vp_as_ctx *asc = NULL;
+
    /* kernels resolved from the residency caches below (the modules persist
     * across draws — caller-owned VS/FS slots + the pool's front end). */
    vx_kernel_h k_vs = NULL, kbuf = NULL, k_expand = NULL, k_setup = NULL,
@@ -509,11 +514,13 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
           * resource to device memory + rewrite its lp_jit_buffer.ptr host->device
           * so the FS's load_ubo/load_ssbo dereference resolves on device. Done on
           * a per-set private copy (fs_desc_stage[i]) that outlives vx_queue_finish.
-          * AS descriptors are left untouched (ray-query-in-FS is deferred). */
+          * Every descriptor kind a fragment shader can reach is relocated here;
+          * one left behind keeps the host pointer llvmpipe put in it. */
          bool has_desc = false;
          for (uint32_t d = 0; d < fs_consts->num_descs && d < VP_MAX_DESCS; d++)
             if ((fs_consts->descs[d].kind == VP_DESC_BUFFER ||
-                 fs_consts->descs[d].kind == VP_DESC_IMAGE) &&
+                 fs_consts->descs[d].kind == VP_DESC_IMAGE ||
+                 fs_consts->descs[d].kind == VP_DESC_AS) &&
                 fs_consts->descs[d].cbuf_index == i) { has_desc = true; break; }
          if (has_desc) {
             fs_desc_stage[i] = (uint8_t *)malloc(fs_consts->size[i]);
@@ -522,6 +529,37 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
             for (uint32_t d = 0; d < fs_consts->num_descs && d < VP_MAX_DESCS; d++) {
                if (fs_consts->descs[d].cbuf_index != i)
                   continue;
+               if (fs_consts->descs[d].kind == VP_DESC_AS) {
+                  /* Acceleration structure: lp_descriptor.accel_struct holds the
+                   * host root at +0. Its links to the structures beneath it are
+                   * absolute addresses, so each is brought across and the link
+                   * rewritten -- a byte copy would leave the device a tree whose
+                   * branches still point into host memory. */
+                  const uint32_t aoff = fs_consts->descs[d].offset;
+                  if (aoff + 8u > fs_consts->size[i]) {
+                     continue;
+                  }
+                  uint8_t *slot = fs_desc_stage[i] + aoff;
+                  uint64_t tlas_host = 0;
+                  memcpy(&tlas_host, slot, sizeof tlas_host);
+                  if (!tlas_host) {
+                     continue;
+                  }
+                  if (!asc) {
+                     asc = vp_as_begin(dev, q, vp_screen_has_rtu(screen));
+                     if (!asc) {
+                        mesa_loge("vortexpipe: raster: no acceleration-structure context");
+                        goto done;
+                     }
+                  }
+                  const uint64_t tlas_dev = vp_as_relocate(asc, tlas_host);
+                  if (!vp_as_ok(asc)) {
+                     mesa_loge("vortexpipe: raster: FS acceleration-structure copy failed");
+                     goto done;
+                  }
+                  memcpy(slot, &tlas_dev, sizeof tlas_dev);
+                  continue;
+               }
                if (fs_consts->descs[d].kind == VP_DESC_IMAGE) {
                   /* Storage image: the same treatment as a buffer, over the
                    * image's own layout. Its extent is height x row stride from
@@ -909,7 +947,8 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
          bool has_desc = false;
          for (uint32_t d = 0; d < vs_consts->num_descs && d < VP_MAX_DESCS; d++)
             if ((vs_consts->descs[d].kind == VP_DESC_BUFFER ||
-                 vs_consts->descs[d].kind == VP_DESC_IMAGE) &&
+                 vs_consts->descs[d].kind == VP_DESC_IMAGE ||
+                 vs_consts->descs[d].kind == VP_DESC_AS) &&
                 vs_consts->descs[d].cbuf_index == i) { has_desc = true; break; }
          if (has_desc) {
             vs_desc_stage[i] = (uint8_t *)malloc(vs_consts->size[i]);
@@ -918,6 +957,36 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
             for (uint32_t d = 0; d < vs_consts->num_descs && d < VP_MAX_DESCS; d++) {
                if (vs_consts->descs[d].cbuf_index != i)
                   continue;
+               if (vs_consts->descs[d].kind == VP_DESC_AS) {
+                  /* Acceleration structure, as in the fragment loop above: the
+                   * relocation is the structure's own, not the stage's, so both
+                   * stages share the one context and a structure bound to both
+                   * is brought across once. */
+                  const uint32_t aoff = vs_consts->descs[d].offset;
+                  if (aoff + 8u > vs_consts->size[i]) {
+                     continue;
+                  }
+                  uint8_t *slot = vs_desc_stage[i] + aoff;
+                  uint64_t tlas_host = 0;
+                  memcpy(&tlas_host, slot, sizeof tlas_host);
+                  if (!tlas_host) {
+                     continue;
+                  }
+                  if (!asc) {
+                     asc = vp_as_begin(dev, q, vp_screen_has_rtu(screen));
+                     if (!asc) {
+                        mesa_loge("vortexpipe: raster: no acceleration-structure context");
+                        goto done;
+                     }
+                  }
+                  const uint64_t tlas_dev = vp_as_relocate(asc, tlas_host);
+                  if (!vp_as_ok(asc)) {
+                     mesa_loge("vortexpipe: raster: VS acceleration-structure copy failed");
+                     goto done;
+                  }
+                  memcpy(slot, &tlas_dev, sizeof tlas_dev);
+                  continue;
+               }
                if (vs_consts->descs[d].kind == VP_DESC_IMAGE) {
                   /* Storage image, over lp_jit_image's layout. This loop gives
                    * each descriptor its own buffer written at 0, so the image
@@ -1249,6 +1318,9 @@ done:
     * vertex-input and FS-resource buffers are now resident too (borrowed from
     * the screen), so only the per-draw VS-output and staging buffers are
     * released here. */
+   /* After the finish above, never before: the BVH uploads are asynchronous and
+    * read the staging blobs this frees. */
+   vp_as_end(asc);
    if (tbuf) vx_buffer_release(tbuf);
    if (vsbuf) vx_buffer_release(vsbuf);
    if (fabuf) vx_buffer_release(fabuf);

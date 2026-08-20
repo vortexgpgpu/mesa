@@ -5860,7 +5860,22 @@ vp_scan_descriptors(struct nir_shader *nir,
                elem_bytes = 0;
                break;
             case nir_intrinsic_load_ubo:
-               if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+               if (nir_intrinsic_range(in) == -1) {
+                  /* lavapipe reads the acceleration-structure handle as an
+                   * UNBOUNDED ubo, and gives every other ubo read a real byte
+                   * range — including the push constants it rewrites into one.
+                   * The unbounded range is therefore the marker, and it marks an
+                   * AS in every stage: a fragment shader's ray query reaches its
+                   * structure through exactly this read, and a stage test ahead
+                   * of this one would classify that as an ordinary buffer and
+                   * relocate it as one. src[0] is the constant cbuf index. */
+                  if (nir_src_is_const(in->src[1]))
+                     off = (int)nir_src_as_uint(in->src[1]);
+                  if (nir_src_is_const(in->src[0]))
+                     cbuf_index = (unsigned)nir_src_as_uint(in->src[0]);
+                  kind = VP_DESC_AS;
+                  elem_bytes = 0;
+               } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
                   /* A fragment UBO is a buffer descriptor reached via
                    * load_ubo(load_const_buf_base_addr_lvp(set+1)+binding, off) —
                    * relocate its lp_jit_buffer.ptr like an SSBO. A constant src[0]
@@ -5870,16 +5885,6 @@ vp_scan_descriptors(struct nir_shader *nir,
                      continue;
                   off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                   elem_bytes = 4;
-               } else if (nir_intrinsic_range(in) == -1) {
-                  /* compute: lavapipe reads the acceleration-structure handle as
-                   * an UNBOUNDED ubo (range == -1), so only that read is an AS —
-                   * src[0] is the constant cbuf index and off is 0. */
-                  if (nir_src_is_const(in->src[1]))
-                     off = (int)nir_src_as_uint(in->src[1]);
-                  if (nir_src_is_const(in->src[0]))
-                     cbuf_index = (unsigned)nir_src_as_uint(in->src[0]);
-                  kind = VP_DESC_AS;
-                  elem_bytes = 0;
                } else {
                   /* compute: a finite-range load_ubo is a data UBO (camera /
                    * scene uniforms) reached through load_ubo(const_buf_base(set)

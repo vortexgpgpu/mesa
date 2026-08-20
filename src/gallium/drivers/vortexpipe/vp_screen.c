@@ -115,6 +115,13 @@ vp_screen_resident_dirty(struct pipe_screen *screen, const void *host,
    }
 }
 
+bool
+vp_screen_has_rtu(struct pipe_screen *screen)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   return vps && vps->has_rtu;
+}
+
 void
 vp_screen_resident_dirty_all(struct pipe_screen *screen)
 {

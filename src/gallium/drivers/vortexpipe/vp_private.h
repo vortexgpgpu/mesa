@@ -148,6 +148,22 @@ void vp_screen_resident_dirty(struct pipe_screen *screen, const void *host,
  * answer is to distrust all of them. */
 void vp_screen_resident_dirty_all(struct pipe_screen *screen);
 
+/* True when the device carries the ray-tracing unit, which decides whether an
+ * acceleration structure is transcoded to the RTU scene format or copied. */
+bool vp_screen_has_rtu(struct pipe_screen *screen);
+
+/* Acceleration-structure relocation, shared by the dispatch and the draw. A
+ * BVH holds absolute links to the structures below it, so it cannot be handed
+ * to the device as host bytes or as a plain copy -- the links are rewritten as
+ * each one is brought across. The context owns every buffer and staging blob
+ * that takes, all of which the asynchronous uploads still read, so vp_as_end
+ * belongs after vx_queue_finish and nowhere earlier. */
+struct vp_as_ctx;
+struct vp_as_ctx *vp_as_begin(vx_device_h dev, vx_queue_h q, bool has_rtu);
+uint64_t vp_as_relocate(struct vp_as_ctx *c, uint64_t tlas_host);
+bool vp_as_ok(const struct vp_as_ctx *c);
+void vp_as_end(struct vp_as_ctx *c);
+
 /* A compiled compute state: llvmpipe's cso plus the Vortex kernel
  * image. vortexpipe's create_compute_state returns one of these
  * (not the raw llvmpipe cso); bind/delete unwrap it. The descriptor
