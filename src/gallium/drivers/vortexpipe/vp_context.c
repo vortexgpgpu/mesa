@@ -238,6 +238,16 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    struct vp_screen *vps = vp_reg_get(pipe->screen);
    uint32_t block_size = info->block[0] * info->block[1] * info->block[2];
 
+   /* An open statistics query counts this dispatch's invocations inside
+    * llvmpipe, which a device dispatch never reaches -- the same counter the
+    * draw path stands aside for, one path over. An occlusion query cannot be
+    * open here (Vulkan scopes those to a render pass, where compute cannot
+    * run), so the shared counter costs nothing in practice and keeps the two
+    * paths reading the same state. */
+   if (vp->n_open_counting_queries || vp->counting_query_lost) {
+      goto fallback;
+   }
+
    /* Empty dispatch: any zero grid or block dimension means zero workgroups /
     * zero invocations, which is defined to do nothing. Return before touching
     * the device — dispatching a zero-extent grid would otherwise fire warps
