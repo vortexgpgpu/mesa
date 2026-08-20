@@ -1242,6 +1242,100 @@ vp_om_color_format(enum pipe_format format, uint32_t *out_fmt, uint32_t *out_bpp
 /* Capture colour attachment 0 and the depth/stencil attachment so the
  * Vortex raster path can round-trip them; everything else stays with
  * llvmpipe. */
+/* True for a query whose result the rasterizer produces as it draws. Occlusion
+ * and pipeline statistics are counted by llvmpipe while it rasterizes, and the
+ * primitive counters by the draw module feeding it; a device draw reaches
+ * neither. A timestamp is deliberately absent -- it does not depend on the
+ * draw, and counting it here would push every instrumented frame off the
+ * device without a single test noticing. */
+static bool
+vp_query_is_counting(unsigned query_type)
+{
+   switch (query_type) {
+   case PIPE_QUERY_OCCLUSION_COUNTER:
+   case PIPE_QUERY_OCCLUSION_PREDICATE:
+   case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
+   case PIPE_QUERY_PIPELINE_STATISTICS:
+   case PIPE_QUERY_PIPELINE_STATISTICS_SINGLE:
+   case PIPE_QUERY_PRIMITIVES_GENERATED:
+   case PIPE_QUERY_PRIMITIVES_EMITTED:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+vp_query_is_tracked(const struct vp_context *vp, const struct pipe_query *q)
+{
+   for (unsigned i = 0; i < vp->n_counting_queries; i++) {
+      if (vp->counting_queries[i] == q) {
+         return true;
+      }
+   }
+   return false;
+}
+
+static struct pipe_query *
+vp_create_query(struct pipe_context *pipe, unsigned query_type, unsigned index)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   struct pipe_query *q = vp->lp_create_query(pipe, query_type, index);
+   if (!q || !vp_query_is_counting(query_type)) {
+      return q;
+   }
+   if (vp->n_counting_queries == vp->counting_queries_cap) {
+      const unsigned cap = vp->counting_queries_cap ? vp->counting_queries_cap * 2u : 16u;
+      struct pipe_query **grown =
+         realloc(vp->counting_queries, cap * sizeof *grown);
+      if (!grown) {
+         /* Unrecorded means unrecognised at begin_query, which would let a
+          * draw run on the device uncounted. Refuse the device path instead. */
+         vp->counting_query_lost = true;
+         return q;
+      }
+      vp->counting_queries = grown;
+      vp->counting_queries_cap = cap;
+   }
+   vp->counting_queries[vp->n_counting_queries++] = q;
+   return q;
+}
+
+static void
+vp_destroy_query(struct pipe_context *pipe, struct pipe_query *q)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   for (unsigned i = 0; i < vp->n_counting_queries; i++) {
+      if (vp->counting_queries[i] == q) {
+         vp->counting_queries[i] = vp->counting_queries[--vp->n_counting_queries];
+         break;
+      }
+   }
+   vp->lp_destroy_query(pipe, q);
+}
+
+static bool
+vp_begin_query(struct pipe_context *pipe, struct pipe_query *q)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   if (vp_query_is_tracked(vp, q)) {
+      vp->n_open_counting_queries++;
+   }
+   return vp->lp_begin_query(pipe, q);
+}
+
+static bool
+vp_end_query(struct pipe_context *pipe, struct pipe_query *q)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   /* A timestamp query ends without ever beginning, so only a tracked one is
+    * decremented, and never below zero. */
+   if (vp_query_is_tracked(vp, q) && vp->n_open_counting_queries > 0) {
+      vp->n_open_counting_queries--;
+   }
+   return vp->lp_end_query(pipe, q);
+}
+
 static void
 vp_set_framebuffer_state(struct pipe_context *pipe,
                          const struct pipe_framebuffer_state *fb)
@@ -2770,6 +2864,17 @@ vp_draw_vbo(struct pipe_context *pipe,
       if (vp->fb_samples != 1 && vp->fb_samples != 4)
          goto llvmpipe;
 
+      /* An open occlusion or statistics query is counted by llvmpipe's
+       * rasterizer as it draws, and a draw that runs on the device never
+       * reaches it -- the query would come back zero, with no error and no
+       * fallback, because the query state lives entirely in llvmpipe and
+       * nothing here would otherwise notice. Stand aside while one is open:
+       * llvmpipe then both renders and counts, and the result is exact. This
+       * is a refusal, not a limitation of the device -- counting passing
+       * samples in the output merger is what would let such a draw stay. */
+      if (vp->n_open_counting_queries || vp->counting_query_lost)
+         goto llvmpipe;
+
       /* A multiview pass replays each draw once per view, into its own layer.
        * The replay is done below, around the device draw; the extra colour
        * attachments of an MRT pass are the part that is not layered -- they
@@ -3312,6 +3417,11 @@ vp_context_destroy(struct pipe_context *pipe)
               vp->launches_device, vp->launches_device + vp->launches_cpu,
               vp->draws_device, vp->draws_device + vp->draws_cpu);
 
+   free(vp->counting_queries);
+   vp->counting_queries = NULL;
+   vp->n_counting_queries = 0;
+   vp->counting_queries_cap = 0;
+
    /* release the cached draw-integration objects (need a
     * live pipe) */
    if (vp->passthrough_vs)
@@ -3522,6 +3632,10 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_bind_fs_state        = pipe->bind_fs_state;
    vp->lp_delete_fs_state      = pipe->delete_fs_state;
    vp->lp_set_framebuffer_state = pipe->set_framebuffer_state;
+   vp->lp_create_query         = pipe->create_query;
+   vp->lp_destroy_query        = pipe->destroy_query;
+   vp->lp_begin_query          = pipe->begin_query;
+   vp->lp_end_query            = pipe->end_query;
    vp->lp_create_dsa_state     = pipe->create_depth_stencil_alpha_state;
    vp->lp_bind_dsa_state       = pipe->bind_depth_stencil_alpha_state;
    vp->lp_delete_dsa_state     = pipe->delete_depth_stencil_alpha_state;
@@ -3578,6 +3692,10 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->bind_fs_state        = vp_bind_fs_state;
    pipe->delete_fs_state      = vp_delete_fs_state;
    pipe->set_framebuffer_state = vp_set_framebuffer_state;
+   pipe->create_query         = vp_create_query;
+   pipe->destroy_query        = vp_destroy_query;
+   pipe->begin_query          = vp_begin_query;
+   pipe->end_query            = vp_end_query;
    pipe->flush                 = vp_flush;
    pipe->create_depth_stencil_alpha_state = vp_create_dsa_state;
    pipe->bind_depth_stencil_alpha_state   = vp_bind_dsa_state;

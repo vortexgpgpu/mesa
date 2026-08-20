@@ -460,6 +460,25 @@ struct vp_context {
     * llvmpipe's rasterizer (see vp_draw_vbo). */
    void *passthrough_vs;
    void *velems;
+   /* Queries whose result is produced by the rasterizer as it draws. llvmpipe
+    * owns the counting, and a draw that runs on the device never reaches it, so
+    * the driver has to know when one is open in order to stand aside. These
+    * hooks only observe -- each forwards to llvmpipe unchanged. */
+   struct pipe_query *(*lp_create_query)(struct pipe_context *, unsigned, unsigned);
+   void (*lp_destroy_query)(struct pipe_context *, struct pipe_query *);
+   bool (*lp_begin_query)(struct pipe_context *, struct pipe_query *);
+   bool (*lp_end_query)(struct pipe_context *, struct pipe_query *);
+   /* The counting queries created so far, and how many are currently open. A
+    * query's type is known only at creation, but the count has to be kept at
+    * begin/end, which are handed the object alone. */
+   struct pipe_query   **counting_queries;
+   unsigned              n_counting_queries;
+   unsigned              counting_queries_cap;
+   unsigned              n_open_counting_queries;
+   /* Set if a counting query could not be recorded. The device path is then
+    * refused outright rather than risking an uncounted draw. */
+   bool                  counting_query_lost;
+
    /* The bound render targets (set_framebuffer_state). */
    void (*lp_set_framebuffer_state)(struct pipe_context *,
                                     const struct pipe_framebuffer_state *);
