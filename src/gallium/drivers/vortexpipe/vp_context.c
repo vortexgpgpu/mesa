@@ -1255,6 +1255,11 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
    vp->fb_depth  = (fb && fb->zsbuf) ? fb->zsbuf->texture : NULL;
    vp->fb_width  = fb ? fb->width  : 0;
    vp->fb_height = fb ? fb->height : 0;
+   /* One bit per view of a multiview pass. Kept because the draw needs it and
+    * only the framebuffer carries it: nothing about a view mask reaches the
+    * shader translator, so the usual refuse-what-we-cannot-translate route
+    * cannot see it. */
+   vp->fb_viewmask = fb ? fb->viewmask : 0u;
    /* Sample count of the pass. Pinned to 1 until the multisample fragment path
     * exists: the screen still refuses multisample formats, but that hook never
     * sees a no-attachment framebuffer's rasterizationSamples, so an unpinned
@@ -2758,6 +2763,18 @@ vp_draw_vbo(struct pipe_context *pipe,
        * precedes variant resolution so an unsupported count never compiles a
        * kernel that cannot be launched. */
       if (vp->fb_samples != 1 && vp->fb_samples != 4)
+         goto llvmpipe;
+
+      /* A multiview pass replays each draw once per view, every replay landing
+       * in its own attachment layer. The device renders a pass once, into a
+       * single w*h plane that resolves to one layer, so every view but the
+       * first would keep the clear -- no error, no fallback, because a view
+       * mask is framebuffer state and never reaches the translator that
+       * refuses what it cannot compile. Until the per-view replay exists, more
+       * than one view goes to llvmpipe, which carries the mask down to the draw
+       * module and loops it there. (gl_ViewIndex needs no test of its own: it
+       * is an unhandled intrinsic, so a shader reading it already refuses.) */
+      if ((vp->fb_viewmask & (vp->fb_viewmask - 1u)) != 0u)
          goto llvmpipe;
 
       struct vp_fs_variant *fsv = NULL;

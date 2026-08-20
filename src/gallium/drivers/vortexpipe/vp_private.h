@@ -466,6 +466,7 @@ struct vp_context {
    struct pipe_resource *fb_color;
    struct pipe_resource *fb_depth;       /* depth/stencil attachment, or NULL */
    unsigned              fb_width, fb_height;
+   uint8_t               fb_viewmask;         /* multiview: one bit per view */
    unsigned              fb_samples;     /* samples per pixel; 1 = single-sample */
    /* All bound colour attachments (fb_color == fb_cbufs[0]). A draw to
     * >1 attachment renders each into its own resident device buffer and writes
