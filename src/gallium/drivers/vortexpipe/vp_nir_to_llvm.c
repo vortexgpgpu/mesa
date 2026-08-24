@@ -5457,6 +5457,21 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       return false;
    }
 
+   /* The compute argument block carries one descriptor blob, set 0's, and has no
+    * slot for a second. The vertex and fragment stages each receive a table of
+    * per-blob base addresses and reach any set through it, so a non-set-0
+    * descriptor is only a problem here. Refusing matters more than it looks:
+    * two sets number their bindings from zero independently, so a set-1
+    * descriptor carries the same offset as its set-0 counterpart, and the launch
+    * relocation would rewrite one on top of the other rather than merely miss
+    * it. */
+   if (nir->info.stage == MESA_SHADER_COMPUTE &&
+       vp_descriptors_outside_set0(nir)) {
+      mesa_logw("vortexpipe: compute shader reaches a descriptor set other than "
+                "set 0, which the launch argument block has no slot for");
+      return false;
+   }
+
    struct vp_tr t = {0};
    t.ok    = true;
    t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
@@ -5836,7 +5851,7 @@ vp_scan_descs_into(struct nir_shader *nir, struct vp_desc *out, unsigned cap)
             int off = -1;
             enum vp_desc_kind kind = VP_DESC_BUFFER;
             unsigned elem_bytes = 1;            /* SSBO: num_elements is bytes */
-            unsigned cbuf_index = 1;            /* default set-0 blob (index 1) */
+            unsigned cbuf_index = VP_CBUF_SET0;  /* until the address says otherwise */
             bool writable = false;
             switch (in->intrinsic) {
             case nir_intrinsic_load_ssbo:
@@ -5961,6 +5976,17 @@ vp_descriptors_overflow(struct nir_shader *nir)
 {
    struct vp_desc scratch[VP_DESC_SCAN_MAX];
    return vp_scan_descs_into(nir, scratch, VP_DESC_SCAN_MAX) > VP_MAX_DESCS;
+}
+
+bool
+vp_descriptors_outside_set0(struct nir_shader *nir)
+{
+   struct vp_desc scratch[VP_DESC_SCAN_MAX];
+   unsigned n = vp_scan_descs_into(nir, scratch, VP_DESC_SCAN_MAX);
+   for (unsigned i = 0; i < n; i++)
+      if (scratch[i].cbuf_index != VP_CBUF_SET0)
+         return true;
+   return false;
 }
 
 /* Locate the FS's TEX-stage-0 texture descriptor: the sampled image's lp_descriptor

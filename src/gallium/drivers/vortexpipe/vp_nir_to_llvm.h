@@ -132,10 +132,17 @@ struct vp_desc {
 };
 #define VP_MAX_DESCS 16
 
-/* Scan a compute NIR for the set-0 descriptors it accesses (load_ssbo
- * / store_ssbo / load_ubo against constant-buffer index 1). Fills
- * out[0..*num_out) with the distinct descriptors found, capped at
- * VP_MAX_DESCS. */
+/* The constant-buffer index of descriptor set 0's blob, per the +1 offset
+ * described above. The compute argument block carries this one blob and no
+ * other, so it is also the only set a dispatch can reach. */
+#define VP_CBUF_SET0 1
+
+/* Scan a NIR shader of any stage for the descriptors it accesses (load_ssbo /
+ * store_ssbo / load_ubo / image access). Fills out[0..*num_out) with the
+ * distinct ones found, capped at VP_MAX_DESCS. Each carries the constant-buffer
+ * index it lives in, which the draw path uses to relocate blob by blob -- a
+ * descriptor's offset means nothing without it, since two sets number their
+ * bindings from zero independently. */
 void vp_scan_descriptors(struct nir_shader *nir,
                          struct vp_desc *out, unsigned *num_out);
 
@@ -144,6 +151,11 @@ void vp_scan_descriptors(struct nir_shader *nir,
  * relocation never sees them and the device is left holding host addresses --
  * translation refuses such a shader rather than running it on those. */
 bool vp_descriptors_overflow(struct nir_shader *nir);
+
+/* True when the shader reaches a descriptor through a constant buffer other than
+ * set 0's. Ordinary for a vertex or fragment shader, which receives a table of
+ * per-blob base addresses; the caller decides whether its stage can serve it. */
+bool vp_descriptors_outside_set0(struct nir_shader *nir);
 
 /* Locate the FS's TEX-stage-0 sampled-image descriptor (cbuf_index, byte offset)
  * from its nir_tex_src_texture_handle, so a draw can read lp_jit_texture.base and
