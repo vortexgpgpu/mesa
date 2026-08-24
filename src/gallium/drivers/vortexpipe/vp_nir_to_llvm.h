@@ -139,6 +139,12 @@ struct vp_desc {
 void vp_scan_descriptors(struct nir_shader *nir,
                          struct vp_desc *out, unsigned *num_out);
 
+/* True when the shader touches more distinct descriptors than vp_scan_descriptors
+ * can record. The ones past the limit are simply absent from its output, so the
+ * relocation never sees them and the device is left holding host addresses --
+ * translation refuses such a shader rather than running it on those. */
+bool vp_descriptors_overflow(struct nir_shader *nir);
+
 /* Locate the FS's TEX-stage-0 sampled-image descriptor (cbuf_index, byte offset)
  * from its nir_tex_src_texture_handle, so a draw can read lp_jit_texture.base and
  * select the actually-sampled texture. Returns false if the FS has no bindless

@@ -5444,6 +5444,19 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       fprintf(stderr, "=== end NIR ===\n");
    }
 
+   /* A descriptor the scan could not record is a descriptor the relocation
+    * never rewrites, leaving the device to dereference a host address. That is
+    * a host-side array bound, invisible to everything else here, so it is
+    * turned into an ordinary translation failure: the shader falls back to
+    * llvmpipe, which has no such limit. Refused before the module is built,
+    * since nothing downstream can change the answer -- but after the NIR dump
+    * above, so the shader that tripped it can still be looked at. */
+   if (vp_descriptors_overflow(nir)) {
+      mesa_logw("vortexpipe: shader touches more than %u distinct descriptors, "
+                "which is more than the relocation can carry", VP_MAX_DESCS);
+      return false;
+   }
+
    struct vp_tr t = {0};
    t.ok    = true;
    t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
@@ -5807,9 +5820,11 @@ vp_desc_addr_offset(nir_def *def, unsigned *cbuf_index)
    return -1;
 }
 
-void
-vp_scan_descriptors(struct nir_shader *nir,
-                    struct vp_desc *out, unsigned *num_out)
+/* Record the distinct descriptors a shader touches, up to `cap`, and return how
+ * many were found -- a count that stops rising at `cap`, so a caller wanting to
+ * know whether the shader exceeds a smaller limit has to pass room above it. */
+static unsigned
+vp_scan_descs_into(struct nir_shader *nir, struct vp_desc *out, unsigned cap)
 {
    unsigned n = 0;
    nir_foreach_function_impl(impl, nir) {
@@ -5915,7 +5930,7 @@ vp_scan_descriptors(struct nir_shader *nir,
                   dup = true;
                   break;
                }
-            if (dup || n >= VP_MAX_DESCS)
+            if (dup || n >= cap)
                continue;
             out[n].offset     = (unsigned)off;
             out[n].cbuf_index = cbuf_index;
@@ -5926,7 +5941,26 @@ vp_scan_descriptors(struct nir_shader *nir,
          }
       }
    }
-   *num_out = n;
+   return n;
+}
+
+/* Enough room above VP_MAX_DESCS to tell "exactly at the limit" from "past it".
+ * A shader with more distinct descriptors than even this is past the limit by
+ * any measure, so saturating here loses nothing. */
+#define VP_DESC_SCAN_MAX 128
+
+void
+vp_scan_descriptors(struct nir_shader *nir,
+                    struct vp_desc *out, unsigned *num_out)
+{
+   *num_out = vp_scan_descs_into(nir, out, VP_MAX_DESCS);
+}
+
+bool
+vp_descriptors_overflow(struct nir_shader *nir)
+{
+   struct vp_desc scratch[VP_DESC_SCAN_MAX];
+   return vp_scan_descs_into(nir, scratch, VP_DESC_SCAN_MAX) > VP_MAX_DESCS;
 }
 
 /* Locate the FS's TEX-stage-0 texture descriptor: the sampled image's lp_descriptor
