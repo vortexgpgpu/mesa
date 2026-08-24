@@ -152,10 +152,12 @@ void vp_scan_descriptors(struct nir_shader *nir,
  * translation refuses such a shader rather than running it on those. */
 bool vp_descriptors_overflow(struct nir_shader *nir);
 
-/* True when the shader reaches a descriptor through a constant buffer other than
- * set 0's. Ordinary for a vertex or fragment shader, which receives a table of
- * per-blob base addresses; the caller decides whether its stage can serve it. */
-bool vp_descriptors_outside_set0(struct nir_shader *nir);
+/* The highest constant-buffer index the shader reaches a descriptor through, or
+ * 0 if it reaches none. Reaching past set 0 is ordinary for a vertex or fragment
+ * shader, which receives a table of per-blob base addresses, and impossible for
+ * compute, which does not -- so this reports the fact and the caller applies the
+ * bound its stage actually has. */
+unsigned vp_descriptors_max_cbuf(struct nir_shader *nir);
 
 /* Locate the FS's TEX-stage-0 sampled-image descriptor (cbuf_index, byte offset)
  * from its nir_tex_src_texture_handle, so a draw can read lp_jit_texture.base and

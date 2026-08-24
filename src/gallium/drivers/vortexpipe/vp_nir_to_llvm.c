@@ -5457,18 +5457,33 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       return false;
    }
 
-   /* The compute argument block carries one descriptor blob, set 0's, and has no
-    * slot for a second. The vertex and fragment stages each receive a table of
-    * per-blob base addresses and reach any set through it, so a non-set-0
-    * descriptor is only a problem here. Refusing matters more than it looks:
-    * two sets number their bindings from zero independently, so a set-1
-    * descriptor carries the same offset as its set-0 counterpart, and the launch
-    * relocation would rewrite one on top of the other rather than merely miss
-    * it. */
-   if (nir->info.stage == MESA_SHADER_COMPUTE &&
-       vp_descriptors_outside_set0(nir)) {
-      mesa_logw("vortexpipe: compute shader reaches a descriptor set other than "
-                "set 0, which the launch argument block has no slot for");
+   /* lavapipe numbers a descriptor set's constant buffer set+1, without
+    * compacting, so the highest index a shader reaches says which set it needs
+    * and the bound to compare it against is whatever that stage can address. */
+   const unsigned max_cbuf = vp_descriptors_max_cbuf(nir);
+
+   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      /* Compute's argument block carries set 0's blob and has no slot for a
+       * second, and no table to index either. Refusing matters more than it
+       * looks -- two sets number their bindings from zero independently, so a
+       * set-1 descriptor carries the same offset as its set-0 counterpart, and
+       * the launch relocation would rewrite one on top of the other rather than
+       * merely miss it. */
+      if (max_cbuf > VP_CBUF_SET0) {
+         mesa_logw("vortexpipe: compute shader reaches a descriptor set other "
+                   "than set 0, which the launch argument block has no slot for");
+         return false;
+      }
+   } else if (max_cbuf >= GFX_FS_DESC_SLOTS) {
+      /* The vertex and fragment stages read their blob bases from a resident
+       * table of GFX_FS_DESC_SLOTS entries, indexed by the shader with no bound
+       * check of its own -- an index past the end is loaded as readily as one
+       * inside, and whatever follows the table is dereferenced as a
+       * constant-buffer base. The host side is sized to match and simply never
+       * records that buffer, so nothing downstream notices either. */
+      mesa_logw("vortexpipe: shader reaches constant buffer %u, past the "
+                "%u-entry descriptor table", max_cbuf,
+                (unsigned)GFX_FS_DESC_SLOTS);
       return false;
    }
 
@@ -5978,15 +5993,16 @@ vp_descriptors_overflow(struct nir_shader *nir)
    return vp_scan_descs_into(nir, scratch, VP_DESC_SCAN_MAX) > VP_MAX_DESCS;
 }
 
-bool
-vp_descriptors_outside_set0(struct nir_shader *nir)
+unsigned
+vp_descriptors_max_cbuf(struct nir_shader *nir)
 {
    struct vp_desc scratch[VP_DESC_SCAN_MAX];
    unsigned n = vp_scan_descs_into(nir, scratch, VP_DESC_SCAN_MAX);
+   unsigned max = 0;
    for (unsigned i = 0; i < n; i++)
-      if (scratch[i].cbuf_index != VP_CBUF_SET0)
-         return true;
-   return false;
+      if (scratch[i].cbuf_index > max)
+         max = scratch[i].cbuf_index;
+   return max;
 }
 
 /* Locate the FS's TEX-stage-0 texture descriptor: the sampled image's lp_descriptor
