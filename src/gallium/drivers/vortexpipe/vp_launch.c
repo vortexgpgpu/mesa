@@ -1069,9 +1069,15 @@ vp_launch_vs(struct pipe_screen *screen, vx_device_h dev,
 
    /* arg block: slot 0 -> output buffer device address,
     *            slot 1 -> vertex attribute table (0 if self-contained),
+    *            VP_ARG_VS_COUNT -> vertex invocations the draw really has,
     *            VP_ARG_VS_DESC -> VS constant-buffer table (see below) */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
    argblk[0] = out_dev;
+   /* The block above is rounded up to fill its warps, so the VS prologue stops
+    * every thread whose vertex id is past the draw. It reads the real count
+    * from here, and a zero here stops all of them -- the launch appears to
+    * succeed and the output buffer comes back exactly as allocated. */
+   argblk[VP_ARG_VS_COUNT] = vertex_count;
 
    /* This standalone path (the llvmpipe raster fallback) has no descriptor
     * state, but the VS prologue always dereferences VP_ARG_VS_DESC to reach
