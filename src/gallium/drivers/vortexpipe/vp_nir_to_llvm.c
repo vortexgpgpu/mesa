@@ -4115,7 +4115,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    /* Route to the SW sampler when the sampler is mipmapped, the texture is NPOT (the
     * FF vx_tex4 unit is POT-only), its format is above the FF set (the FF unit has
     * no decoder or texel stride for it), or it wraps to a border colour (the FF unit
-    * has no border mux and would decode that wrap as REPEAT); otherwise the fast HW
+    * carries no border colour, so it cannot produce one); otherwise the fast HW
     * path. All are uniform descriptor bits, so the branch never diverges (derivatives
     * safe). A float format always sets the extended-format bit, so the HW unit never
     * sees a wide texel. */
