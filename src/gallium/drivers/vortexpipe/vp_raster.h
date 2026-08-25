@@ -204,6 +204,13 @@ bool vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
                     const struct vp_fs_consts *vs_consts,
                     const struct vp_mrt_params *mrt);
 
+/* Fold a multisample pass's sample-interleaved colour plane into a dense
+ * single-sample one, on the device. Runs at pass end, after the last draw. */
+bool vp_raster_resolve_msaa(vx_device_h dev, struct vp_raster_pool *pool,
+                            vx_buffer_h src, vx_buffer_h dst,
+                            uint32_t width, uint32_t height,
+                            uint32_t samples, uint32_t color_format);
+
 #ifdef __cplusplus
 }
 #endif

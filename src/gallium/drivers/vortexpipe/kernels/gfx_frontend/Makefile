@@ -61,7 +61,15 @@ VX_CFLAGS := --target=$(TARGET) \
   -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections -ffp-contract=off \
   -D__VORTEX__ -DNDEBUG \
   -I. -I$(VORTEX_HOME)/sw/gfx -I$(VORTEX_HOME)/sw/kernel/include \
-  -I$(VORTEX_HOME)/sw/common -I$(VORTEX_BUILD)/sw -I$(VORTEX_BUILD)/hw
+  -I$(VORTEX_HOME)/sw/common -I$(VORTEX_BUILD)/sw -I$(VORTEX_BUILD)/hw \
+  -I$(VORTEX_HOME)/third_party
+
+# The pass-end multisample resolve reuses the software merger's box filter, so
+# the kernel pulls in gfx_sw.h. That header refuses to compile without this
+# define, as a reminder that its merge inlines a large divergent CFG and needs a
+# raised divergence-block guard -- which the flags above already carry, at a
+# bound well past what this kernel adds.
+VX_CFLAGS += -DGFX_SW_DIVERGENCE_OK
 
 # gfx_v2 §6.4: link the front end at a distinct base (0x80200000) so it
 # co-resides with the per-draw fragment-shader module (linked at the default

@@ -119,7 +119,7 @@ struct vp_raster_pool {
     * the device once and reused across every draw (it never changes), instead
     * of reloaded per draw. */
    vx_module_h fe_module;
-   vx_kernel_h k_expand, k_setup, k_binning;
+   vx_kernel_h k_expand, k_setup, k_binning, k_resolve;
    /* SW sampler / output-merger: small resident descriptors the FS reads
     * (tex via arg[1], om via arg[2]) when the unit is routed to software;
     * created once, rewritten per draw. */
@@ -144,11 +144,42 @@ vp_raster_pool_destroy(struct vp_raster_pool *pool)
       if (b) vx_buffer_release(b);
    if (pool->texstate_buf) vx_buffer_release(pool->texstate_buf);
    if (pool->omstate_buf)  vx_buffer_release(pool->omstate_buf);
+   if (pool->k_resolve) vx_kernel_release(pool->k_resolve);
    if (pool->k_binning) vx_kernel_release(pool->k_binning);
    if (pool->k_setup)   vx_kernel_release(pool->k_setup);
    if (pool->k_expand)  vx_kernel_release(pool->k_expand);
    if (pool->fe_module) vx_module_release(pool->fe_module);
    delete pool;
+}
+
+/* Load the embedded front-end module onto the device once per context and cache
+ * its kernel handles. Both the draw and the pass-end resolve reach for it, and
+ * a multisample pass that clears without drawing still has samples to fold, so
+ * the resolve cannot assume a draw already loaded it. */
+static bool
+vp_pool_module(vx_device_h dev, struct vp_raster_pool *pool)
+{
+   if (pool->fe_module != NULL)
+      return true;
+   size_t fe_size = 0;
+   const void *fe_bytes = vp_gfx_frontend_vxbin(vp_xlen_is_64(), &fe_size);
+   if (vx_module_load_bytes(dev, fe_bytes, fe_size, &pool->fe_module) != VX_SUCCESS) {
+      mesa_loge("vortexpipe: raster: front-end module load failed");
+      pool->fe_module = NULL;
+      return false;
+   }
+   if (vx_module_get_kernel(pool->fe_module, "expand_k", &pool->k_expand) != VX_SUCCESS ||
+       vx_module_get_kernel(pool->fe_module, "setup_k", &pool->k_setup) != VX_SUCCESS ||
+       vx_module_get_kernel(pool->fe_module, "binning_k", &pool->k_binning) != VX_SUCCESS ||
+       vx_module_get_kernel(pool->fe_module, "msaa_resolve_k", &pool->k_resolve) != VX_SUCCESS) {
+      /* Drop the module rather than leave it cached: a later call would find
+       * fe_module set, return success, and launch through a null kernel. */
+      mesa_loge("vortexpipe: raster: front-end module is missing a kernel entry");
+      vx_module_release(pool->fe_module);
+      pool->fe_module = NULL;
+      return false;
+   }
+   return true;
 }
 
 /* Ensure the pool is sized for this draw (grow-only); (re)allocates and
@@ -215,6 +246,68 @@ vp_pool_ensure(vx_device_h dev, struct vp_raster_pool *pool,
    }
    pool->cap_tris = NT; pool->cap_bins = B; pool->cap_keys = K; pool->cap_T = T;
    return true;
+}
+
+/* Fold a multisample pass's colour plane down to one texel per pixel, on the
+ * device. `src` is the sample-interleaved plane every draw of the pass merged
+ * into; `dst` receives the dense single-sample result the host copy reads.
+ *
+ * Launched as its own submission rather than folded into a draw: it has to run
+ * after the last draw of the pass, and a pass may end without one. */
+extern "C" bool
+vp_raster_resolve_msaa(vx_device_h dev, struct vp_raster_pool *pool,
+                       vx_buffer_h src, vx_buffer_h dst,
+                       uint32_t width, uint32_t height,
+                       uint32_t samples, uint32_t color_format)
+{
+   if (!pool || !src || !dst || samples <= 1 || !width || !height)
+      return false;
+   if (!vp_pool_module(dev, pool))
+      return false;
+
+   vx_queue_h q = NULL;
+   bool ok = false;
+   uint64_t src_dev = 0, dst_dev = 0;
+
+   VP_CHECK(vx_queue_create(dev, 0, &q), "vx_queue_create(resolve)");
+   VP_CHECK(vx_buffer_address(src, &src_dev), "vx_buffer_address(resolve src)");
+   VP_CHECK(vx_buffer_address(dst, &dst_dev), "vx_buffer_address(resolve dst)");
+
+   {
+      resolve_arg_t rarg{};
+      rarg.src_addr     = src_dev;
+      rarg.dst_addr     = dst_dev;
+      rarg.width        = width;
+      rarg.height       = height;
+      rarg.samples      = samples;
+      rarg.color_format = color_format;
+
+      /* One thread per pixel, spread over whatever the device offers; the
+       * kernel is grid-strided, so the geometry only has to be non-empty. */
+      uint32_t n = width * height, gdim[1] = { 1 }, bdim[1] = { 1 };
+      VP_CHECK(vx_device_max_occupancy_grid(dev, 1, &n, gdim, bdim),
+               "vx_device_max_occupancy_grid(resolve)");
+
+      vx_launch_info_t li{};
+      li.struct_size = sizeof(li);
+      li.kernel      = pool->k_resolve;
+      li.args_host   = &rarg;
+      li.args_size   = sizeof(rarg);
+      li.ndim        = 1;
+      li.grid_dim[0]  = gdim[0];
+      li.block_dim[0] = bdim[0];
+
+      vx_command_t cmd{};
+      cmd.type = VX_COMMAND_LAUNCH;
+      cmd.data.launch = &li;
+      VP_CHECK(vx_enqueue_draw(q, &cmd, 1, 0, NULL, NULL), "vx_enqueue_draw(resolve)");
+      VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish(resolve)");
+      ok = true;
+   }
+
+done:
+   if (q) vx_queue_release(q);
+   return ok;
 }
 
 extern "C" bool
@@ -369,18 +462,8 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
       }
       k_vs = *vs_kernel_io;
 
-      if (pool->fe_module == NULL) {
-         size_t fe_size = 0;
-         const void *fe_bytes = vp_gfx_frontend_vxbin(vp_xlen_is_64(), &fe_size);
-         VP_CHECK(vx_module_load_bytes(dev, fe_bytes, fe_size, &pool->fe_module),
-                  "vx_module_load_bytes(frontend)");
-         VP_CHECK(vx_module_get_kernel(pool->fe_module, "expand_k", &pool->k_expand),
-                  "vx_module_get_kernel(expand_k)");
-         VP_CHECK(vx_module_get_kernel(pool->fe_module, "setup_k", &pool->k_setup),
-                  "vx_module_get_kernel(setup_k)");
-         VP_CHECK(vx_module_get_kernel(pool->fe_module, "binning_k", &pool->k_binning),
-                  "vx_module_get_kernel(binning_k)");
-      }
+      if (!vp_pool_module(dev, pool))
+         goto done;
       k_expand  = pool->k_expand;
       k_setup   = pool->k_setup;
       k_binning = pool->k_binning;

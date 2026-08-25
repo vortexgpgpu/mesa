@@ -508,6 +508,19 @@ struct vp_context {
     * from fb_color_bpp because the flush back to the resource runs as part of
     * binding the *next* framebuffer, when fb_color_bpp already describes it. */
    unsigned              rfb_bpp;
+   /* Colour format the resident planes hold, carried for the same reason as
+    * rfb_bpp: the multisample resolve runs during that same flush and has to
+    * decode the samples in the format they were written, not the next pass's. */
+   unsigned              rfb_cfmt;
+   /* Destination for the pass-end multisample resolve: one texel per pixel,
+    * folded from rcb's samples on the device. Only allocated when rfb_s > 1;
+    * at one sample the resident plane is already what the resource wants. */
+   vx_buffer_h           rcb_resolved;
+   /* Whether this multisample pass's colour has left through a resolve. The
+    * resolve is its only route out, so a pass that ends without one has
+    * rendered into a plane nothing reads -- worth saying rather than dropping
+    * silently. Meaningless at one sample. */
+   bool                  rfb_resolved;
    /* The attachment layer the resident planes mirror. Part of their key, so a
     * multiview pass moving to the next view resolves the current one back to
     * its own layer before loading the next. */

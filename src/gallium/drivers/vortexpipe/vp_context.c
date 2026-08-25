@@ -1364,13 +1364,22 @@ vp_set_framebuffer_state(struct pipe_context *pipe,
     * shader translator, so the usual refuse-what-we-cannot-translate route
     * cannot see it. */
    vp->fb_viewmask = fb ? fb->viewmask : 0u;
-   /* Sample count of the pass. Pinned to 1 until the multisample fragment path
-    * exists: the screen still refuses multisample formats, but that hook never
-    * sees a no-attachment framebuffer's rasterizationSamples, so an unpinned
-    * read here would size the resident buffers per sample while every draw
-    * still merged as if single-sample. The capture is left in place because it
-    * is what the residency below is keyed on. */
+   /* Sample count of the pass, from the first colour attachment -- or from the
+    * framebuffer itself, which is the only place a no-attachment pass carries
+    * it. Everything downstream is keyed on this: which fragment variant is
+    * compiled, how the resident planes are sized, and what the merger is told
+    * to store per pixel. Reading 1 for a multisample pass does not degrade to a
+    * fallback, it merges one sample per pixel and leaves the application's
+    * resolve target holding its clear, so the count has to be the real one. */
    vp->fb_samples = 1;
+   if (fb) {
+      if (fb->nr_cbufs > 0 && fb->cbufs[0] && fb->cbufs[0]->texture &&
+          fb->cbufs[0]->texture->nr_samples > 1) {
+         vp->fb_samples = fb->cbufs[0]->texture->nr_samples;
+      } else if (fb->samples > 1) {
+         vp->fb_samples = fb->samples;
+      }
+   }
    /* Capture every bound colour attachment (fb_cbufs[0] == fb_color). */
    vp->fb_nr_cbufs = 0;
    for (unsigned i = 0; i < GFX_OM_MAX_RT; i++)
@@ -1648,6 +1657,24 @@ vp_fb_sync_out(struct pipe_context *pipe, struct vp_context *vp)
 {
    if (!vp->rfb_dirty || !vp->rcb || !vp->rfb_res)
       return;
+   /* A multisample pass's resident plane holds one colour per sample, and the
+    * copy below writes one per pixel through a 2D transfer that has no sample
+    * index to write the rest through. Such a pass leaves by its resolve
+    * (vp_blit), which folds the samples on the device and writes the single
+    * texel per pixel the resolve target wants. A pass that ends without one has
+    * rendered somewhere nothing will read, and the attachment keeps whatever
+    * llvmpipe cleared it to -- say so, because the alternative is a blank image
+    * with no explanation. Carrying such a pass out needs the samples written
+    * back to the multisample resource, which a 2D transfer cannot do. */
+   if (vp->rfb_s > 1) {
+      if (!vp->rfb_resolved) {
+         mesa_loge("vortexpipe: a %ux multisample pass ended without a resolve; "
+                   "its colour cannot reach the attachment and the attachment "
+                   "keeps its clear", vp->rfb_s);
+      }
+      vp->rfb_dirty = false;
+      return;
+   }
    const uint32_t bytes = vp->rfb_w * vp->rfb_h * vp->rfb_bpp;
    /* One staging buffer serves every attachment, so it has to be as wide as the
     * widest of them. The widths come from rmrt_bpp, not from the framebuffer
@@ -1689,6 +1716,7 @@ vp_fb_invalidate(struct pipe_context *pipe, struct vp_context *vp)
    vp_fb_sync_out(pipe, vp);
    if (vp->rcb) { vx_buffer_release(vp->rcb); vp->rcb = NULL; }
    if (vp->rzb) { vx_buffer_release(vp->rzb); vp->rzb = NULL; }
+   if (vp->rcb_resolved) { vx_buffer_release(vp->rcb_resolved); vp->rcb_resolved = NULL; }
    /* Drop the extra colour attachments. */
    for (unsigned k = 0; k < GFX_OM_MAX_RT; k++) {
       if (vp->rcb_extra[k]) { vx_buffer_release(vp->rcb_extra[k]); vp->rcb_extra[k] = NULL; }
@@ -1770,11 +1798,23 @@ vp_fb_ensure(struct pipe_context *pipe, struct vp_context *vp,
    free(zinit);
    if (!zok) { vx_buffer_release(vp->rcb); vp->rcb = NULL; return false; }
 
+   /* Destination for the pass-end resolve. The samples are folded on the
+    * device, so the host copy reads one texel per pixel out of this rather than
+    * S of them out of the plane above. */
+   if (S > 1 &&
+       vx_buffer_create(vp->dev, cbytes, 0, &vp->rcb_resolved) != VX_SUCCESS) {
+      vx_buffer_release(vp->rcb); vp->rcb = NULL;
+      vx_buffer_release(vp->rzb); vp->rzb = NULL;
+      return false;
+   }
+
    vp->rfb_res = vp->fb_color;
    vp->rfb_w = w; vp->rfb_h = h; vp->rfb_s = vp->fb_samples;
    vp->rfb_layer = layer;
    vp->rfb_bpp = cbpp;
+   vp->rfb_cfmt = vp->fb_color_format[0];
    vp->rfb_dirty = false;
+   vp->rfb_resolved = false;
    return true;
 }
 
@@ -3590,10 +3630,74 @@ vp_resource_copy_region(struct pipe_context *pipe,
    vp_dirty_resource(pipe, dst);
 }
 
+/* Whether `info` is the resolve that carries the current multisample pass out.
+ * Kept apart from performing it, because once it is, forwarding to llvmpipe is
+ * not a fallback: llvmpipe holds only the clear for this attachment.
+ *
+ * Only a whole-attachment, level-0, same-format resolve is claimed. Nothing
+ * produces anything else today, and a narrower or reformatting one is better
+ * left to llvmpipe -- wrong, but wrong in the direction of the clear -- than
+ * served from a plane addressed as if it were full-size. */
+static bool
+vp_blit_is_resident_resolve(const struct vp_context *vp,
+                            const struct pipe_blit_info *info)
+{
+   return info && vp->rfb_s > 1 && vp->rcb && vp->rcb_resolved &&
+          info->src.resource == vp->rfb_res && info->dst.resource &&
+          info->dst.resource->nr_samples <= 1 &&
+          info->src.format == info->dst.format &&
+          info->src.level == 0 && info->dst.level == 0 &&
+          info->src.box.x == 0 && info->src.box.y == 0 &&
+          info->dst.box.x == 0 && info->dst.box.y == 0 &&
+          (unsigned)info->src.box.width  == vp->rfb_w &&
+          (unsigned)info->src.box.height == vp->rfb_h;
+}
+
+/* A multisample pass leaves by its resolve. lavapipe ends such a pass with a
+ * blit from the multisample colour attachment to the resolve target, and that
+ * attachment's contents live in the resident plane the device merged into --
+ * llvmpipe holds only the clear, so forwarding the blit would resolve the
+ * clear. Fold the samples on the device instead and write the result straight
+ * into the resolve target, which is single-sample and takes an ordinary
+ * transfer. This is the only route out: vp_fb_sync_out cannot express one
+ * colour per sample through a 2D transfer. */
+static void
+vp_blit_resolve_resident(struct pipe_context *pipe, struct vp_context *vp,
+                         const struct pipe_blit_info *info)
+{
+   if (!vp_raster_resolve_msaa(vp->dev, vp->raster_pool, vp->rcb,
+                               vp->rcb_resolved, vp->rfb_w, vp->rfb_h,
+                               vp->rfb_s, vp->rfb_cfmt)) {
+      mesa_loge("vortexpipe: multisample resolve failed; the resolve target "
+                "keeps what it held");
+      return;
+   }
+
+   const uint32_t bytes = vp->rfb_w * vp->rfb_h * vp->rfb_bpp;
+   void *host = malloc(bytes);
+   bool ok = host && vp_buffer_readback(vp->dev, vp->rcb_resolved, host, bytes);
+   if (ok) {
+      ok = vp_resource_rw(pipe, info->dst.resource, info->dst.box.z,
+                          vp->rfb_w, vp->rfb_h, vp->rfb_bpp, host, true);
+   }
+   free(host);
+   if (!ok) {
+      mesa_loge("vortexpipe: multisample resolve could not reach the resolve "
+                "target; it keeps what it held");
+      return;
+   }
+   vp_dirty_resource(pipe, info->dst.resource);
+   vp->rfb_resolved = true;
+}
+
 static void
 vp_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
    struct vp_context *vp = vp_reg_get(pipe);
+   if (vp_blit_is_resident_resolve(vp, info)) {
+      vp_blit_resolve_resident(pipe, vp, info);
+      return;
+   }
    vp->lp_blit(pipe, info);
    vp_dirty_resource(pipe, info ? info->dst.resource : NULL);
 }
