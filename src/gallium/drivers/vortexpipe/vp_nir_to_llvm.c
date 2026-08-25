@@ -5182,6 +5182,22 @@ static_assert(VP_RAST_QUAD_WORDS == 13,
 static_assert(VP_RAST_MSAA_QUAD_WORDS == 17,
               "gfx_rast_msaa_quad_t width moved; check the bcoord base word");
 
+/* The emitter builds the call to the walk by hand -- it writes the LLVM
+ * function type rather than calling the C declaration -- so nothing in the
+ * compiler checks it against gfx_sw_abi.h, and a parameter list that grows on
+ * the device side leaves the arguments shifted. The failure is silent: the walk
+ * reads a scissor bound out of a pointer, rejects every sample, and the draw
+ * renders black. Bind each declaration to the shape the emitter assumes, so the
+ * next change over there is a build error here instead. */
+typedef uint32_t (*vp_walk_fn)(const void *, uint32_t, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                               gfx_rast_quad_t *, uint32_t);
+typedef uint32_t (*vp_walk_msaa_fn)(const void *, uint32_t, uint32_t, uint32_t,
+                                    uint32_t, uint32_t, uint32_t, uint32_t,
+                                    uint32_t, gfx_rast_msaa_quad_t *, uint32_t);
+static const vp_walk_fn      vp_walk_sig      = gfx_rast_walk_tile_sw;
+static const vp_walk_msaa_fn vp_walk_msaa_sig = gfx_rast_walk_tile_msaa_sw;
+
 static LLVMValueRef
 emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
                           LLVMTypeRef fs_main_ty)
@@ -5303,16 +5319,25 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMValueRef flat = LLVMBuildAdd(t->b, flat_base,
       vp_to_iptr(t, LLVMBuildMul(t->b, pid,
          LLVMConstInt(t->i32, GFX_FS_FLAT_WORDS * 4u, false), "")), "flat");
-   LLVMTypeRef wparams[9] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
-                              t->i32, t->i32, t->ptr, t->i32 };
-   LLVMTypeRef wty = LLVMFunctionType(t->i32, wparams, 9, false);
+   /* The walk confines coverage to a rect, not an extent: left and top are
+    * separate parameters because a scissored sub-rectangle has a non-zero
+    * origin. The arg block carries only the extent today, so the origin is the
+    * framebuffer's -- the same rect the walk was confined to when the callee
+    * took a width and a height and pinned its own corner to (0,0). Handing it
+    * an app scissor origin is a separate change, and needs the host to put one
+    * in the arg block first. */
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMTypeRef wparams[11] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
+                               t->i32, t->i32, t->i32, t->i32, t->ptr, t->i32 };
+   LLVMTypeRef wty = LLVMFunctionType(t->i32, wparams, 11, false);
    LLVMValueRef wfn = LLVMGetNamedFunction(t->mod, walk_name);
    if (!wfn)
       wfn = LLVMAddFunction(t->mod, walk_name, wty);
-   LLVMValueRef wargs[9] = {
+   LLVMValueRef wargs[11] = {
       LLVMBuildIntToPtr(t->b, prim, t->ptr, "primp"), pid, tx, ty, logc,
-      scis_w, scis_h, quadbuf, LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false) };
-   LLVMValueRef cnt = LLVMBuildCall2(t->b, wty, wfn, wargs, 9, "cnt");
+      zero, zero, scis_w, scis_h,
+      quadbuf, LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false) };
+   LLVMValueRef cnt = LLVMBuildCall2(t->b, wty, wfn, wargs, 11, "cnt");
    LLVMBuildStore(t->b, cnt, cnt_slot);
    /* One lane is one pixel, so a quad is four ADJACENT lanes: lane L takes corner
     * L&3 of quad L>>2, and the warp holds NT/4 quads at a time. */
