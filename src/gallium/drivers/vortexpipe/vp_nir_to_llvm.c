@@ -92,10 +92,8 @@
  * perspective 1/w plane. The w0..w5 planes are appended after rhw, so the
  * z/r/g/b/a/u/v/rhw offsets below are unchanged. At w==1 the premultiplied
  * varying planes equal the raw attributes and rhw is constant, so reading them
- * affinely is exact; the fourteen attribute planes push the per-prim stride to
- * 204B. NOTE: duplicated as VP_RAST_PRIM_STRIDE in vp_raster.cpp (the DCR
- * writer) — keep the two in sync. */
-#define VP_RAST_PRIM_STRIDE 204
+ * affinely is exact. The record pitch itself is VP_RAST_PRIM_STRIDE
+ * (vp_nir_to_llvm.h), shared with the DCR writer in vp_raster.cpp. */
 #define VP_RAST_ATTR_Z       36
 #define VP_RAST_ATTR_R       48
 #define VP_RAST_ATTR_G       60

@@ -102,6 +102,19 @@ void vp_free_ir(char *ir);
  * leave free; the compute SSBO slots it overlaps are never read by a VS. */
 #define VP_ARG_VS_COUNT  6
 
+/* Byte pitch of one vortex::graphics::rast_prim_t record in the front end's
+ * primitive buffer: vec3e_t edges[3] (36B) + rast_attribs_t {z,r,g,b,a,u,v,rhw,
+ * w0..w5} (14 planes x 12B = 168B) + facing (4B) + rhw_scale (4B).
+ *
+ * Three consumers index primitive N by it -- the RASTER unit through the
+ * PBUF_STRIDE DCR, and the fragment kernel's hardware- and software-raster
+ * paths -- so it must be the record's whole size, trailing scalars included,
+ * not just the part RASTER reads. A stride short of sizeof() leaves primitive 0
+ * correct and makes every later primitive's edges alias the previous record's
+ * tail, which drops it from the render with no diagnostic. vp_raster.cpp
+ * static_asserts this against the ABI struct. */
+#define VP_RAST_PRIM_STRIDE 212
+
 /* A descriptor a compute kernel reaches through set-0's descriptor
  * buffer (constant-buffer index 1):
  *  - VP_DESC_BUFFER: an SSBO -- lp_jit_buffer{ptr,size} at `offset`.
