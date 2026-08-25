@@ -2862,6 +2862,52 @@ vp_draw_vbo(struct pipe_context *pipe,
    struct vp_cso     *vs = vp->cur_vs;
    struct vp_cso     *fs = vp->cur_fs;
 
+   /* An indirect draw carries its vertex count, instance count and first
+    * vertex in a buffer rather than in the call. Nothing below reads that
+    * buffer, so resolve it here and re-enter as the direct draws it describes
+    * -- the same shape launch_grid uses for an indirect dispatch. Doing it
+    * here rather than in the device path also fixes the fallback: llvmpipe
+    * then receives ordinary direct draws.
+    *
+    * Reading the buffer on the host means its contents must already be final,
+    * which holds while every path that writes it completes before submit. A
+    * draw-count buffer or a stream-output count is left alone: those are read
+    * at submit time by definition, and llvmpipe resolves them exactly. */
+   if (indirect && indirect->buffer && !indirect->indirect_draw_count &&
+       !indirect->count_from_stream_output && indirect->draw_count > 0) {
+      const unsigned words  = info->index_size ? 5u : 4u;
+      const unsigned stride = indirect->stride ? indirect->stride : words * 4u;
+      const unsigned span   = stride * (indirect->draw_count - 1) + words * 4u;
+      struct pipe_transfer *xfer = NULL;
+      const uint8_t *base = (const uint8_t *)pipe_buffer_map_range(
+         pipe, indirect->buffer, indirect->offset, span, PIPE_MAP_READ, &xfer);
+      if (base) {
+         for (unsigned i = 0; i < indirect->draw_count; i++) {
+            const uint32_t *c = (const uint32_t *)(base + (size_t)i * stride);
+            struct pipe_draw_info di = *info;
+            struct pipe_draw_start_count_bias d = { 0 };
+            /* The index buffer belongs to the caller's info; a copy of it must
+             * not also claim ownership, or it is released once per command. */
+            di.take_index_buffer_ownership = false;
+            /* The caller's bounds describe the whole buffer, not this command's
+             * slice of it. */
+            di.index_bounds_valid = false;
+            if (info->index_size) {
+               d.count = c[0]; di.instance_count = c[1];
+               d.start = c[2]; d.index_bias = (int32_t)c[3];
+               di.start_instance = c[4];
+            } else {
+               d.count = c[0]; di.instance_count = c[1];
+               d.start = c[2]; di.start_instance = c[3];
+            }
+            if (d.count && di.instance_count)
+               vp_draw_vbo(pipe, &di, drawid_offset + i, NULL, &d, 1);
+         }
+         pipe_buffer_unmap(pipe, xfer);
+         return;
+      }
+   }
+
    /* Run on Vortex for a simple direct, non-instanced single draw with a
     * translated VS. Indexed draws are supported on the hardware path: the
     * index buffer is uploaded (widened to u32) and resolved per-vertex in the
