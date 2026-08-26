@@ -2962,15 +2962,32 @@ vp_draw_vbo(struct pipe_context *pipe,
       if (vp->fb_samples != 1 && vp->fb_samples != 4)
          goto llvmpipe;
 
-      /* An open occlusion or statistics query is counted by llvmpipe's
-       * rasterizer as it draws, and a draw that runs on the device never
-       * reaches it -- the query would come back zero, with no error and no
-       * fallback, because the query state lives entirely in llvmpipe and
-       * nothing here would otherwise notice. Stand aside while one is open:
-       * llvmpipe then both renders and counts, and the result is exact. This
-       * is a refusal, not a limitation of the device -- counting passing
-       * samples in the output merger is what would let such a draw stay. */
-      if (vp->n_open_counting_queries || vp->counting_query_lost)
+      /* A multisample colour attachment the application can also sample from.
+       * The device serves a multisample pass only through the pass-end resolve:
+       * the per-sample plane is resident, and the single-sample result is what
+       * reaches the attachment. An application that samples the attachment
+       * itself -- as a sampler2DMS, the only way it can observe one -- wants the
+       * samples that were never written back, and by the time that is noticed,
+       * after the pass, there is nowhere left to put them. Writing them back
+       * would need a transfer carrying a sample index, which the read path does
+       * not have. So stand aside up front, the way an unsupported sample count
+       * just did, rather than hand back the clear. */
+      if (vp->fb_samples > 1) {
+         for (unsigned i = 0; i < vp->fb_nr_cbufs; i++)
+            if (vp->fb_cbufs[i] && (vp->fb_cbufs[i]->bind & PIPE_BIND_SAMPLER_VIEW))
+               goto llvmpipe;
+      }
+
+      /* State that governs this draw but lives in llvmpipe: an open query it
+       * counts as it rasterizes, or a conditional-rendering predicate it tests
+       * before drawing at all. A draw on the device reaches neither, so the
+       * query would come back zero and the predicate would go untested -- both
+       * silently, since none of it passes through the shader translator that
+       * refuses what it cannot do. Stand aside and llvmpipe does it exactly.
+       * These are refusals, not limits of the device: counting samples in the
+       * output merger, and reading the predicate before the launch, are what
+       * would let such a draw stay on it. */
+      if (vp_defer_to_llvmpipe(vp))
          goto llvmpipe;
 
       /* A multiview pass replays each draw once per view, into its own layer.
