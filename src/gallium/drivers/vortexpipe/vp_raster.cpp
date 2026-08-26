@@ -336,12 +336,12 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
                const struct vp_fs_consts *vs_consts,
                const struct vp_mrt_params *mrt)
 {
-   /* A draw targeting >1 colour attachment merges in software (the FF
-    * OM unit is single-attachment), so force the SW-OM path when MRT is active.
-    * The FS was compiled for sw_om (vp_create_fs_state) to match. */
+   /* A draw targeting >1 colour attachment exports once per attachment, and the
+    * merger carries per-attachment state selected by the attachment index the
+    * export address carries. Whether that is legal depends on depth/stencil
+    * WRITE state, which this function cannot see -- the caller decides and says
+    * so through sw_om, because the FS had to be translated for the same answer. */
    const bool mrt_active = mrt && mrt->num_color > 1;
-   if (mrt_active)
-      sw_om = true;
    /* Instancing: the draw runs the whole VS -> expand -> setup -> bin -> raster
     * pipeline over instance_count × verts_per_instance vertices (each instance is
     * just more primitives — the true-GPU shape). verts_per_instance is the
@@ -1328,9 +1328,30 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
       /* FF OM config — skipped when OM is routed to software (the FS merges via
        * gfx_om_fragment_sw from the resident om descriptor instead). */
       if (!sw_om) {
-      DCRW(VX_DCR_OM_CBUF_ADDR,        (uint32_t)(color_dev / 64));
-      DCRW(VX_DCR_OM_CBUF_PITCH,       width * 4);
-      DCRW(VX_DCR_OM_CBUF_WRITEMASK,   om->colormask);
+      /* Per-attachment merger state. VX_DCR_OM_RT_SELECT latches which
+       * attachment the colour/blend registers below land in, so each one is
+       * programmed under its own select. Written even for a single attachment:
+       * the select is sticky, and a stale one from a previous MRT draw would
+       * silently retarget this draw's colour writes. */
+      for (uint32_t k = 0; k < (mrt_active ? mrt->num_color : 1u); k++) {
+         DCRW(VX_DCR_OM_RT_SELECT,     k);
+         DCRW(VX_DCR_OM_CBUF_ADDR,     (uint32_t)((mrt_active ? mrt->color_dev[k]
+                                                              : color_dev) / 64));
+         DCRW(VX_DCR_OM_CBUF_PITCH,    mrt_active ? mrt->pitch[k] : width * 4);
+         DCRW(VX_DCR_OM_CBUF_WRITEMASK, mrt_active ? mrt->colormask[k]
+                                                   : om->colormask);
+         DCRW(VX_DCR_OM_BLEND_MODE,    mrt_active ? mrt->blend_mode[k]
+                                                  : om->blend_mode);
+         DCRW(VX_DCR_OM_BLEND_FUNC,    mrt_active ? mrt->blend_func[k]
+                                                  : om->blend_func);
+         DCRW(VX_DCR_OM_BLEND_CONST,   mrt_active ? mrt->blend_const[k]
+                                                  : om->blend_const);
+         /* The logic op is pipeline-wide in Vulkan, so every attachment gets
+          * the same one -- it is written per attachment only because the
+          * register lives behind the select. */
+         DCRW(VX_DCR_OM_LOGIC_OP,      om->logic_op);
+      }
+      DCRW(VX_DCR_OM_RT_SELECT,        0);
       DCRW(VX_DCR_OM_ZBUF_ADDR,        (uint32_t)(depth_dev / 64));
       DCRW(VX_DCR_OM_ZBUF_PITCH,       width * 4);
       DCRW(VX_DCR_OM_DEPTH_FUNC,       om->depth_test ? om->depth_func : VX_OM_DEPTH_FUNC_ALWAYS);
@@ -1342,10 +1363,6 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
       DCRW(VX_DCR_OM_STENCIL_REF,       om->stencil_ref);
       DCRW(VX_DCR_OM_STENCIL_MASK,      om->stencil_mask);
       DCRW(VX_DCR_OM_STENCIL_WRITEMASK, om->stencil_writemask);
-      DCRW(VX_DCR_OM_BLEND_MODE,        om->blend_mode);
-      DCRW(VX_DCR_OM_BLEND_FUNC,        om->blend_func);
-      DCRW(VX_DCR_OM_BLEND_CONST,       om->blend_const);
-      DCRW(VX_DCR_OM_LOGIC_OP,          om->logic_op);
       DCRW(VX_DCR_OM_EARLYZ_SAFE,       om->earlyz_safe ? 1u : 0u);
 
       /* OM aperture: a fragment export is a store into a virtual address range

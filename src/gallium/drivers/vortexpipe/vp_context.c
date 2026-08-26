@@ -818,13 +818,13 @@ vp_create_fs_state(struct pipe_context *pipe,
    cso->fs_resident = -1;   /* no variant holds the FS device address yet */
 
    if (state->type == PIPE_SHADER_IR_NIR) {
-      /* A >1-RT fragment shader must merge in software — the FF OM unit
-       * is single-attachment. Force SW OM here so the compiled kernel calls the
-       * MRT fallback AND the draw path (fs_routing.sw_om) programs it to match. */
+      /* A >1-RT fragment shader can use the fixed-function merger -- it exports
+       * once per attachment -- but only when the depth/stencil stage cannot
+       * change state between those exports, and that is draw state. So the
+       * decision is left to the draw path, which folds it into the variant key
+       * the kernel is translated under. */
       cso->fs_num_color =
          vp_fs_num_color_outputs((struct nir_shader *)state->ir.nir);
-      if (cso->fs_num_color > 1)
-         cso->fs_routing.sw_om = true;
       /* A gather/texelFetch/shadow FS samples in software (NPOT-capable); flag it
        * sw_tex so the draw path keeps NPOT-textured draws on the device path
        * instead of dropping them to llvmpipe. */
@@ -3105,6 +3105,18 @@ vp_draw_vbo(struct pipe_context *pipe,
                routing.sw_om = true;
                break;
             }
+         }
+         /* A multi-attachment fragment is several exports, and each one re-runs
+          * the depth/stencil stage. That is only self-consistent while the stage
+          * cannot change state between them, so a depth- or stencil-WRITING MRT
+          * draw merges in software. Depth testing is fine: every export tests the
+          * same unchanged value. The device asserts this rather than trusting the
+          * driver, in both the RTL and the SimX model. */
+         if (fs->fs_num_color > 1 && vp->cur_dsa &&
+             (vp->cur_dsa->depth_write ||
+              vp->cur_dsa->stencil_writemask[0] ||
+              vp->cur_dsa->stencil_writemask[1])) {
+            routing.sw_om = true;
          }
          const struct vp_fs_variant_key key =
             vp_fs_key_make(&routing, vp->fb_samples, vp->fb_color_bgra_mask);

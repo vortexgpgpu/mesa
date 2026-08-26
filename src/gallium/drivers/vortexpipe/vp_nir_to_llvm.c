@@ -4678,16 +4678,20 @@ emit_vx_om_export(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef colour,
    LLVMBuildCall2(t->b, fnty, ia, a, 3, "");
 }
 
-/* Aperture address of one pixel:
- *   base + ((face << (xbits+ybits)) | (y << xbits) | x) << record_shift
- * xbits/ybits/record_shift are unpacked from the FS arg block (per-draw). */
+/* Aperture address of one pixel of one colour attachment:
+ *   base + ((((rt << 1) | face) << (xbits+ybits)) | (y << xbits) | x) << record_shift
+ * xbits/ybits/record_shift are unpacked from the FS arg block (per-draw). The
+ * attachment index sits ABOVE the cube face, so rt == 0 reproduces the
+ * single-attachment encoding bit for bit. */
 static LLVMValueRef
 emit_om_aperture_addr(struct vp_tr *t, LLVMValueRef xbits, LLVMValueRef ybits,
                       LLVMValueRef shift, LLVMValueRef x, LLVMValueRef y,
-                      LLVMValueRef face)
+                      LLVMValueRef face, LLVMValueRef rt)
 {
+   LLVMValueRef sel = LLVMBuildOr(t->b,
+      LLVMBuildShl(t->b, rt, LLVMConstInt(t->i32, 1, false), ""), face, "");
    LLVMValueRef idx = LLVMBuildOr(t->b,
-      LLVMBuildShl(t->b, face, LLVMBuildAdd(t->b, xbits, ybits, ""), ""),
+      LLVMBuildShl(t->b, sel, LLVMBuildAdd(t->b, xbits, ybits, ""), ""),
       LLVMBuildOr(t->b, LLVMBuildShl(t->b, y, xbits, ""), x, ""), "");
    return LLVMBuildAdd(t->b,
       LLVMConstInt(t->iptr, (uint32_t)VX_MEM_OM_BASE_ADDR, false),
@@ -5185,12 +5189,19 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
          LLVMValueRef a[7] = { omstate_ptr, cov, pxc, pyc, face, rgba, depth_i };
          LLVMBuildCall2(t->b, fty, ofn, a, 7, "");
       } else {
-         /* FF output-merger: export this pixel as a store into the OM aperture.
-          * An uncovered lane must be skipped -- there is no coverage mask
-          * downstream, and the ingress turns every aperture store into a
-          * fragment. The branch diverges across lanes; the thread mask handles
-          * it, and it is placed AFTER the shader body so a helper lane still
-          * runs the shader. */
+         /* FF output-merger: export this pixel as a store into the OM aperture,
+          * once per colour attachment. An uncovered lane must be skipped --
+          * there is no coverage mask downstream, and the ingress turns every
+          * aperture store into a fragment. The branch diverges across lanes; the
+          * thread mask handles it, and it is placed AFTER the shader body so a
+          * helper lane still runs the shader.
+          *
+          * Each export re-runs the depth/stencil stage, so several of them are
+          * only self-consistent while that stage cannot change state between
+          * them -- the draw path keeps a depth- or stencil-WRITING multi-
+          * attachment draw on the software merger, and both the RTL and the
+          * SimX model assert it rather than trusting that. num_color == 1
+          * unrolls to exactly the single-attachment export. */
          LLVMBasicBlockRef bb_do   = LLVMAppendBasicBlockInContext(t->ctx, fn, "om_do");
          LLVMBasicBlockRef bb_skip = LLVMAppendBasicBlockInContext(t->ctx, fn, "om_skip");
          LLVMBuildCondBr(t->b,
@@ -5199,10 +5210,13 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
             bb_do, bb_skip);
 
          LLVMPositionBuilderAtEnd(t->b, bb_do);
-         emit_vx_om_export(t,
-            emit_om_aperture_addr(t, t->om_ap_xbits, t->om_ap_ybits,
-                                  t->om_ap_shift, pxc, pyc, face),
-            rgba, depth_i);
+         for (unsigned rt = 0; rt < num_color && rt < GFX_OM_MAX_RT; rt++) {
+            emit_vx_om_export(t,
+               emit_om_aperture_addr(t, t->om_ap_xbits, t->om_ap_ybits,
+                                     t->om_ap_shift, pxc, pyc, face,
+                                     LLVMConstInt(t->i32, rt, false)),
+               rgba_rt[rt], depth_i);
+         }
          LLVMBuildBr(t->b, bb_skip);
 
          LLVMPositionBuilderAtEnd(t->b, bb_skip);
