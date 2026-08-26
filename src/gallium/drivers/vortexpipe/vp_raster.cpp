@@ -797,10 +797,7 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
             | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u)
             | (tex_pot ? 0u : GFX_SW_TEX_FILTER_NPOT)
             | (texstate.format > (uint32_t)VX_TEX_FORMAT_FF_MAX
-                  ? GFX_SW_TEX_FILTER_EXT_FORMAT : 0u)
-            | ((tex->wrap_u == VX_TEX_WRAP_BORDER ||
-                tex->wrap_v == VX_TEX_WRAP_BORDER)
-                  ? GFX_SW_TEX_FILTER_BORDER : 0u);
+                  ? GFX_SW_TEX_FILTER_EXT_FORMAT : 0u);
          texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
          texstate.border = tex->border;
          /* Carry the mip-0 integer dims so the SW sampler can address NPOT
@@ -1375,6 +1372,12 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
          DCRW(VX_DCR_TEX_FORMAT,       VX_TEX_FORMAT_A8R8G8B8);
          DCRW(VX_DCR_TEX_FILTER,       tex->filter);
          DCRW(VX_DCR_TEX_WRAP,         (tex->wrap_v << 16) | tex->wrap_u);
+         /* The colour a tap outside [0,1) resolves to under WRAP_BORDER. The
+          * unit substitutes it after the format decode, so it is already in the
+          * decoded ARGB8888 the blend works in. Written unconditionally: it is
+          * read only for a border wrap, and a stale value under any other wrap
+          * would be a state leak between draws. */
+         DCRW(VX_DCR_TEX_BORDER,       tex->border);
          DCRW(VX_DCR_TEX_ADDR,         (uint32_t)(tex_dev / 64));
          /* Per-LOD mip byte offsets: the TEX unit indexes mipoff[selected lod]
           * (VX_tex_core) to reach that level's texels within the resident base. */

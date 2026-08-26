@@ -937,10 +937,11 @@ vp_vx_wrap(unsigned w)
    }
 }
 
-/* The sampler's border colour as the ARGB8888 word the software sampler
- * substitutes for an out-of-range tap. Only the standard transparent/opaque
- * black and opaque white are expressible exactly; a custom colour quantizes to
- * eight bits per channel. */
+/* The sampler's border colour as the ARGB8888 word substituted for an
+ * out-of-range tap. The same word serves both samplers: the texture unit
+ * substitutes after its format decode, where a texel is already ARGB8888. Only
+ * the standard transparent/opaque black and opaque white are expressible
+ * exactly; a custom colour quantizes to eight bits per channel. */
 static uint32_t
 vp_vx_border(const struct pipe_sampler_state *s)
 {

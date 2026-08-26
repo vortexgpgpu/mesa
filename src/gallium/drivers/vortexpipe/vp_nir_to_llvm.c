@@ -4175,17 +4175,20 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    }
 
    /* Route to the SW sampler when the sampler is mipmapped, the texture is NPOT (the
-    * FF vx_tex4 unit is POT-only), its format is above the FF set (the FF unit has
-    * no decoder or texel stride for it), or it wraps to a border colour (the FF unit
-    * carries no border colour, so it cannot produce one); otherwise the fast HW
-    * path. All are uniform descriptor bits, so the branch never diverges (derivatives
-    * safe). A float format always sets the extended-format bit, so the HW unit never
-    * sees a wide texel. */
+    * FF vx_tex4 unit is POT-only), or its format is above the FF set (the FF unit has
+    * no decoder or texel stride for it); otherwise the fast HW path. All are uniform
+    * descriptor bits, so the branch never diverges (derivatives safe). A float format
+    * always sets the extended-format bit, so the HW unit never sees a wide texel.
+    *
+    * A border wrap is NOT among them: the unit carries a border colour of its own
+    * and substitutes the taps that leave the texture. A mipmapped border sampler
+    * still lands in software, on the mip bit -- which is the one border combination
+    * the unit has no test for. */
    LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
       LLVMBuildAnd(t->b, emit_tex_filter_word(t),
          LLVMConstInt(t->i32,
             GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
-            GFX_SW_TEX_FILTER_EXT_FORMAT | GFX_SW_TEX_FILTER_BORDER, false), ""),
+            GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
       LLVMConstInt(t->i32, 0, false), "tex_use_sw");
    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
    LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_sw");
