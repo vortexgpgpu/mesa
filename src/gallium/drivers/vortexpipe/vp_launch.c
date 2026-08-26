@@ -966,9 +966,8 @@ done:
    return ok;
 }
 
-/* attribute-table entry the VS kernel reads: { device base, stride }.
- * The table is indexed by VS input driver_location. */
-#define VP_ATTR_ENTRY_BYTES 8
+/* How many VS input driver_locations the attribute table covers. The entry
+ * layout itself is VP_ATTR_ENTRY_WORDS, shared with the fetch lowering. */
 #define VP_ATTR_TABLE_LOCS  8
 
 bool
