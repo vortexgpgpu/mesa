@@ -847,6 +847,22 @@ vp_store_mem_val(struct vp_tr *t, unsigned bits, LLVMValueRef v) {
 static LLVMValueRef emit_quad_deriv(struct vp_tr *t, LLVMValueRef value,
                                     unsigned dir);
 
+/* An identity the optimizer cannot see through: an empty asm whose output is
+ * tied to its input, so it costs no instruction and yields a value with no
+ * known provenance. */
+static LLVMValueRef
+emit_opaque(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef ty = LLVMTypeOf(v);
+   LLVMTypeRef args[1] = { ty };
+   LLVMTypeRef fnty = LLVMFunctionType(ty, args, 1, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, "", 0, "=r,0", 4,
+                                      /*HasSideEffects*/ false, false,
+                                      LLVMInlineAsmDialectATT, false);
+   LLVMValueRef a[1] = { v };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "opaque");
+}
+
 /* The address a store should actually use. A discarded fragment invocation keeps
  * running so its quad neighbours can still shuffle from it, but it may not commit
  * side effects -- so its stores are steered into a dead per-thread word instead.
@@ -5581,7 +5597,13 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    if (t.is_fs) {
       LLVMValueRef sink = LLVMBuildAlloca(t.b, LLVMArrayType(t.i32, 8),
                                           "discard_sink");
-      t.fs_sink = LLVMBuildPtrToInt(t.b, sink, t.iptr, "");
+      /* Blinded: the sink is never read, so an optimizer that can still see the
+       * alloca proves a store to it dead and rewrites the branchless address
+       * select into a conditional store. That branch tests a per-lane predicate,
+       * and the warp takes or skips it as one -- so a single suppressed lane
+       * suppresses its neighbours' stores too. The address has to stay an
+       * address for the store to remain unconditional. */
+      t.fs_sink = emit_opaque(&t, LLVMBuildPtrToInt(t.b, sink, t.iptr, ""));
    }
 
    /* Vertex-shader prologue: assign output slots, then read the
