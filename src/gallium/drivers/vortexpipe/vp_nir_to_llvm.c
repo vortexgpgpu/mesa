@@ -4658,7 +4658,12 @@ emit_vx_om_export(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef colour,
                   LLVMValueRef depth)
 {
    const char *s = ".insn r4 43, 3, 3, x0, $0, $1, $2";
-   LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
+   /* The address is pointer-wide: the LSU decodes the aperture by comparing the
+    * whole address against the aperture range, and rv64 holds a 32-bit value in
+    * a register SIGN-extended -- so an i32 base of 0xE0000000 would arrive as
+    * 0xffffffff_e0000000 and match nothing. Colour and depth are payload and
+    * stay 32-bit. */
+   LLVMTypeRef args[3] = { t->iptr, t->i32, t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
                                        args, 3, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,r,r", 6,
@@ -4682,8 +4687,8 @@ emit_om_aperture_addr(struct vp_tr *t, LLVMValueRef xbits, LLVMValueRef ybits,
       LLVMBuildShl(t->b, face, LLVMBuildAdd(t->b, xbits, ybits, ""), ""),
       LLVMBuildOr(t->b, LLVMBuildShl(t->b, y, xbits, ""), x, ""), "");
    return LLVMBuildAdd(t->b,
-      LLVMConstInt(t->i32, (uint32_t)VX_MEM_OM_BASE_ADDR, false),
-      LLVMBuildShl(t->b, idx, shift, ""), "");
+      LLVMConstInt(t->iptr, (uint32_t)VX_MEM_OM_BASE_ADDR, false),
+      vp_to_iptr(t, LLVMBuildShl(t->b, idx, shift, "")), "");
 }
 
 /* reinterpret a raw fixed-point i32 as float: (float)raw / 2^frac */
