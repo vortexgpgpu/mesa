@@ -2962,22 +2962,6 @@ vp_draw_vbo(struct pipe_context *pipe,
       if (vp->fb_samples != 1 && vp->fb_samples != 4)
          goto llvmpipe;
 
-      /* A multisample colour attachment the application can also sample from.
-       * The device serves a multisample pass only through the pass-end resolve:
-       * the per-sample plane is resident, and the single-sample result is what
-       * reaches the attachment. An application that samples the attachment
-       * itself -- as a sampler2DMS, the only way it can observe one -- wants the
-       * samples that were never written back, and by the time that is noticed,
-       * after the pass, there is nowhere left to put them. Writing them back
-       * would need a transfer carrying a sample index, which the read path does
-       * not have. So stand aside up front, the way an unsupported sample count
-       * just did, rather than hand back the clear. */
-      if (vp->fb_samples > 1) {
-         for (unsigned i = 0; i < vp->fb_nr_cbufs; i++)
-            if (vp->fb_cbufs[i] && (vp->fb_cbufs[i]->bind & PIPE_BIND_SAMPLER_VIEW))
-               goto llvmpipe;
-      }
-
       /* State that governs this draw but lives in llvmpipe: an open query it
        * counts as it rasterizes, or a conditional-rendering predicate it tests
        * before drawing at all. A draw on the device reaches neither, so the
