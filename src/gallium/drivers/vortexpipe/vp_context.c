@@ -1013,38 +1013,40 @@ vp_create_texture_handle(struct pipe_context *pipe,
        * descriptor (lp_jit_texture.base) back to the resource — the per-draw
        * selection that lets >1 bound texture disambiguate. Dedup by resource. */
       struct pipe_resource *res = view->texture;
-      bool known = false;
-      for (unsigned i = 0; i < vp->txh_count; i++)
-         if (vp->txh_res[i] == res) { known = true; break; }
-      if (!known && vp->txh_count < VP_MAX_TEX_HANDLES) {
-         struct pipe_transfer *xfer = NULL;
-         const void *base = pipe_texture_map(pipe, res, 0, 0, PIPE_MAP_READ,
-                                             0, 0, res->width0, res->height0, &xfer);
-         if (base) {
-            /* A destroyed resource leaves its entry behind, and a later
-             * allocation can reuse its storage address. The stale entry would
-             * then win the per-draw match and resolve every property -- target,
-             * layer count, the resource itself -- from the wrong texture, so
-             * this capture supersedes it. */
-            for (unsigned i = 0; i < vp->txh_count; ) {
-               if (vp->txh_base[i] == base) {
-                  vp->txh_count--;
-                  vp->txh_base[i]   = vp->txh_base[vp->txh_count];
-                  vp->txh_res[i]    = vp->txh_res[vp->txh_count];
-                  vp->txh_target[i] = vp->txh_target[vp->txh_count];
-                  vp->txh_layers[i] = vp->txh_layers[vp->txh_count];
-               } else {
-                  i++;
-               }
+      struct pipe_transfer *xfer = NULL;
+      const void *base = pipe_texture_map(pipe, res, 0, 0, PIPE_MAP_READ,
+                                          0, 0, res->width0, res->height0, &xfer);
+      if (base) {
+         /* Drop every entry this capture supersedes before adding it. Both keys
+          * are recycled by the allocator: a destroyed texture hands its resource
+          * pointer AND its storage address to the next one, so an entry matching
+          * either may describe a texture that no longer exists. Keeping such an
+          * entry lets it win the per-draw match and answer with the wrong
+          * target and layer count -- which is a 2D array reporting one layer to
+          * textureSize once some earlier texture has been destroyed. Matching on
+          * the resource alone and skipping the capture is what let that stand:
+          * the properties below come from the VIEW, and a recycled pointer says
+          * nothing about which view is bound now. */
+         for (unsigned i = 0; i < vp->txh_count; ) {
+            if (vp->txh_res[i] == res || vp->txh_base[i] == base) {
+               vp->txh_count--;
+               vp->txh_base[i]   = vp->txh_base[vp->txh_count];
+               vp->txh_res[i]    = vp->txh_res[vp->txh_count];
+               vp->txh_target[i] = vp->txh_target[vp->txh_count];
+               vp->txh_layers[i] = vp->txh_layers[vp->txh_count];
+            } else {
+               i++;
             }
+         }
+         if (vp->txh_count < VP_MAX_TEX_HANDLES) {
             vp->txh_base[vp->txh_count]   = base;
             vp->txh_res[vp->txh_count]    = res;
             vp->txh_target[vp->txh_count] = view->target;
             vp->txh_layers[vp->txh_count] =
                view->u.tex.last_layer - view->u.tex.first_layer + 1u;
             vp->txh_count++;
-            pipe_texture_unmap(pipe, xfer);
          }
+         pipe_texture_unmap(pipe, xfer);
       }
    }
    if (state) {
