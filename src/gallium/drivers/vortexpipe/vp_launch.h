@@ -87,6 +87,9 @@ struct vp_vertex_input {
    uint32_t    attr_buf[8];      /* which buf_data[] this attribute fetches from */
    uint32_t    attr_offset[8];   /* byte offset of the attribute in its buffer */
    uint32_t    attr_stride[8];   /* bytes between consecutive vertices */
+   /* 0 = per-vertex; otherwise the attribute advances once every `divisor`
+    * instances (VK_EXT_vertex_attribute_divisor). */
+   uint32_t    attr_divisor[8];
 };
 
 /* Run a compiled Vortex vertex-shader kernel (.vxbin) on `dev`. One

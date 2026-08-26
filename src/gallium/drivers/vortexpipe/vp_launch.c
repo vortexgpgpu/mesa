@@ -1097,13 +1097,14 @@ vp_launch_vs(struct pipe_screen *screen, vx_device_h dev,
    /* Vertex buffer + attribute table: upload the interleaved vertex
     * buffer, then a table indexed by driver_location holding the
     * device base address + stride of each attribute. The VS kernel
-    * fetches input `loc` of vertex `vid` at table[loc].base +
-    * vid*table[loc].stride.
+    * fetches input `loc` at table[loc].base + index*table[loc].stride, the
+    * index taken from the vertex or, for a non-zero divisor, from
+    * instance/divisor.
     *
     * `table` is declared at function scope: vx_enqueue_write is
     * asynchronous (the source is read at vx_queue_finish), so it must
     * outlive the `if` block -- the same lifetime rule as argblk. */
-   uint32_t table[VP_ATTR_TABLE_LOCS * 2] = { 0 };
+   uint32_t table[VP_ATTR_TABLE_LOCS * VP_ATTR_ENTRY_WORDS] = { 0 };
    if (vin && vin->num_attrs) {
       /* Upload each distinct vertex-buffer resource once; an attribute points at
        * its own buffer's device base + its byte offset. */
@@ -1130,9 +1131,10 @@ vp_launch_vs(struct pipe_screen *screen, vx_device_h dev,
          uint32_t loc = vin->attr_loc[i];
          if (loc >= VP_ATTR_TABLE_LOCS)
             continue;
-         table[loc * 2 + 0] = (uint32_t)buf_dev[vin->attr_buf[i]]
-                            + vin->attr_offset[i];
-         table[loc * 2 + 1] = vin->attr_stride[i];
+         uint32_t *e = &table[loc * VP_ATTR_ENTRY_WORDS];
+         e[0] = (uint32_t)buf_dev[vin->attr_buf[i]] + vin->attr_offset[i];
+         e[1] = vin->attr_stride[i];
+         e[2] = vin->attr_divisor[i];
       }
       VP_CHECK(vx_buffer_create(dev, sizeof(table), 0, &tbuf),
                "vx_buffer_create(attrtab)");

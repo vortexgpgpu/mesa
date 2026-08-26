@@ -1654,6 +1654,53 @@ vp_dev_upload(vx_device_h dev, const void *src, size_t bytes,
 
 /* Copy the resident colour buffer back to the framebuffer's colour resource so
  * the host / a present / an llvmpipe read observes the rendered result. */
+/* Carry a multisample pass out when it ends without a resolve.
+ *
+ * The resident plane holds the samples interleaved within a row -- pixel i's
+ * samples are adjacent -- while llvmpipe holds a multisample resource as one
+ * whole-image plane per sample, `sample_stride` apart. A 2D transfer cannot
+ * express the second, which is why the ordinary path cannot do this: it has one
+ * destination per pixel and needs one per sample. Writing the planes directly
+ * is that missing sample index.
+ *
+ * A pass ending without a resolve is an application reading the attachment it
+ * rendered into (sampling it as a sampler2DMS), so leaving the clear hands it a
+ * blank image. Returns false if the resource's host range is unavailable, and
+ * the caller reports that rather than pretending the colour arrived. */
+static bool
+vp_fb_sync_out_multisample(struct vp_context *vp)
+{
+   const struct llvmpipe_resource *lpr = llvmpipe_resource_const(vp->rfb_res);
+   if (!llvmpipe_resource_is_texture(vp->rfb_res) || !lpr->tex_data ||
+       !lpr->sample_stride || vp->rfb_bpp != 4) {
+      return false;
+   }
+
+   const uint32_t w = vp->rfb_w, h = vp->rfb_h, ns = vp->rfb_s;
+   const size_t   words = (size_t)w * h * ns;
+   uint32_t      *src   = (uint32_t *)malloc(words * 4);
+   if (!src) {
+      return false;
+   }
+   bool ok = vp_buffer_readback(vp->dev, vp->rcb, src, (uint32_t)(words * 4));
+   if (ok) {
+      uint8_t *base = (uint8_t *)lpr->tex_data
+                    + (size_t)vp->rfb_layer * lpr->img_stride[0];
+      for (uint32_t sample = 0; sample < ns; sample++) {
+         uint8_t *plane = base + (size_t)sample * lpr->sample_stride;
+         for (uint32_t y = 0; y < h; y++) {
+            uint32_t *dst = (uint32_t *)(plane + (size_t)y * lpr->row_stride[0]);
+            const uint32_t *row = src + (size_t)y * w * ns;
+            for (uint32_t x = 0; x < w; x++) {
+               dst[x] = row[(size_t)x * ns + sample];
+            }
+         }
+      }
+   }
+   free(src);
+   return ok;
+}
+
 static void
 vp_fb_sync_out(struct pipe_context *pipe, struct vp_context *vp)
 {
@@ -1669,9 +1716,10 @@ vp_fb_sync_out(struct pipe_context *pipe, struct vp_context *vp)
     * with no explanation. Carrying such a pass out needs the samples written
     * back to the multisample resource, which a 2D transfer cannot do. */
    if (vp->rfb_s > 1) {
-      if (!vp->rfb_resolved) {
-         mesa_loge("vortexpipe: a %ux multisample pass ended without a resolve; "
-                   "its colour cannot reach the attachment and the attachment "
+      if (!vp->rfb_resolved &&
+          !vp_fb_sync_out_multisample(vp)) {
+         mesa_loge("vortexpipe: a %ux multisample pass ended without a resolve "
+                   "and its colour could not be written back; the attachment "
                    "keeps its clear", vp->rfb_s);
       }
       vp->rfb_dirty = false;
@@ -2464,6 +2512,7 @@ vp_create_rasterizer_state(struct pipe_context *pipe,
    if (cso) {
       cso->cull_face = s->cull_face;
       cso->front_ccw = s->front_ccw;
+      cso->scissor   = s->scissor;
       vp_reg_put(lp_cso, cso);
    }
    return lp_cso;
@@ -2533,6 +2582,30 @@ vp_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
              vp->vp_scale_x, vp->vp_scale_y, vp->vp_trans_x, vp->vp_trans_y);
    }
    vp->lp_set_viewport_states(pipe, start_slot, num_viewports, vps);
+}
+
+/* The app's scissor rect. The device already bounds its coverage walk by the
+ * viewport's screen rect, but Vulkan lets a draw bind a scissor strictly
+ * inside that viewport and every fragment outside it must be discarded, so the
+ * two rectangles are intersected at draw time. Gallium hands the rect over
+ * already in window space with a non-zero origin, which is the case an
+ * extent-only encoding gets wrong. */
+static void
+vp_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
+                      unsigned num_scissors,
+                      const struct pipe_scissor_state *scs)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   if (scs && start_slot == 0 && num_scissors >= 1) {
+      vp->sc_minx  = scs[0].minx;
+      vp->sc_miny  = scs[0].miny;
+      vp->sc_maxx  = scs[0].maxx;
+      vp->sc_maxy  = scs[0].maxy;
+      vp->sc_valid = true;
+      vp_dbg("vortexpipe: scissor [%u,%u)x[%u,%u)",
+             vp->sc_minx, vp->sc_maxx, vp->sc_miny, vp->sc_maxy);
+   }
+   vp->lp_set_scissor_states(pipe, start_slot, num_scissors, scs);
 }
 
 /* Translate the bound Gallium rasterizer state to the device SETUP_CULL_*
@@ -2697,6 +2770,12 @@ vp_gather_vertex_input(struct pipe_context *pipe, struct vp_context *vp,
       vin->attr_offset[i] = vp->vbufs[bi].buffer_offset + ve->src_offset[i]
                           + (indexed ? 0u : draws[0].start * ve->src_stride[i]);
       vin->attr_stride[i] = ve->src_stride[i];
+      /* An instance-rate attribute ignores draws[0].start entirely -- it is
+       * indexed by instance, not by draw position -- so the per-vertex start
+       * fold above must not apply to it. */
+      vin->attr_divisor[i] = ve->instance_divisor[i];
+      if (vin->attr_divisor[i])
+         vin->attr_offset[i] = vp->vbufs[bi].buffer_offset + ve->src_offset[i];
    }
 
    /* Map each distinct resource; unmap what we mapped if any map fails. */
@@ -2822,33 +2901,63 @@ vp_gather_topology_u32(struct pipe_context *pipe, struct vp_context *vp,
       return false;
    }
 
+   /* Primitive restart cuts the strip or fan at a reserved index value and
+    * begins a new one at the next position: the two runs must share no
+    * triangle. Walking positions rather than triangles is what makes that
+    * expressible -- a run shorter than three vertices contributes nothing, and
+    * both the strip's alternating winding and the fan's hub are relative to
+    * the run, not to the draw. Without restart there is exactly one run and
+    * this reduces to the original walk. */
+   const bool restart = info->primitive_restart && indexed;
+   const uint32_t restart_index = info->index_size == 4
+                                ? info->restart_index
+                                : (info->restart_index & 0xffffu);
+   #define VP_RAW_INDEX(pos)                                                   \
+      (info->index_size == 4 ? ((const uint32_t *)isrc)[pos]                   \
+                             : (uint32_t)((const uint16_t *)isrc)[pos])
+
    uint32_t w = 0;
-   if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
-      for (unsigned i = 0; i < tris; i++) {
-         /* alternate winding so every triangle keeps the strip's facing */
-         if (i & 1u) {
-            u32[w++] = VP_SRC_VERT(i + 1);
-            u32[w++] = VP_SRC_VERT(i);
-            u32[w++] = VP_SRC_VERT(i + 2);
-         } else {
-            u32[w++] = VP_SRC_VERT(i);
-            u32[w++] = VP_SRC_VERT(i + 1);
-            u32[w++] = VP_SRC_VERT(i + 2);
-         }
+   unsigned run = 0;              /* first position of the current run */
+   for (unsigned pos = 0; pos < count; pos++) {
+      if (restart && VP_RAW_INDEX(pos) == restart_index) {
+         run = pos + 1;
+         continue;
       }
-   } else { /* MESA_PRIM_TRIANGLE_FAN */
-      for (unsigned i = 0; i < tris; i++) {
-         u32[w++] = VP_SRC_VERT(0);
-         u32[w++] = VP_SRC_VERT(i + 1);
-         u32[w++] = VP_SRC_VERT(i + 2);
+      const unsigned in_run = pos - run;   /* 0-based position within the run */
+      if (in_run < 2) {
+         continue;
+      }
+      if (info->mode == MESA_PRIM_TRIANGLE_STRIP) {
+         /* alternate winding so every triangle keeps the strip's facing */
+         if (in_run & 1u) {
+            u32[w++] = VP_SRC_VERT(pos - 1);
+            u32[w++] = VP_SRC_VERT(pos - 2);
+            u32[w++] = VP_SRC_VERT(pos);
+         } else {
+            u32[w++] = VP_SRC_VERT(pos - 2);
+            u32[w++] = VP_SRC_VERT(pos - 1);
+            u32[w++] = VP_SRC_VERT(pos);
+         }
+      } else { /* MESA_PRIM_TRIANGLE_FAN */
+         u32[w++] = VP_SRC_VERT(run);
+         u32[w++] = VP_SRC_VERT(pos - 1);
+         u32[w++] = VP_SRC_VERT(pos);
       }
    }
+   #undef VP_RAW_INDEX
    #undef VP_SRC_VERT
 
-   bool ok = vp_dev_upload(vp->dev, u32, (size_t)tris * 3u * 4u, out_buf, out_dev);
+   if (w == 0) {
+      free(u32);
+      if (xfer) pipe_buffer_unmap(pipe, xfer);
+      *out_tris = 0;
+      return false;
+   }
+
+   bool ok = vp_dev_upload(vp->dev, u32, (size_t)w * 4u, out_buf, out_dev);
    free(u32);
    if (xfer) pipe_buffer_unmap(pipe, xfer);
-   if (ok) *out_tris = tris;
+   if (ok) *out_tris = w / 3u;
    return ok;
 }
 
@@ -2921,22 +3030,21 @@ vp_draw_vbo(struct pipe_context *pipe,
     * end. Lines/points still fall back to llvmpipe (SW-raster work). */
    bool tristrip = info->mode == MESA_PRIM_TRIANGLE_STRIP ||
                    info->mode == MESA_PRIM_TRIANGLE_FAN;
+   /* Primitive restart is resolved in that same translation -- the cut lands in
+    * the index list the front end consumes, so the device never sees a restart
+    * index. A restart on a list topology has no strip to cut and stays with
+    * llvmpipe. */
+   bool restart_ok = !info->primitive_restart || (tristrip && indexed);
    /* Instancing: a multi-instance draw runs on the device (the VS resolves
     * gl_InstanceIndex and the whole pipeline runs over instance_count ×
-    * verts-per-instance vertices). Instance-RATE vertex attributes (a non-zero
-    * divisor) are not fetched on device yet, so a draw that binds one falls back
-    * to llvmpipe. Single-instance draws never inspect the divisor (fast path). */
-   bool instance_rate_attr = false;
-   if (info->instance_count > 1 && vp->cur_velems) {
-      for (unsigned i = 0; i < vp->cur_velems->num; i++)
-         if (vp->cur_velems->instance_divisor[i] != 0) { instance_rate_attr = true; break; }
-   }
+    * verts-per-instance vertices). Instance-RATE attributes ride the same path:
+    * the divisor travels in the attribute table and the VS indexes by
+    * instance/divisor. */
    bool simple =
       vp->dev && vs && vs->vxbin && vs->vs_layout.stride &&
       !indirect && num_draws == 1 &&
       (info->index_size == 0 || indexed) &&
-      !info->primitive_restart && info->instance_count >= 1 &&
-      !instance_rate_attr &&
+      restart_ok && info->instance_count >= 1 &&
       (info->mode == MESA_PRIM_TRIANGLES || tristrip) &&
       draws[0].count > 0;
 
@@ -3085,6 +3193,12 @@ vp_draw_vbo(struct pipe_context *pipe,
          vp_sy = vp->vp_scale_y; vp_ty = vp->vp_trans_y;
          vp_min_z = vp->vp_min_z; vp_max_z = vp->vp_max_z;
       }
+
+      /* The scissor is a second rectangle the coverage walk must respect, and
+       * it only applies when the bound rasterizer state asks for it. */
+      struct vp_scissor_rect sc_rect = { vp->sc_minx, vp->sc_miny,
+                                         vp->sc_maxx, vp->sc_maxy };
+      bool sc_used = vp->sc_valid && vp->cur_rast && vp->cur_rast->scissor;
 
       bool hw_path = vin_ok && !sw_raster && gfx_hw && fsv && vp->fb_color_ok &&
                      vp->fb_color && vp->fb_width && vp->fb_height;
@@ -3413,6 +3527,7 @@ vp_draw_vbo(struct pipe_context *pipe,
                                      fs_sw_raster,
                                      vp_sx, vp_tx, vp_sy, vp_ty,
                                      vp_min_z, vp_max_z,
+                                     sc_used ? &sc_rect : NULL,
                                      &fs_consts, &vs_consts,
                                      use_mrt ? &mrt : NULL);
                if (!drew || !vmask) {
@@ -3811,6 +3926,7 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_bind_rasterizer_state   = pipe->bind_rasterizer_state;
    vp->lp_delete_rasterizer_state = pipe->delete_rasterizer_state;
    vp->lp_set_viewport_states  = pipe->set_viewport_states;
+   vp->lp_set_scissor_states   = pipe->set_scissor_states;
    vp->lp_create_texture_handle = pipe->create_texture_handle;
    vp->lp_create_vertex_elements_state = pipe->create_vertex_elements_state;
    vp->lp_bind_vertex_elements_state   = pipe->bind_vertex_elements_state;
@@ -3872,6 +3988,7 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->bind_rasterizer_state   = vp_bind_rasterizer_state;
    pipe->delete_rasterizer_state = vp_delete_rasterizer_state;
    pipe->set_viewport_states   = vp_set_viewport_states;
+   pipe->set_scissor_states    = vp_set_scissor_states;
    pipe->create_texture_handle = vp_create_texture_handle;
    pipe->create_vertex_elements_state = vp_create_vertex_elements_state;
    pipe->bind_vertex_elements_state   = vp_bind_vertex_elements_state;

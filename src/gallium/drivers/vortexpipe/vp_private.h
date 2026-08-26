@@ -289,11 +289,13 @@ struct vp_blend_cso {
 /* Captured rasterizer state: the face-cull inputs the device front end
  * needs. cull_face is the Gallium PIPE_FACE_* mask and front_ccw the
  * front-face winding; vp_draw_vbo turns the pair into the device
- * SETUP_CULL_* mode (see vp_cull_mode). Only these two fields are used —
- * everything else in pipe_rasterizer_state stays with llvmpipe. */
+ * SETUP_CULL_* mode (see vp_cull_mode), and whether the bound scissor rect
+ * applies at all — everything else in pipe_rasterizer_state stays with
+ * llvmpipe. */
 struct vp_rast_cso {
    unsigned cull_face;         /* PIPE_FACE_{NONE,FRONT,BACK,FRONT_AND_BACK} */
    bool     front_ccw;         /* front face is counter-clockwise */
+   bool     scissor;           /* clip to the bound scissor rect */
 };
 
 /* Captured texture-sampler state, VX TEX-encoded. lavapipe
@@ -600,6 +602,16 @@ struct vp_context {
    float vp_min_z, vp_max_z;   /* depth range (VkViewport minDepth..maxDepth) */
    void  (*lp_set_viewport_states)(struct pipe_context *, unsigned, unsigned,
                                    const struct pipe_viewport_state *);
+   /* Scissor rect captured from the app's bound VkScissor. The device bounds
+    * its coverage walk by the viewport's screen rect, which is not the same
+    * rectangle: Vulkan lets a draw scissor strictly inside its viewport, and
+    * without this that rect never reaches the device and a scissored draw
+    * paints the whole viewport. Only slot 0 is tracked (gfx-v1 is
+    * single-viewport); sc_valid is false until the app sets one. */
+   bool     sc_valid;
+   unsigned sc_minx, sc_miny, sc_maxx, sc_maxy;
+   void  (*lp_set_scissor_states)(struct pipe_context *, unsigned, unsigned,
+                                  const struct pipe_scissor_state *);
    /* Texture + sampler, captured from create_texture_handle.
     * lavapipe routes an image view (texture, state==NULL) and a
     * sampler (state, view==NULL) through that one entry point; gfx-v1

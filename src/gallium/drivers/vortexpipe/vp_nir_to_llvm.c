@@ -108,6 +108,16 @@
 #define VP_RAST_ATTR_W3     168
 #define VP_RAST_ATTR_W4     180
 #define VP_RAST_ATTR_W5     192
+/* The two per-primitive scalars that sit after the planes (rast_prim_t): the
+ * winding EdgeEquation flipped away, which is gl_FrontFacing, and the factor
+ * the rhw plane was premultiplied by, which gl_FragCoord.w must undo. */
+/* i32 words of the fragment-shader input record: four 16-byte slots for the
+ * declared inputs, plus one for the system values that have no variable of
+ * their own (gl_FrontFacing). */
+#define VP_FS_IN_WORDS 20
+
+#define VP_RAST_PRIM_FACING    204
+#define VP_RAST_PRIM_RHW_SCALE 208
 
 /* Scalar planes available to carry varyings: [u,v,r,g,b,a] plus w0..w5. The
  * VS packs into them in declaration order and the FS reads back the same way,
@@ -215,6 +225,14 @@ struct vp_tr {
    unsigned       fs_num_color;
    unsigned       fs_out_words;  /* i32 words in the FS output area (incl. scratch) */
    int            fs_depth_off;  /* byte offset of gl_FragDepth's slot; -1 if unwritten */
+   /* gl_FragCoord is declared as a shader input and so owns a slot in the input
+    * record, but it is a system value: the wrapper synthesises it rather than
+    * interpolating a plane. -1 when the shader does not read it. */
+   int            fs_pos_off;
+   /* gl_FrontFacing arrives as an intrinsic, not a variable, so it has no slot
+    * of its own. One is reserved past the declared inputs and filled by the
+    * wrapper, which is where the primitive record is in scope. */
+   unsigned       fs_sysval_off;
    bool           ok;
 };
 
@@ -682,22 +700,37 @@ emit_vx_barrier(struct vp_tr *t)
 
 /* VS vertex-input fetch: the device address of attribute `loc` for the
  * current vertex. The attribute table (arg slot 1) holds, per VS input
- * driver_location, a { device base, stride } pair; the attribute lives
- * at base + vid*stride (vp_launch_vs builds the table). base/stride
- * are i32 fields on the wire even on rv64 (the table layout is the
- * same), so widen base to iptr before address arithmetic. */
+ * driver_location, a { base, stride, divisor } entry; the attribute lives at
+ * base + index*stride (vp_launch_vs builds the table). The index is the vertex
+ * id, or for a non-zero divisor the instance id divided by it, so an
+ * instance-rate attribute advances once every `divisor` instances rather than
+ * once per instance. The fields are i32 on the wire even on rv64 (the table
+ * layout is the same), so widen base to iptr before address arithmetic. */
 static LLVMValueRef
 emit_vs_attr_addr(struct vp_tr *t, unsigned loc)
 {
    LLVMValueRef ent = LLVMBuildAdd(t->b, t->attr_table,
-      vp_iptr_const(t, loc * 8u), "");
+      vp_iptr_const(t, loc * VP_ATTR_ENTRY_BYTES), "");
    LLVMValueRef base = LLVMBuildLoad2(t->b, t->i32,
       LLVMBuildIntToPtr(t->b, ent, t->ptr, ""), "attrbase");
    LLVMValueRef stride = LLVMBuildLoad2(t->b, t->i32,
       LLVMBuildIntToPtr(t->b,
          LLVMBuildAdd(t->b, ent, vp_iptr_const(t, 4), ""),
          t->ptr, ""), "attrstride");
-   LLVMValueRef offset = LLVMBuildMul(t->b, t->vid, stride, "");
+   LLVMValueRef divisor = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildIntToPtr(t->b,
+         LLVMBuildAdd(t->b, ent, vp_iptr_const(t, 8), ""),
+         t->ptr, ""), "attrdiv");
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef per_vertex = LLVMBuildICmp(t->b, LLVMIntEQ, divisor, zero, "");
+   /* The divide is guarded to 1 on the per-vertex path: it is dead there, but
+    * a udiv by the zero that marks that path is poison, not an ignored value. */
+   LLVMValueRef safe_div = LLVMBuildSelect(t->b, per_vertex,
+      LLVMConstInt(t->i32, 1, false), divisor, "");
+   LLVMValueRef inst = t->instance ? t->instance : zero;
+   LLVMValueRef index = LLVMBuildSelect(t->b, per_vertex, t->vid,
+      LLVMBuildUDiv(t->b, inst, safe_div, ""), "attridx");
+   LLVMValueRef offset = LLVMBuildMul(t->b, index, stride, "");
    return LLVMBuildAdd(t->b, vp_to_iptr(t, base),
                               vp_to_iptr(t, offset), "vsin");
 }
@@ -846,6 +879,9 @@ vp_store_mem_val(struct vp_tr *t, unsigned bits, LLVMValueRef v) {
 /* quad-derivative helper (defined with the other Vortex intrinsics, below). */
 static LLVMValueRef emit_quad_deriv(struct vp_tr *t, LLVMValueRef value,
                                     unsigned dir);
+
+/* i32 load from an iptr address (defined with the fragment wrapper, below). */
+static LLVMValueRef emit_load_i32(struct vp_tr *t, LLVMValueRef addr);
 
 /* An identity the optimizer cannot see through: an empty asm whose output is
  * tied to its input, so it costs no instruction and yields a value with no
@@ -1673,6 +1709,16 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
     * load_instance_id + load_base_instance; the VS prologue resolves the
     * 0-based instance id and the base-instance from arg slots 3/4. On the
     * non-instanced fast path instance == 0 and first_instance == 0. */
+   /* gl_FrontFacing: the wrapper resolved the primitive's winding into the
+    * reserved system-value slot, because the primitive record is in scope there
+    * and not here. NIR wants a 1-bit value. */
+   case nir_intrinsic_load_front_face:
+      ssa_set(t, in->def.index, 0,
+              LLVMBuildICmp(t->b, LLVMIntNE,
+                 emit_load_i32(t, LLVMBuildAdd(t->b, t->fs_in_base,
+                    vp_iptr_const(t, t->fs_sysval_off), "")),
+                 LLVMConstInt(t->i32, 0, false), "frontface"));
+      break;
    case nir_intrinsic_load_instance_id:
       ssa_set(t, in->def.index, 0,
               t->instance ? t->instance : LLVMConstInt(t->i32, 0, false));
@@ -4407,6 +4453,7 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
 {
    unsigned off = 0;
    unsigned fs_scalars = 0;
+   t->fs_pos_off = -1;
    nir_foreach_shader_in_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
       /* A flat varying bypasses the interpolator: its bit pattern is not
@@ -4427,12 +4474,33 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
                    var->data.location);
          t->ok = false; return;
       }
-      fs_scalars += glsl_get_components(var->type);
+      /* gl_FragCoord is a system value wearing an input's clothes. It takes a
+       * slot in the record like any other input, but the wrapper writes it from
+       * the pixel address and the primitive rather than from an interpolated
+       * plane -- so it must not claim one, or every varying declared after it
+       * reads its neighbour's. */
+      if (var->data.location == VARYING_SLOT_POS) {
+         t->fs_pos_off = (int)off;
+      } else {
+         fs_scalars += glsl_get_components(var->type);
+      }
       t->vars[t->nvars].var     = var;
       t->vars[t->nvars].alloca  = NULL;
       t->vars[t->nvars].out_off = (int)off;
       t->nvars++;
       off += 16;
+   }
+   /* One slot past the declared inputs for the system values with no variable
+    * of their own (gl_FrontFacing). */
+   t->fs_sysval_off = off;
+   /* The record is a fixed-size alloca in the wrapper, so a shader declaring
+    * more inputs than it holds would have the wrapper write past it. The plane
+    * budget below does not bound this: twelve scalars are twelve slots. */
+   if (off + 16u > VP_FS_IN_WORDS * 4u) {
+      mesa_logw("vortexpipe: FS declares %u input slots, record holds %u; "
+                "this draw runs on llvmpipe",
+                off / 16u, (VP_FS_IN_WORDS * 4u) / 16u - 1u);
+      t->ok = false; return;
    }
    /* Same plane budget as the VS side, checked here too because the two are
     * compiled independently: a fragment shader reading past the last plane is
@@ -4698,7 +4766,7 @@ emit_arg_i32(struct vp_tr *t, LLVMValueRef arg, unsigned k)
  * arbitrary user varyings, gfx-v1 has exactly these planes. */
 static void
 emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim, LLVMValueRef flat,
-                      LLVMValueRef in_addr,
+                      LLVMValueRef in_addr, LLVMValueRef px, LLVMValueRef py,
                       LLVMValueRef dxq, LLVMValueRef dyq)
 {
    /* The front end interpolates 12 scalar planes; expand_k packed the VS varyings
@@ -4733,6 +4801,9 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim, LLVMValueRef flat,
          continue;
       unsigned nc = glsl_get_components(var->type);
       LLVMValueRef slot = addk(t, in_addr, (unsigned)t->vars[i].out_off);
+      if (var->data.location == VARYING_SLOT_POS) {
+         continue;   /* system value; written below, and claims no plane */
+      }
       /* A flat varying is held constant over the primitive, so it is read from
        * the words setup copied out of the provoking vertex rather than
        * interpolated. No arithmetic is applied on the way: the value may be an
@@ -4752,6 +4823,69 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim, LLVMValueRef flat,
                         LLVMBuildBitCast(t->b, f, t->i32, ""));
       }
    }
+
+   /* gl_FragCoord. x,y are the pixel CENTRE, which is the sample position the
+    * whole pipeline shades at. z is the same fixed-function depth plane the
+    * merger and the early-Z read, so a shader comparing gl_FragCoord.z against
+    * what it wrote sees one value, not two. w is 1/w_clip: the rhw plane
+    * interpolates that directly, but setup premultiplied it by a normalization
+    * factor that cancels in a varying's interp(a*rhw)/interp(rhw) and does NOT
+    * cancel here, so it is divided back out. */
+   if (t->fs_pos_off >= 0) {
+      LLVMValueRef slot = addk(t, in_addr, (unsigned)t->fs_pos_off);
+      LLVMValueRef half = LLVMConstReal(t->f32, 0.5);
+      LLVMValueRef xf = LLVMBuildFAdd(t->b,
+         LLVMBuildSIToFP(t->b, px, t->f32, ""), half, "fcx");
+      LLVMValueRef yf = LLVMBuildFAdd(t->b,
+         LLVMBuildSIToFP(t->b, py, t->f32, ""), half, "fcy");
+
+      LLVMValueRef zpx = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z));
+      LLVMValueRef zpy = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z + 4));
+      LLVMValueRef zpz = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z + 8));
+      LLVMValueRef zacc = LLVMBuildAdd(t->b,
+         LLVMBuildAdd(t->b,
+            LLVMBuildMul(t->b, LLVMBuildSExt(t->b, zpx, t->i64, ""),
+                               LLVMBuildSExt(t->b, px, t->i64, ""), ""),
+            LLVMBuildMul(t->b, LLVMBuildSExt(t->b, zpy, t->i64, ""),
+                               LLVMBuildSExt(t->b, py, t->i64, ""), ""), ""),
+         LLVMBuildSExt(t->b, zpz, t->i64, ""), "");
+      LLVMValueRef z32 = LLVMBuildTrunc(t->b, zacc, t->i32, "");
+      LLVMValueRef zmask = LLVMConstInt(t->i32, 0xffffff, false);
+      LLVMValueRef zsat = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, z32, LLVMConstInt(t->i32, 0, false), ""),
+         LLVMConstInt(t->i32, 0, false),
+         LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntSGT, z32, zmask, ""), zmask, z32, ""), "");
+      LLVMValueRef zf = LLVMBuildFDiv(t->b,
+         LLVMBuildUIToFP(t->b, zsat, t->f32, ""),
+         LLVMConstReal(t->f32, (double)0xffffff), "fcz");
+
+      LLVMValueRef scale = LLVMBuildBitCast(t->b,
+         emit_load_i32(t, addk(t, prim, VP_RAST_PRIM_RHW_SCALE)), t->f32, "");
+      LLVMValueRef snz = LLVMBuildFCmp(t->b, LLVMRealONE, scale,
+                                       LLVMConstReal(t->f32, 0.0), "");
+      LLVMValueRef wf = LLVMBuildFDiv(t->b, rhw_f,
+         LLVMBuildSelect(t->b, snz, scale, LLVMConstReal(t->f32, 1.0), ""), "fcw");
+
+      emit_store_i32(t, addk(t, slot, 0),
+                     LLVMBuildBitCast(t->b, xf, t->i32, ""));
+      emit_store_i32(t, addk(t, slot, 4),
+                     LLVMBuildBitCast(t->b, yf, t->i32, ""));
+      emit_store_i32(t, addk(t, slot, 8),
+                     LLVMBuildBitCast(t->b, zf, t->i32, ""));
+      emit_store_i32(t, addk(t, slot, 12),
+                     LLVMBuildBitCast(t->b, wf, t->i32, ""));
+   }
+
+   /* gl_FrontFacing. EdgeEquation flips a backward-wound triangle's edges so the
+    * interior is positive either way, which erases the winding; setup records it
+    * beforehand, and this is the only place it can still be read. */
+   emit_store_i32(t, addk(t, in_addr, t->fs_sysval_off),
+      LLVMBuildZExt(t->b,
+         LLVMBuildICmp(t->b, LLVMIntEQ,
+            emit_load_i32(t, addk(t, prim, VP_RAST_PRIM_FACING)),
+            LLVMConstInt(t->i32, 0, false), ""),
+         t->i32, "frontfacing"));
 }
 
 /* Source of a covered quad's per-corner edge (barycentric) values, the one
@@ -4870,7 +5004,7 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
 
       /* interpolate the RASTER attribute planes into the FS input
        * varyings (colour and/or texcoord, by declaration). */
-      emit_fs_fill_varyings(t, prim, flat, in_addr, dxq, dyq);
+      emit_fs_fill_varyings(t, prim, flat, in_addr, pxc, pyc, dxq, dyq);
 
       /* run the programmable fragment shader (3rd arg = SW texstate table,
        * 4th = resident FS descriptor table, 5th = the discard/demote flag). A
@@ -5117,7 +5251,7 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
    LLVMValueRef mrt_ptr = LLVMConstNull(t->ptr);
    LLVMValueRef mrt_colors_addr = LLVMConstNull(t->iptr);
    unsigned nrt = t->fs_num_color ? t->fs_num_color : 1;
-   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16),
+   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, VP_FS_IN_WORDS),
                                           "fs_in");
    LLVMValueRef out_scr = LLVMBuildAlloca(t->b,
       LLVMArrayType(t->i32, t->fs_out_words ? t->fs_out_words : 4), "fs_out");
@@ -5268,7 +5402,7 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMValueRef mrt_ptr = LLVMConstNull(t->ptr);
    LLVMValueRef mrt_colors_addr = LLVMConstNull(t->iptr);
    unsigned nrt = t->fs_num_color ? t->fs_num_color : 1;
-   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16), "fs_in");
+   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, VP_FS_IN_WORDS), "fs_in");
    LLVMValueRef out_scr = LLVMBuildAlloca(t->b,
       LLVMArrayType(t->i32, t->fs_out_words ? t->fs_out_words : 4), "fs_out");
    if (t->sw_om && nrt > 1) {

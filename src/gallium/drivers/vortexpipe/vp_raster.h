@@ -50,6 +50,14 @@ struct vp_fs_consts {
 /* The vertex-buffer geometry feeding the VS stage (defined in vp_launch.h). */
 struct vp_vertex_input;
 
+/* The app's scissor rect, in window space, already intersected with nothing:
+ * vp_raster_draw intersects it with the viewport's screen rect. A draw that
+ * binds no scissor passes NULL and keeps the viewport rect alone. minx==maxx
+ * or miny==maxy is an empty rect and paints nothing. */
+struct vp_scissor_rect {
+   unsigned minx, miny, maxx, maxy;
+};
+
 /* Persistent front-end working set: the binning pipeline's resident
  * buffer set, laid out once over VX_MEM_PHYS and reused across the frame's
  * draws (grown on demand) instead of allocated per draw. Owned by the
@@ -200,6 +208,7 @@ bool vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
                     bool sw_tex, bool sw_om, bool sw_raster,
                     float vp_sx, float vp_tx, float vp_sy, float vp_ty,
                     float vp_min_z, float vp_max_z,
+                    const struct vp_scissor_rect *scissor,
                     const struct vp_fs_consts *fs_consts,
                     const struct vp_fs_consts *vs_consts,
                     const struct vp_mrt_params *mrt);

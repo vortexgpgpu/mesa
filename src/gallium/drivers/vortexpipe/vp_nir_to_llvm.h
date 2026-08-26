@@ -96,6 +96,17 @@ void vp_free_ir(char *ir);
 #define VP_ARG_VS_DESC   (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
 #define VP_ARG_SLOTS     (VP_ARG_VS_DESC + 1)
 
+/* Vertex-attribute table (VS arg slot 1): one entry per VS input
+ * driver_location, holding { device base, stride, divisor, - }. The attribute
+ * for a draw lives at base + index*stride, where a zero divisor indexes by
+ * vertex and a non-zero one by instance/divisor -- an instance-rate attribute
+ * advances once every `divisor` instances, not once per instance. The unused
+ * fourth word keeps the entry a power of two wide so the address is a shift.
+ * Both table builders (vp_raster_draw, vp_launch_vs) and the fetch lowering
+ * (emit_vs_attr_addr) share this layout. */
+#define VP_ATTR_ENTRY_WORDS 4
+#define VP_ATTR_ENTRY_BYTES (VP_ATTR_ENTRY_WORDS * 4)
+
 /* Vertex stage: how many vertex invocations the draw actually has. Warps and
  * CTAs are filled, so more threads launch than that, and a thread past the end
  * has no vertex to shade. It sits in the first slot the vertex meanings above

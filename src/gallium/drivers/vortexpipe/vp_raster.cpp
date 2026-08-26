@@ -331,6 +331,7 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
                bool sw_tex, bool sw_om, bool sw_raster,
                float vp_sx, float vp_tx, float vp_sy, float vp_ty,
                float vp_min_z, float vp_max_z,
+               const struct vp_scissor_rect *scissor,
                const struct vp_fs_consts *fs_consts,
                const struct vp_fs_consts *vs_consts,
                const struct vp_mrt_params *mrt)
@@ -944,7 +945,7 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
        * output). The table is indexed by VS input driver_location. Both the
        * table and the VS arg block are declared here so they outlive
        * vx_enqueue_draw (async uploads + submit-time arg copy). */
-      uint32_t vs_attr_table[VP_ATTR_TABLE_LOCS * 2] = { 0 };
+      uint32_t vs_attr_table[VP_ATTR_TABLE_LOCS * VP_ATTR_ENTRY_WORDS] = { 0 };
       uint64_t vs_argblk[VP_ARG_SLOTS] = { 0 };
       vs_argblk[0] = vs_out_dev;
       if (vin && vin->num_attrs) {
@@ -977,9 +978,10 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
          for (uint32_t i = 0; i < vin->num_attrs; i++) {
             uint32_t loc = vin->attr_loc[i];
             if (loc >= VP_ATTR_TABLE_LOCS) continue;
-            vs_attr_table[loc * 2 + 0] = (uint32_t)buf_dev[vin->attr_buf[i]]
-                                       + vin->attr_offset[i];
-            vs_attr_table[loc * 2 + 1] = vin->attr_stride[i];
+            uint32_t *e = &vs_attr_table[loc * VP_ATTR_ENTRY_WORDS];
+            e[0] = (uint32_t)buf_dev[vin->attr_buf[i]] + vin->attr_offset[i];
+            e[1] = vin->attr_stride[i];
+            e[2] = vin->attr_divisor[i];
          }
          VP_CHECK(vx_buffer_create(dev, sizeof(vs_attr_table), 0, &tbuf),
                   "vx_buffer_create(attrtab)");
@@ -1301,6 +1303,19 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
       }
       if (symax > (int32_t)height) {
          symax = (int32_t)height;
+      }
+      /* Intersect the app's scissor. It is a second, independent rectangle:
+       * a draw may scissor strictly inside its viewport, and every fragment
+       * outside the intersection must be discarded. An empty result collapses
+       * to a zero-area rect rather than going negative, which the coverage
+       * walk reads as "no pixels". */
+      if (scissor) {
+         if ((int32_t)scissor->minx > sxmin) { sxmin = (int32_t)scissor->minx; }
+         if ((int32_t)scissor->maxx < sxmax) { sxmax = (int32_t)scissor->maxx; }
+         if ((int32_t)scissor->miny > symin) { symin = (int32_t)scissor->miny; }
+         if ((int32_t)scissor->maxy < symax) { symax = (int32_t)scissor->maxy; }
+         if (sxmax < sxmin) { sxmax = sxmin; }
+         if (symax < symin) { symax = symin; }
       }
       DCRW(VX_DCR_RASTER_SCISSOR_X,   ((uint32_t)sxmax << 16) | (uint32_t)sxmin);
       DCRW(VX_DCR_RASTER_SCISSOR_Y,   ((uint32_t)symax << 16) | (uint32_t)symin);
