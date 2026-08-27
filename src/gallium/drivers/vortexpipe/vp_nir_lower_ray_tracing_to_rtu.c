@@ -17,9 +17,10 @@
  * attributes back.
  *
  * Scope: opaque-triangle ray queries (the VK_KHR_ray_query path the
- * raytrace test exercises). The RTU resolves the whole ray in one
- * trace+wait, so rq_proceed returns false (the while(proceed) loop runs
- * its body zero times) and the candidate/any-hit path is a follow-up.
+ * raytrace test exercises), plus the candidate-return path for non-opaque
+ * geometry: rq_proceed issues the ray on its first call and hands back the
+ * lane's verdict on every later one, so the while(proceed) loop runs once per
+ * candidate and ends on a terminal status.
  */
 
 #include "vp_nir_to_llvm.h"
@@ -38,6 +39,12 @@
 #define RQ_COMMITTED_NONE         0
 #define RQ_COMMITTED_TRIANGLE     1
 
+/* Candidate RayQueryIntersection types (SPIR-V): Triangle=0, AABB=1. The
+ * candidate and committed enumerations are different, so a query's `committed`
+ * flag selects which one an intersection type is reported in. */
+#define RQ_CANDIDATE_TRIANGLE     0
+#define RQ_CANDIDATE_AABB         1
+
 /* Per-ray-query lowering state. The RTU is one-ray-per-lane, so a single
  * shared state covers the common single-query shader. The v2 window ABI passes
  * the ray geometry through the trace register window (not the slot file), so
@@ -51,6 +58,9 @@ struct rq_state {
    nir_variable *tmin;    /* float                                   */
    nir_variable *tmax;    /* float                                   */
    nir_variable *status;  /* uint: vx_rt_wait status                */
+   nir_variable *handle;  /* uint: trace handle, needed to resume    */
+   nir_variable *started; /* uint: 0 before the first proceed        */
+   nir_variable *action;  /* uint: verdict for the candidate in hand */
 };
 
 static nir_def *
@@ -84,32 +94,80 @@ lower_initialize(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    nir_store_var(b, st->tmin, tmin, 0x1);
    nir_store_var(b, st->tmax, tmax, 0x1);
    nir_store_var(b, st->status, nir_imm_int(b, VX_RT_STS_DONE_MISS), 0x1);
+   nir_store_var(b, st->handle, nir_imm_int(b, 0), 0x1);
+   nir_store_var(b, st->started, nir_imm_int(b, 0), 0x1);
+   /* An unanswered candidate is a rejected one, so the verdict defaults to
+    * IGNORE and only an explicit confirm or terminate moves it. */
+   nir_store_var(b, st->action, nir_imm_int(b, VX_RT_CB_IGNORE), 0x1);
+}
+
+/* True while this lane must keep proceeding: it has a candidate to service
+ * (YIELD_ANYHIT / YIELD_PROC) or is still traversing without one (PENDING).
+ * A PENDING lane has to stay in the loop -- exiting on it would leave
+ * traversal unfinished and read stale hit data -- and whatever verdict the
+ * loop body computes for it is discarded by the RTU, which only applies a
+ * verdict to a lane that actually holds a candidate. */
+static nir_def *
+sts_is_yield(nir_builder *b, nir_def *status)
+{
+   return nir_ior(b, nir_ieq_imm(b, status, VX_RT_STS_YIELD_ANYHIT),
+             nir_ior(b, nir_ieq_imm(b, status, VX_RT_STS_YIELD_PROC),
+                        nir_ieq_imm(b, status, VX_RT_STS_PENDING)));
+}
+
+/* True only when the lane holds a candidate this iteration. */
+static nir_def *
+sts_has_candidate(nir_builder *b, nir_def *status)
+{
+   return nir_ior(b, nir_ieq_imm(b, status, VX_RT_STS_YIELD_ANYHIT),
+                     nir_ieq_imm(b, status, VX_RT_STS_YIELD_PROC));
 }
 
 static nir_def *
 lower_proceed(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
 {
-   /* Fire one synchronous ray: the RTU walks the whole BVH in trace+wait.
-    * `while (rayQueryProceedEXT(rq)) {}` evaluates proceed once, so a single
-    * trace happens and the loop body (candidate handling) is skipped for the
-    * opaque path. Return false. */
-   nir_def *scene  = nir_load_var(b, st->scene);
-   nir_def *flags  = nir_load_var(b, st->flags);
-   nir_def *cull   = nir_load_var(b, st->cull);
-   /* lane-3 config word: ray_flags (low 16) | cull_mask (high 16). */
-   nir_def *flags_cull =
-      nir_ior(b, nir_iand_imm(b, flags, 0xffff),
-                 nir_ishl_imm(b, nir_iand_imm(b, cull, 0xff), 16));
-   nir_def *origin = nir_load_var(b, st->origin);
-   nir_def *dir    = nir_load_var(b, st->dir);
-   nir_def *tmin   = nir_load_var(b, st->tmin);
-   nir_def *tmax   = nir_load_var(b, st->tmax);
+   /* The first proceed issues the ray; every later one hands back the verdict
+    * for the candidate the previous proceed returned. Both end by blocking on
+    * the handle, so one wait serves either path. This is the shape the RTU's
+    * candidate-return protocol expects and the shape rayQueryProceedEXT has:
+    * the loop runs once per candidate and ends on a terminal status. */
+   nir_push_if(b, nir_ieq_imm(b, nir_load_var(b, st->started), 0));
+   {
+      nir_def *scene  = nir_load_var(b, st->scene);
+      nir_def *flags  = nir_load_var(b, st->flags);
+      nir_def *cull   = nir_load_var(b, st->cull);
+      /* lane-3 config word: ray_flags (low 16) | cull_mask (high 16). */
+      nir_def *flags_cull =
+         nir_ior(b, nir_iand_imm(b, flags, 0xffff),
+                    nir_ishl_imm(b, nir_iand_imm(b, cull, 0xff), 16));
+      nir_def *origin = nir_load_var(b, st->origin);
+      nir_def *dir    = nir_load_var(b, st->dir);
+      nir_def *tmin   = nir_load_var(b, st->tmin);
+      nir_def *tmax   = nir_load_var(b, st->tmax);
 
-   nir_def *handle = nir_vortex_rt_wtrace(b, 32, scene, flags_cull,
-                                          origin, dir, tmin, tmax);
-   nir_def *status = nir_vortex_rt_wait(b, 32, handle);
+      nir_store_var(b, st->handle,
+                    nir_vortex_rt_wtrace(b, 32, scene, flags_cull,
+                                         origin, dir, tmin, tmax), 0x1);
+      nir_store_var(b, st->started, nir_imm_int(b, 1), 0x1);
+   }
+   nir_push_else(b, NULL);
+   {
+      /* An any-hit lane computes no distance of its own, so the candidate's
+       * own t goes back unchanged; it is read against the status that
+       * delivered the candidate. */
+      nir_def *prev = nir_load_var(b, st->status);
+      nir_vortex_rt_continue(b, nir_load_var(b, st->action),
+                                rt_get(b, VX_RT_HIT_T, prev),
+                                nir_imm_int(b, 0));
+   }
+   nir_pop_if(b, NULL);
+
+   nir_def *status = nir_vortex_rt_wait(b, 32, nir_load_var(b, st->handle));
    nir_store_var(b, st->status, status, 0x1);
-   return nir_imm_false(b);
+   /* Reset for the iteration about to run: the verdict must be what this
+    * iteration decides, never what the previous one did. */
+   nir_store_var(b, st->action, nir_imm_int(b, VX_RT_CB_IGNORE), 0x1);
+   return sts_is_yield(b, status);
 }
 
 static nir_def *
@@ -121,11 +179,19 @@ lower_load(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
 
    switch (value) {
    case nir_ray_query_value_intersection_type: {
-      /* committed: a hit is a triangle (opaque), a miss is None.
-       * candidate: opaque-only, never a pending candidate -> None. */
+      /* Committed: a hit is a triangle, a miss is None. Candidate: whichever
+       * kind the yield delivered, and None when the lane is still traversing
+       * with nothing in hand -- a shader must not treat a PENDING iteration as
+       * a candidate to shade. */
       bool committed = nir_intrinsic_committed(in);
-      if (!committed)
-         return nir_imm_int(b, RQ_COMMITTED_NONE);
+      if (!committed) {
+         return nir_bcsel(b, sts_has_candidate(b, status),
+                          nir_bcsel(b,
+                             nir_ieq_imm(b, status, VX_RT_STS_YIELD_PROC),
+                             nir_imm_int(b, RQ_CANDIDATE_AABB),
+                             nir_imm_int(b, RQ_CANDIDATE_TRIANGLE)),
+                          nir_imm_int(b, RQ_COMMITTED_NONE));
+      }
       return nir_bcsel(b, nir_ieq_imm(b, status, VX_RT_STS_DONE_HIT),
                        nir_imm_int(b, RQ_COMMITTED_TRIANGLE),
                        nir_imm_int(b, RQ_COMMITTED_NONE));
@@ -203,6 +269,9 @@ vp_nir_lower_ray_tracing_to_rtu(nir_shader *shader)
       .tmin   = nir_local_variable_create(impl, glsl_float_type(), "rq_tmin"),
       .tmax   = nir_local_variable_create(impl, glsl_float_type(), "rq_tmax"),
       .status = nir_local_variable_create(impl, glsl_uint_type(), "rq_status"),
+      .handle = nir_local_variable_create(impl, glsl_uint_type(), "rq_handle"),
+      .started = nir_local_variable_create(impl, glsl_uint_type(), "rq_started"),
+      .action = nir_local_variable_create(impl, glsl_uint_type(), "rq_action"),
    };
 
    nir_foreach_block_safe(block, impl) {
@@ -222,10 +291,16 @@ vp_nir_lower_ray_tracing_to_rtu(nir_shader *shader)
          case nir_intrinsic_rq_load:
             nir_def_rewrite_uses(&in->def, lower_load(&b, in, &st));
             break;
-         case nir_intrinsic_rq_terminate:
-         case nir_intrinsic_rq_generate_intersection:
          case nir_intrinsic_rq_confirm_intersection:
-            /* Opaque path: no candidate/any-hit handling yet. Drop. */
+            nir_store_var(&b, st.action, nir_imm_int(&b, VX_RT_CB_ACCEPT), 0x1);
+            break;
+         case nir_intrinsic_rq_terminate:
+            nir_store_var(&b, st.action, nir_imm_int(&b, VX_RT_CB_TERMINATE), 0x1);
+            break;
+         case nir_intrinsic_rq_generate_intersection:
+            /* A ray query has no intersection shader to run, so a procedural
+             * candidate has no hit to generate. Leaving it IGNOREd rejects it,
+             * which is the only answer available here. */
             break;
          default:
             continue;

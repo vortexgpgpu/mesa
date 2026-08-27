@@ -71,7 +71,7 @@ void
 lp_build_nir_soa_prepasses(struct nir_shader *nir);
 
 void
-lp_build_opt_nir(struct nir_shader *nir);
+lp_build_opt_nir(struct nir_shader *nir, unsigned subgroup_size);
 
 
 static inline LLVMValueRef

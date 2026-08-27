@@ -74,16 +74,18 @@ foreach vp_xlen : [['32', vp_vortex_build], ['64', vp_vortex_build64]]
       'all',
     ],
     # Rebuild the blob when the SDK kernel sources (sw/gfx, sw/common) or the
-    # build recipe change — meson does not see make's own prerequisites. Headers
-    # follow the 06-10 consolidation: the fused stage logic is gfx_frontend_k.h;
-    # the shared ABI/setup math live in sw/common (gfx_frontend_abi.h + gfx_setup.h).
+    # build recipe change — meson does not see make's own prerequisites. The
+    # stage logic is gfx_frontend_k.h and the pass-end resolve gfx_resolve_k.h;
+    # the shared ABI/setup/merge math lives in sw/common.
     depend_files : files(
         'kernels/gfx_frontend/gfx_frontend_kernel.cpp',
         'kernels/gfx_frontend/Makefile',
       ) + [
         vp_vortex_home / 'sw' / 'gfx' / 'gfx_frontend_k.h',
+        vp_vortex_home / 'sw' / 'gfx' / 'gfx_resolve_k.h',
         vp_vortex_home / 'sw' / 'common' / 'gfx_frontend_abi.h',
         vp_vortex_home / 'sw' / 'common' / 'gfx_setup.h',
+        vp_vortex_home / 'sw' / 'common' / 'gfx_sw.h',
         vp_vortex_home / 'sw' / 'common' / 'vx_gfx_abi.h',
       ],
     console : true,

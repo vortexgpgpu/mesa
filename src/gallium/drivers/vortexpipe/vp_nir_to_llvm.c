@@ -24,8 +24,11 @@
 #include "vp_compile.h"      /* vp_xlen_is_64 */
 #include "vp_private.h"      /* vp_dbg */
 #include "gfx_fs_desc_abi.h" /* GFX_FS_ARG_DESC, GFX_FS_ARG_APERTURE */
+#include "gfx_sw_abi.h"      /* gfx_sw_texstate_t (logdim offset for auto-LOD) */
 #include "VX_types.h"        /* VX_MEM_OM_BASE_ADDR */
 
+#include <assert.h>          /* static_assert */
+#include <stddef.h>          /* offsetof */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,15 +86,14 @@
 #define VP_TEX_OUT_SLOT         24
 
 /* vortex::graphics::rast_prim_t layout (sw/common/vx_gfx_abi.h, FIXEDPOINT):
- * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v,rhw}, each a
- * rast_attrib_t {x,y,z} of fixed24 (12B). r/g/b/a are the colour planes,
- * u/v the texcoord planes; rhw is the perspective 1/w plane (appended last,
- * so the z/r/g/b/a/u/v offsets below are unchanged). At w==1 the premultiplied
- * colour/uv planes equal the raw attributes and rhw is constant, so reading them
- * affinely is exact; the trailing rhw pushes the per-prim stride to 132B.
- * NOTE: duplicated as VP_RAST_PRIM_STRIDE in vp_raster.cpp (the DCR writer) —
- * keep the two in sync. */
-#define VP_RAST_PRIM_STRIDE 132
+ * vec3e_t edges[3] (36B), then rast_attribs_t {z,r,g,b,a,u,v,rhw,w0..w5}, each a
+ * rast_attrib_t {x,y,z} of fixed24 (12B). r/g/b/a/u/v/w0..w5 are the twelve
+ * generic varying planes (declaration-order [u,v,r,g,b,a,w0..w5]); rhw is the
+ * perspective 1/w plane. The w0..w5 planes are appended after rhw, so the
+ * z/r/g/b/a/u/v/rhw offsets below are unchanged. At w==1 the premultiplied
+ * varying planes equal the raw attributes and rhw is constant, so reading them
+ * affinely is exact. The record pitch itself is VP_RAST_PRIM_STRIDE
+ * (vp_nir_to_llvm.h), shared with the DCR writer in vp_raster.cpp. */
 #define VP_RAST_ATTR_Z       36
 #define VP_RAST_ATTR_R       48
 #define VP_RAST_ATTR_G       60
@@ -100,6 +102,27 @@
 #define VP_RAST_ATTR_U       96
 #define VP_RAST_ATTR_V      108
 #define VP_RAST_ATTR_RHW    120
+#define VP_RAST_ATTR_W0     132
+#define VP_RAST_ATTR_W1     144
+#define VP_RAST_ATTR_W2     156
+#define VP_RAST_ATTR_W3     168
+#define VP_RAST_ATTR_W4     180
+#define VP_RAST_ATTR_W5     192
+/* The two per-primitive scalars that sit after the planes (rast_prim_t): the
+ * winding EdgeEquation flipped away, which is gl_FrontFacing, and the factor
+ * the rhw plane was premultiplied by, which gl_FragCoord.w must undo. */
+/* i32 words of the fragment-shader input record: four 16-byte slots for the
+ * declared inputs, plus one for the system values that have no variable of
+ * their own (gl_FrontFacing). */
+#define VP_FS_IN_WORDS 20
+
+#define VP_RAST_PRIM_FACING    204
+#define VP_RAST_PRIM_RHW_SCALE 208
+
+/* Scalar planes available to carry varyings: [u,v,r,g,b,a] plus w0..w5. The
+ * VS packs into them in declaration order and the FS reads back the same way,
+ * so this bounds the two together. */
+#define VP_RAST_MAX_PLANES   12
 
 /* TEX unit: coordinates are S.23 fixed-point (VX_types.h VX_TEX_FXD_FRAC). */
 #define VP_TEX_FXD_FRAC      23
@@ -141,6 +164,8 @@ struct vp_tr {
    unsigned       scratch_size;
    LLVMValueRef   scratch_base; /* iptr addr of the scratch alloca, or NULL */
    LLVMBasicBlockRef entry;     /* function entry block (alloca home) */
+   LLVMValueRef   tex_f32_slot; /* float[4] the float texture ABI writes, or NULL */
+   LLVMValueRef   tex_i32_slot; /* int32[4] the integer texture ABI writes, or NULL */
    /* SSA map: [def index][component] -> iN value (bit pattern).
     * For a deref instr, component 0 holds the iptr byte address. */
    LLVMValueRef  *val;
@@ -159,18 +184,23 @@ struct vp_tr {
     * fast path (verts_per_instance == 0). */
    LLVMValueRef   instance;       /* i32 0-based instance id (gl_InstanceID) */
    LLVMValueRef   first_instance; /* i32 base instance (gl_BaseInstance) */
+   LLVMValueRef   base_vertex;    /* i32 base vertex (gl_BaseVertex); added to
+                                   * gl_VertexIndex only -- see the vid comment */
    LLVMValueRef   out_base;     /* iptr output-buffer device address */
    unsigned       out_stride;   /* bytes per output vertex record */
    LLVMValueRef   attr_table;   /* iptr addr of the {base,stride}[] table */
    /* fragment-shader state (is_fs only) */
    bool           is_fs;
+   unsigned       fs_samples;   /* samples per pixel; 1 = single-sample */
+   uint8_t        fs_bgra_mask; /* per-RT: blue-first, not red-first */
    LLVMValueRef   fs_in_base;   /* iptr interpolated-varyings area */
    LLVMValueRef   fs_out_base;  /* iptr output-colour area */
    struct vp_var  vars[VP_MAXV];
    unsigned       nvars;
    /* Per-unit SW routing (FS only). fs_texstate is fs_main's 3rd
-    * param: a resident gfx_sw_texstate_t[] (per sampler stage), used by
-    * emit_vx_tex when sw_tex; null pointer when texturing is HW. */
+    * param: a resident gfx_sw_texstate_t[] (per sampler stage). The SW sampler
+    * reads all of it; the HW-tex FS reads logdim/filter to derive the mip LOD and
+    * the min/mag tap. Zero (unused) for an untextured draw. */
    bool           sw_tex;
    bool           sw_om;
    bool           sw_raster;  /* FS is the one-warp-per-tile SW-raster kernel */
@@ -194,6 +224,15 @@ struct vp_tr {
     * array and calls gfx_om_fragment_mrt_sw when num_color > 1. */
    unsigned       fs_num_color;
    unsigned       fs_out_words;  /* i32 words in the FS output area (incl. scratch) */
+   int            fs_depth_off;  /* byte offset of gl_FragDepth's slot; -1 if unwritten */
+   /* gl_FragCoord is declared as a shader input and so owns a slot in the input
+    * record, but it is a system value: the wrapper synthesises it rather than
+    * interpolating a plane. -1 when the shader does not read it. */
+   int            fs_pos_off;
+   /* gl_FrontFacing arrives as an intrinsic, not a variable, so it has no slot
+    * of its own. One is reserved past the declared inputs and filled by the
+    * wrapper, which is where the primitive record is in scope. */
+   unsigned       fs_sysval_off;
    bool           ok;
 };
 
@@ -288,6 +327,93 @@ emit_fpow(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y)
    return LLVMBuildCall2(t->b, fty, fn, a, 2, "fpow");
 }
 
+static LLVMTypeRef cty(struct vp_tr *t, unsigned bits);
+
+/* Width-aware unary float intrinsic (llvm.<base>.f32/f64). `base` is the
+ * intrinsic stem without the type suffix ("floor","ceil","trunc","round",
+ * "roundeven","exp2","log2","sin","cos"). `fa` is a compute-typed float (from
+ * as_float, always f32/f64 — never half), and the result is the same type; the
+ * caller rounds back to f16 via from_float. The RISC-V backend lowers these to
+ * FPU sequences or libcalls. */
+static LLVMValueRef
+emit_funary_intrin(struct vp_tr *t, const char *base, LLVMValueRef fa,
+                   unsigned bits)
+{
+   const char  *suf = bits == 64 ? "f64" : "f32";
+   char         nm[32];
+   snprintf(nm, sizeof(nm), "llvm.%s.%s", base, suf);
+   LLVMTypeRef  ft  = cty(t, bits);
+   LLVMTypeRef  fnty = LLVMFunctionType(ft, &ft, 1, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, nm);
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, nm, fnty);
+   return LLVMBuildCall2(t->b, fnty, fn, &fa, 1, base);
+}
+
+/* copysign on a compute float: magnitude of `mag`, sign of `sgn`. Implemented
+ * with integer bit ops (clear the sign bit of mag, OR in the sign bit of sgn)
+ * so it lowers cleanly in divergent codegen. Restores the sign of a zero result
+ * from rounding (floor(-0.0) = -0.0, trunc(-0.3) = -0.0, ...). */
+static LLVMValueRef
+emit_fcopysign(struct vp_tr *t, LLVMValueRef mag, LLVMValueRef sgn, unsigned bits)
+{
+   int          is64 = (bits == 64);
+   LLVMTypeRef  it   = is64 ? t->i64 : t->i32;
+   LLVMTypeRef  ft   = is64 ? t->f64 : t->f32;
+   uint64_t     smask = is64 ? 0x8000000000000000ull : 0x80000000ull;
+   LLVMValueRef mb   = LLVMBuildBitCast(t->b, mag, it, "");
+   LLVMValueRef sb   = LLVMBuildBitCast(t->b, sgn, it, "");
+   LLVMValueRef absv = LLVMBuildAnd(t->b, mb,
+                          LLVMConstInt(it, ~smask, false), "");
+   LLVMValueRef sv   = LLVMBuildAnd(t->b, sb,
+                          LLVMConstInt(it, smask, false), "");
+   return LLVMBuildBitCast(t->b, LLVMBuildOr(t->b, absv, sv, ""), ft, "");
+}
+
+/* trunc / floor / ceil, synthesized from fptosi/sitofp. The Vortex LLVM backend
+ * cannot lower llvm.trunc/floor/ceil/round in divergent codegen (they expand to
+ * a rounding pseudo the divergent custom-inserter rejects), but int<->float
+ * converts and float selects lower fine. A value with |x| >= 2^24 (f32) / 2^53
+ * (f64) is already integral, so the round-trip (which would overflow the integer
+ * range) is guarded off and x passes through unchanged. `fa` is a compute float
+ * (f32/f64); the result is the same type. */
+static LLVMValueRef
+emit_ftrunc(struct vp_tr *t, LLVMValueRef fa, unsigned bits)
+{
+   LLVMTypeRef  ft   = cty(t, bits);
+   int          is64 = (bits == 64);
+   LLVMTypeRef  it   = is64 ? t->i64 : t->i32;
+   LLVMValueRef iv   = LLVMBuildFPToSI(t->b, fa, it, "");
+   LLVMValueRef rv   = LLVMBuildSIToFP(t->b, iv, ft, "");
+   LLVMValueRef ax   = emit_funary_intrin(t, "fabs", fa, bits);
+   LLVMValueRef big  = LLVMBuildFCmp(t->b, LLVMRealOGE, ax,
+                          LLVMConstReal(ft, is64 ? 9007199254740992.0
+                                                 : 16777216.0), "");
+   return emit_fcopysign(t, LLVMBuildSelect(t->b, big, fa, rv, "ftrunc"),
+                         fa, bits);
+}
+static LLVMValueRef
+emit_ffloor(struct vp_tr *t, LLVMValueRef fa, unsigned bits)
+{
+   LLVMTypeRef  ft = cty(t, bits);
+   LLVMValueRef tr = emit_ftrunc(t, fa, bits);
+   /* trunc rounds toward zero; for x<tr (negative non-integers) subtract one. */
+   LLVMValueRef gt = LLVMBuildFCmp(t->b, LLVMRealOGT, tr, fa, "");
+   LLVMValueRef m1 = LLVMBuildFSub(t->b, tr, LLVMConstReal(ft, 1.0), "");
+   return emit_fcopysign(t, LLVMBuildSelect(t->b, gt, m1, tr, "ffloor"),
+                         fa, bits);
+}
+static LLVMValueRef
+emit_fceil(struct vp_tr *t, LLVMValueRef fa, unsigned bits)
+{
+   LLVMTypeRef  ft = cty(t, bits);
+   LLVMValueRef tr = emit_ftrunc(t, fa, bits);
+   LLVMValueRef lt = LLVMBuildFCmp(t->b, LLVMRealOLT, tr, fa, "");
+   LLVMValueRef p1 = LLVMBuildFAdd(t->b, tr, LLVMConstReal(ft, 1.0), "");
+   return emit_fcopysign(t, LLVMBuildSelect(t->b, lt, p1, tr, "fceil"),
+                         fa, bits);
+}
+
 /* llvm.ctpop.i32 (population count / set-bit count). */
 static LLVMValueRef
 emit_ctpop(struct vp_tr *t, LLVMValueRef v)
@@ -325,6 +451,18 @@ emit_cttz(struct vp_tr *t, LLVMValueRef v)
       fn = LLVMAddFunction(t->mod, "llvm.cttz.i32", fty);
    LLVMValueRef a[2] = { v, LLVMConstInt(i1, 0, false) };
    return LLVMBuildCall2(t->b, fty, fn, a, 2, "cttz");
+}
+
+/* llvm.bitreverse.i32 (reverse bit order) -> Vortex has no native op; the RISC-V
+ * backend expands it, but declaring the intrinsic keeps codegen one node wide. */
+static LLVMValueRef
+emit_bitreverse(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef  fty = LLVMFunctionType(t->i32, &t->i32, 1, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.bitreverse.i32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.bitreverse.i32", fty);
+   return LLVMBuildCall2(t->b, fty, fn, &v, 1, "bitreverse");
 }
 
 /* vx ballot (custom-0, funct3=3, funct7=1): rd = per-lane predicate reduced to
@@ -373,13 +511,21 @@ emit_shfl_up(struct vp_tr *t, LLVMValueRef value, unsigned delta)
 }
 
 /* shfl_idx (gather): every lane reads `value` from source lane `src` (dynamic).
- * bval=src, cval=0x3f, mask=0 -> 0xFC0 | src. */
+ * bval=src, cval=0x3f, mask=0 -> 0xFC0 | src. The shfl instruction is i32-typed,
+ * so a sub-i32 value (a bool arrives as i1 from the subgroup broadcast / shuffle
+ * / quad lowerings) is widened for transport and narrowed back — the inline-asm
+ * call would otherwise fail IR verification. Type-preserving, so every caller
+ * (shuffle, read_invocation, vote_ieq, ...) sees the value's original type. */
 static LLVMValueRef
 emit_shfl_idx(struct vp_tr *t, LLVMValueRef value, LLVMValueRef src)
 {
-   LLVMValueRef bc = LLVMBuildOr(t->b, LLVMConstInt(t->i32, 0xFC0u, false),
-                                 src, "shflidx_bc");
-   return emit_shfl(t, 7, value, bc);
+   LLVMTypeRef  vt  = LLVMTypeOf(value);
+   LLVMValueRef v32 = (vt == t->i32) ? value
+                    : LLVMBuildZExt(t->b, value, t->i32, "shfl_w");
+   LLVMValueRef bc  = LLVMBuildOr(t->b, LLVMConstInt(t->i32, 0xFC0u, false),
+                                  src, "shflidx_bc");
+   LLVMValueRef r   = emit_shfl(t, 7, v32, bc);
+   return (vt == t->i32) ? r : LLVMBuildTrunc(t->b, r, vt, "shfl_n");
 }
 
 /* Combine two lane values under a subgroup reduction op (32-bit). Operands and
@@ -421,6 +567,42 @@ emit_scan_combine(struct vp_tr *t, nir_op rop, LLVMValueRef a, LLVMValueRef b)
    }
 }
 
+/* The identity element of a subgroup reduction op, as the i32 lane bit pattern.
+ * Used to seed the lane-0 slot of an exclusive scan. Returns NULL (clears ok)
+ * for an op with no identity mapping. */
+static LLVMValueRef
+emit_scan_identity(struct vp_tr *t, nir_op rop)
+{
+   switch (rop) {
+   case nir_op_iadd: case nir_op_ior: case nir_op_ixor:
+      return LLVMConstInt(t->i32, 0, false);
+   case nir_op_imul:
+      return LLVMConstInt(t->i32, 1, false);
+   case nir_op_iand:
+      return LLVMConstInt(t->i32, 0xFFFFFFFFu, false);
+   case nir_op_umin:
+      return LLVMConstInt(t->i32, 0xFFFFFFFFu, false);
+   case nir_op_umax:
+      return LLVMConstInt(t->i32, 0, false);
+   case nir_op_imin:
+      return LLVMConstInt(t->i32, 0x7FFFFFFFu, false);
+   case nir_op_imax:
+      return LLVMConstInt(t->i32, 0x80000000u, false);
+   case nir_op_fadd:
+      return LLVMConstInt(t->i32, 0x00000000u, false);          /* +0.0f */
+   case nir_op_fmul:
+      return LLVMConstInt(t->i32, 0x3F800000u, false);          /* 1.0f  */
+   case nir_op_fmin:
+      return LLVMConstInt(t->i32, 0x7F800000u, false);          /* +inf  */
+   case nir_op_fmax:
+      return LLVMConstInt(t->i32, 0xFF800000u, false);          /* -inf  */
+   default:
+      mesa_logw("vortexpipe: subgroup scan op %d has no identity", rop);
+      t->ok = false;
+      return NULL;
+   }
+}
+
 /* read a RISC-V CSR via inline asm: `csrr <rd>, <csr>` -> i32 */
 static LLVMValueRef
 emit_csr_read(struct vp_tr *t, unsigned csr, const char *name)
@@ -434,6 +616,56 @@ emit_csr_read(struct vp_tr *t, unsigned csr, const char *name)
                                       LLVMInlineAsmDialectATT,
                                       /*CanThrow*/ false);
    return LLVMBuildCall2(t->b, fnty, ia, NULL, 0, name);
+}
+
+/* Inclusive prefix scan of `val` across the warp (subgroup) under reduction op
+ * `rop`: Hillis-Steele over shfl_up. Three guards decide whether a lane combines
+ * its neighbour at step d:
+ *   - in range: the source lane (lane-d) must exist (lane >= d);
+ *   - source active: the source lane must be an active invocation;
+ *   - same cluster: for a clustered reduction, the source must not cross the
+ *     cluster boundary.
+ * The second matters under divergence — a shfl from an inactive lane returns the
+ * reader's OWN value, so combining it unconditionally would double-count for a
+ * non-idempotent op (add/mul/xor); an active source at a further power-of-two
+ * distance is still picked up in a later step. Unrolled to cover NT up to 32.
+ *
+ * `cluster` is the width of the lane group a clustered reduction folds over, or
+ * 0 for the whole warp. It is a power of two, so a lane's offset within its
+ * cluster is `lane & (cluster-1)` and a source at distance d stays inside the
+ * cluster exactly when that offset is at least d. No lane reaches past its own
+ * cluster, so the scan stops at d == cluster.
+ *
+ * Returns the inclusive result (NULL + clears ok on an unmapped op). */
+static LLVMValueRef
+emit_subgroup_incl_scan(struct vp_tr *t, nir_op rop, LLVMValueRef val,
+                        unsigned cluster)
+{
+   LLVMValueRef acc    = val;
+   LLVMValueRef lane   = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+   LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+   LLVMValueRef one    = LLVMConstInt(t->i32, 1, false);
+   /* Offset within the cluster; for the unclustered scan this is just the lane. */
+   LLVMValueRef pos    = cluster
+      ? LLVMBuildAnd(t->b, lane, LLVMConstInt(t->i32, cluster - 1u, false), "cpos")
+      : lane;
+   unsigned span = cluster ? cluster : 32u;
+   for (unsigned d = 1; d < span && d <= 16u; d <<= 1) {
+      LLVMValueRef dc   = LLVMConstInt(t->i32, d, false);
+      LLVMValueRef nbr  = emit_shfl_up(t, acc, d);
+      LLVMValueRef comb = emit_scan_combine(t, rop, acc, nbr);
+      if (!t->ok)
+         return NULL;
+      LLVMValueRef inrange = LLVMBuildICmp(t->b, LLVMIntUGE, pos, dc, "");
+      LLVMValueRef srcbit  = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, active, LLVMBuildSub(t->b, lane, dc, ""), ""),
+         one, "");
+      LLVMValueRef srcact  = LLVMBuildICmp(t->b, LLVMIntNE, srcbit,
+         LLVMConstInt(t->i32, 0, false), "");
+      LLVMValueRef doit = LLVMBuildAnd(t->b, inrange, srcact, "");
+      acc = LLVMBuildSelect(t->b, doit, comb, acc, "scan");
+   }
+   return acc;
 }
 
 /* vx_barrier(): a workgroup execution barrier (custom-0, funct3=4).
@@ -455,27 +687,50 @@ emit_vx_barrier(struct vp_tr *t)
                                       /*CanThrow*/ false);
    LLVMValueRef a[2] = { emit_csr_read(t, VX_CSR_CTA_ID,   "cta_id"),
                          emit_csr_read(t, VX_CSR_CTA_SIZE, "cta_warps") };
-   LLVMBuildCall2(t->b, fnty, ia, a, 2, "");
+   LLVMValueRef call = LLVMBuildCall2(t->b, fnty, ia, a, 2, "");
+   /* Mark the barrier convergent: it must execute with the CTA's lanes
+    * converged, so mid-level CFG passes (SimplifyCFG merging two branches on the
+    * same divergent condition) must not duplicate it into, or sink it out of,
+    * divergent control flow. Without this the barrier is placed inside a
+    * divergent if and the workgroup never actually synchronizes. */
+   unsigned conv = LLVMGetEnumAttributeKindForName("convergent", 10);
+   LLVMAddCallSiteAttribute(call, LLVMAttributeFunctionIndex,
+                            LLVMCreateEnumAttribute(t->ctx, conv, 0));
 }
 
 /* VS vertex-input fetch: the device address of attribute `loc` for the
  * current vertex. The attribute table (arg slot 1) holds, per VS input
- * driver_location, a { device base, stride } pair; the attribute lives
- * at base + vid*stride (vp_launch_vs builds the table). base/stride
- * are i32 fields on the wire even on rv64 (the table layout is the
- * same), so widen base to iptr before address arithmetic. */
+ * driver_location, a { base, stride, divisor } entry; the attribute lives at
+ * base + index*stride (vp_launch_vs builds the table). The index is the vertex
+ * id, or for a non-zero divisor the instance id divided by it, so an
+ * instance-rate attribute advances once every `divisor` instances rather than
+ * once per instance. The fields are i32 on the wire even on rv64 (the table
+ * layout is the same), so widen base to iptr before address arithmetic. */
 static LLVMValueRef
 emit_vs_attr_addr(struct vp_tr *t, unsigned loc)
 {
    LLVMValueRef ent = LLVMBuildAdd(t->b, t->attr_table,
-      vp_iptr_const(t, loc * 8u), "");
+      vp_iptr_const(t, loc * VP_ATTR_ENTRY_BYTES), "");
    LLVMValueRef base = LLVMBuildLoad2(t->b, t->i32,
       LLVMBuildIntToPtr(t->b, ent, t->ptr, ""), "attrbase");
    LLVMValueRef stride = LLVMBuildLoad2(t->b, t->i32,
       LLVMBuildIntToPtr(t->b,
          LLVMBuildAdd(t->b, ent, vp_iptr_const(t, 4), ""),
          t->ptr, ""), "attrstride");
-   LLVMValueRef offset = LLVMBuildMul(t->b, t->vid, stride, "");
+   LLVMValueRef divisor = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildIntToPtr(t->b,
+         LLVMBuildAdd(t->b, ent, vp_iptr_const(t, 8), ""),
+         t->ptr, ""), "attrdiv");
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef per_vertex = LLVMBuildICmp(t->b, LLVMIntEQ, divisor, zero, "");
+   /* The divide is guarded to 1 on the per-vertex path: it is dead there, but
+    * a udiv by the zero that marks that path is poison, not an ignored value. */
+   LLVMValueRef safe_div = LLVMBuildSelect(t->b, per_vertex,
+      LLVMConstInt(t->i32, 1, false), divisor, "");
+   LLVMValueRef inst = t->instance ? t->instance : zero;
+   LLVMValueRef index = LLVMBuildSelect(t->b, per_vertex, t->vid,
+      LLVMBuildUDiv(t->b, inst, safe_div, ""), "attridx");
+   LLVMValueRef offset = LLVMBuildMul(t->b, index, stride, "");
    return LLVMBuildAdd(t->b, vp_to_iptr(t, base),
                               vp_to_iptr(t, offset), "vsin");
 }
@@ -527,13 +782,122 @@ emit_load_const(struct vp_tr *t, nir_load_const_instr *lc)
  * the translator carries f64 values as i64 bit patterns (rv32 has no
  * D extension; the .vxbin compiler lowers f64 ops to soft-float). */
 static LLVMTypeRef
-fty(struct vp_tr *t, unsigned bits) { return bits == 64 ? t->f64 : t->f32; }
+fty(struct vp_tr *t, unsigned bits) {
+   return bits == 64 ? t->f64
+        : bits == 16 ? LLVMHalfTypeInContext(t->ctx)
+                     : t->f32;
+}
 static LLVMTypeRef
 ity(struct vp_tr *t, unsigned bits) { return bits == 64 ? t->i64 : t->i32; }
+
+/* Compute float type. Vortex has an f32/f64 FPU but NO half hardware (Zfh is
+ * off), and the RISC-V backend cannot lower `half` ops in Vortex's divergent
+ * codegen. So fp16 is computed in f32 exactly as a GPU without native f16 does:
+ * promote to f32, do the op, round the single result back to f16. cty() is the
+ * type the arithmetic runs in (f32 for 16- and 32-bit, f64 for 64-bit). */
+static LLVMTypeRef
+cty(struct vp_tr *t, unsigned bits) { return bits == 64 ? t->f64 : t->f32; }
+
+/* Float ALU operands live in the lane as their IEEE bit pattern in an integer:
+ * i32 for 16- and 32-bit (a 16-bit value occupies the low half), i64 for 64-bit.
+ * as_float() recovers the compute-typed float for an op; from_float() packs a
+ * result back. A 16-bit float is unpacked as its half bit pattern then widened
+ * to f32 for the arithmetic; from_float() truncates the f32 result back to f16
+ * (one correctly-rounded step), so denormals and rounding stay f16-accurate
+ * without ever emitting a native `half` operation. */
+static LLVMValueRef
+as_float(struct vp_tr *t, LLVMValueRef laneval, unsigned bits) {
+   if (bits == 16) {
+      LLVMValueRef h = LLVMBuildTrunc(t->b, laneval,
+                                      LLVMInt16TypeInContext(t->ctx), "");
+      LLVMValueRef hf = LLVMBuildBitCast(t->b, h,
+                                         LLVMHalfTypeInContext(t->ctx), "");
+      return LLVMBuildFPExt(t->b, hf, t->f32, "");
+   }
+   return LLVMBuildBitCast(t->b, laneval, fty(t, bits), "");
+}
+static LLVMValueRef
+from_float(struct vp_tr *t, LLVMValueRef fval, unsigned bits) {
+   if (bits == 16) {
+      LLVMValueRef hf = LLVMBuildFPTrunc(t->b, fval,
+                                         LLVMHalfTypeInContext(t->ctx), "");
+      LLVMValueRef h  = LLVMBuildBitCast(t->b, hf,
+                                         LLVMInt16TypeInContext(t->ctx), "");
+      return LLVMBuildZExt(t->b, h, t->i32, "");
+   }
+   return LLVMBuildBitCast(t->b, fval, ity(t, bits), "");
+}
+
+/* Normalize a `bits`-wide integer held in the i32 lane before a signed (sgn) or
+ * unsigned read. Sub-32-bit arithmetic (iadd/imul/ishl/...) is done in i32 and
+ * can leave dirty high bits, so a signed consumer must sign-extend and an
+ * unsigned consumer must mask from the true width. No-op for >=32-bit sources
+ * or values already at their native LLVM width (i64). */
+static LLVMValueRef
+norm_int_src(struct vp_tr *t, LLVMValueRef v, unsigned bits, bool sgn) {
+   if (bits >= 32 || LLVMTypeOf(v) != t->i32)
+      return v;
+   if (sgn) {
+      unsigned sh = 32 - bits;
+      return LLVMBuildAShr(t->b,
+                LLVMBuildShl(t->b, v, LLVMConstInt(t->i32, sh, false), ""),
+                LLVMConstInt(t->i32, sh, false), "sext");
+   }
+   return LLVMBuildAnd(t->b, v, LLVMConstInt(t->i32, (1u << bits) - 1, false),
+                       "zext");
+}
+
+/* Exact-width integer type for a memory access element (i8/i16/i32/i64).
+ * Distinct from the lane ABI type ity() (only i32/i64): a sub-32-bit access
+ * must touch exactly bit_size/8 bytes. Loading/storing at the wider lane type
+ * would over-read or over-write the neighbouring element — and a widened store
+ * that straddles a 64B device block corrupts memory outright. */
+static LLVMTypeRef
+mem_ty(struct vp_tr *t, unsigned bits) {
+   return LLVMIntTypeInContext(t->ctx, bits);
+}
+
+/* Load a bit_size-wide integer from p, widened (zero-extended) to the lane ABI
+ * type so downstream ops see a normal i32/i64 SSA value. */
+static LLVMValueRef
+vp_load_mem(struct vp_tr *t, unsigned bits, LLVMValueRef p, const char *nm) {
+   LLVMValueRef raw = LLVMBuildLoad2(t->b, mem_ty(t, bits), p, nm);
+   if (bits < 32)
+      return LLVMBuildZExt(t->b, raw, ity(t, bits), "");
+   return raw;
+}
+
+/* Truncate a lane ABI value to the bit_size-wide memory element before storing,
+ * so the backend emits a byte/half store rather than a full word. */
+static LLVMValueRef
+vp_store_mem_val(struct vp_tr *t, unsigned bits, LLVMValueRef v) {
+   if (bits < 32)
+      return LLVMBuildTrunc(t->b, v, mem_ty(t, bits), "");
+   return v;
+}
 
 /* quad-derivative helper (defined with the other Vortex intrinsics, below). */
 static LLVMValueRef emit_quad_deriv(struct vp_tr *t, LLVMValueRef value,
                                     unsigned dir);
+
+/* i32 load from an iptr address (defined with the fragment wrapper, below). */
+static LLVMValueRef emit_load_i32(struct vp_tr *t, LLVMValueRef addr);
+
+/* An identity the optimizer cannot see through: an empty asm whose output is
+ * tied to its input, so it costs no instruction and yields a value with no
+ * known provenance. */
+static LLVMValueRef
+emit_opaque(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef ty = LLVMTypeOf(v);
+   LLVMTypeRef args[1] = { ty };
+   LLVMTypeRef fnty = LLVMFunctionType(ty, args, 1, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, "", 0, "=r,0", 4,
+                                      /*HasSideEffects*/ false, false,
+                                      LLVMInlineAsmDialectATT, false);
+   LLVMValueRef a[1] = { v };
+   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "opaque");
+}
 
 /* The address a store should actually use. A discarded fragment invocation keeps
  * running so its quad neighbours can still shuffle from it, but it may not commit
@@ -583,13 +947,13 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          break;
       }
       case nir_op_fadd: case nir_op_fmul: {
-         LLVMTypeRef ft = fty(t, alu->def.bit_size);
-         LLVMValueRef a = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
-         LLVMValueRef b = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c), ft, "");
+         unsigned bs = alu->def.bit_size;
+         LLVMValueRef a = as_float(t, alu_src(t, alu, 0, c), bs);
+         LLVMValueRef b = as_float(t, alu_src(t, alu, 1, c), bs);
          LLVMValueRef res = alu->op == nir_op_fadd
             ? LLVMBuildFAdd(t->b, a, b, "fadd")
             : LLVMBuildFMul(t->b, a, b, "fmul");
-         r = LLVMBuildBitCast(t->b, res, ity(t, alu->def.bit_size), "");
+         r = from_float(t, res, bs);
          break;
       }
       case nir_op_isub:
@@ -633,8 +997,15 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                             : alu->op == nir_op_ige ? LLVMIntSGE
                             : alu->op == nir_op_ult ? LLVMIntULT
                                                     : LLVMIntUGE;
-         LLVMValueRef cmp = LLVMBuildICmp(t->b, p, alu_src(t, alu, 0, c),
-                                          alu_src(t, alu, 1, c), "icmp");
+         /* Normalize sub-32-bit operands by width: signed compares sign-extend,
+          * unsigned/equality mask. Sub-32-bit arithmetic runs in the i32 lane
+          * and leaves dirty high bits (e.g. a 16-bit iadd that overflowed in a
+          * saturating-dot), which would corrupt an i32 icmp. */
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         bool sgn = (alu->op == nir_op_ilt || alu->op == nir_op_ige);
+         LLVMValueRef ca = norm_int_src(t, alu_src(t, alu, 0, c), sbs, sgn);
+         LLVMValueRef cb = norm_int_src(t, alu_src(t, alu, 1, c), sbs, sgn);
+         LLVMValueRef cmp = LLVMBuildICmp(t->b, p, ca, cb, "icmp");
          r = (alu->def.bit_size == 1) ? cmp
            : LLVMBuildSExt(t->b, cmp, t->i32, "");
          break;
@@ -646,9 +1017,9 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                              : alu->op == nir_op_fneu ? LLVMRealUNE
                              : alu->op == nir_op_flt ? LLVMRealOLT
                                                      : LLVMRealOGE;
-         LLVMTypeRef ft = fty(t, nir_src_bit_size(alu->src[0].src));
-         LLVMValueRef a = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
-         LLVMValueRef b = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c), ft, "");
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         LLVMValueRef a = as_float(t, alu_src(t, alu, 0, c), sbs);
+         LLVMValueRef b = as_float(t, alu_src(t, alu, 1, c), sbs);
          LLVMValueRef cmp = LLVMBuildFCmp(t->b, p, a, b, "fcmp");
          r = (alu->def.bit_size == 1) ? cmp
            : LLVMBuildSExt(t->b, cmp, t->i32, "");
@@ -689,33 +1060,46 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          r = LLVMBuildNeg(t->b, alu_src(t, alu, 0, c), "ineg");
          break;
       /* integer <-> float conversions (floats held as i32 bit patterns) */
-      case nir_op_i2f32:
-         r = LLVMBuildBitCast(t->b,
-            LLVMBuildSIToFP(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->i32, "");
+      case nir_op_i2f16: case nir_op_i2f32: case nir_op_i2f64: {
+         unsigned db  = alu->def.bit_size;
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         LLVMValueRef s = norm_int_src(t, alu_src(t, alu, 0, c), sbs, true);
+         r = from_float(t, LLVMBuildSIToFP(t->b, s, cty(t, db), ""), db);
          break;
-      case nir_op_u2f32:
-         r = LLVMBuildBitCast(t->b,
-            LLVMBuildUIToFP(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->i32, "");
+      }
+      case nir_op_u2f16: case nir_op_u2f32: case nir_op_u2f64: {
+         unsigned db  = alu->def.bit_size;
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         LLVMValueRef s = norm_int_src(t, alu_src(t, alu, 0, c), sbs, false);
+         r = from_float(t, LLVMBuildUIToFP(t->b, s, cty(t, db), ""), db);
          break;
-      case nir_op_f2i32:
-         r = LLVMBuildFPToSI(t->b,
-            LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->i32, "");
+      }
+      case nir_op_f2i8:  case nir_op_f2i16:
+      case nir_op_f2i32: case nir_op_f2i64: {
+         unsigned db = alu->def.bit_size;
+         LLVMValueRef v = LLVMBuildFPToSI(t->b,
+            as_float(t, alu_src(t, alu, 0, c), nir_src_bit_size(alu->src[0].src)),
+            LLVMIntTypeInContext(t->ctx, db), "");
+         r = db < 32 ? LLVMBuildZExt(t->b, v, t->i32, "") : v;
          break;
-      case nir_op_f2u32:
-         r = LLVMBuildFPToUI(t->b,
-            LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f32, ""),
-            t->i32, "");
+      }
+      case nir_op_f2u8:  case nir_op_f2u16:
+      case nir_op_f2u32: case nir_op_f2u64: {
+         unsigned db = alu->def.bit_size;
+         LLVMValueRef v = LLVMBuildFPToUI(t->b,
+            as_float(t, alu_src(t, alu, 0, c), nir_src_bit_size(alu->src[0].src)),
+            LLVMIntTypeInContext(t->ctx, db), "");
+         r = db < 32 ? LLVMBuildZExt(t->b, v, t->i32, "") : v;
          break;
+      }
       /* float neg / div / min / max / abs / fused-multiply-add / sign */
       case nir_op_fneg: case nir_op_fdiv:
       case nir_op_fmin: case nir_op_fmax:
       case nir_op_fabs: case nir_op_ffma: case nir_op_fsign:
       case nir_op_fsqrt: case nir_op_frsq: {
-         LLVMTypeRef  ft = fty(t, alu->def.bit_size);
-         LLVMValueRef fa = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
+         unsigned     bs = alu->def.bit_size;
+         LLVMTypeRef  ft = cty(t, bs);
+         LLVMValueRef fa = as_float(t, alu_src(t, alu, 0, c), bs);
          LLVMValueRef z  = LLVMConstReal(ft, 0.0);
          LLVMValueRef res;
          if (alu->op == nir_op_fsqrt) {
@@ -726,9 +1110,9 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          } else if (alu->op == nir_op_fneg) {
             res = LLVMBuildFNeg(t->b, fa, "");
          } else if (alu->op == nir_op_fabs) {
-            res = LLVMBuildSelect(t->b,
-               LLVMBuildFCmp(t->b, LLVMRealOLT, fa, z, ""),
-               LLVMBuildFNeg(t->b, fa, ""), fa, "");
+            /* llvm.fabs clears the sign bit outright; a select(x<0,-x,x) would
+             * mishandle -0.0 (-0.0 < 0.0 is false, so it would keep the sign). */
+            res = emit_funary_intrin(t, "fabs", fa, bs);
          } else if (alu->op == nir_op_fsign) {
             res = LLVMBuildSelect(t->b,
                LLVMBuildFCmp(t->b, LLVMRealOGT, fa, z, ""),
@@ -737,8 +1121,7 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                   LLVMBuildFCmp(t->b, LLVMRealOLT, fa, z, ""),
                   LLVMConstReal(ft, -1.0), z, ""), "");
          } else {
-            LLVMValueRef fb = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c),
-                                               ft, "");
+            LLVMValueRef fb = as_float(t, alu_src(t, alu, 1, c), bs);
             if (alu->op == nir_op_fdiv)
                res = LLVMBuildFDiv(t->b, fa, fb, "");
             else if (alu->op == nir_op_fmin)
@@ -748,39 +1131,39 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                res = LLVMBuildSelect(t->b,
                   LLVMBuildFCmp(t->b, LLVMRealOGT, fa, fb, ""), fa, fb, "");
             else { /* ffma */
-               LLVMValueRef fc = LLVMBuildBitCast(t->b, alu_src(t, alu, 2, c),
-                                                  ft, "");
+               LLVMValueRef fc = as_float(t, alu_src(t, alu, 2, c), bs);
                res = LLVMBuildFAdd(t->b, LLVMBuildFMul(t->b, fa, fb, ""),
                                    fc, "");
             }
          }
-         r = LLVMBuildBitCast(t->b, res, ity(t, alu->def.bit_size), "");
+         r = from_float(t, res, bs);
          break;
       }
       /* float width conversions — branch on the actual LLVM operand width so
        * the bitcasts stay legal even when the source value was materialized at
        * a different width than its NIR bit_size (a same-width convert is the
        * identity on the bit pattern). */
+      /* Float width conversions. Drive off the NIR source/dest bit sizes (not the
+       * LLVM operand type — a 16-bit float shares the i32 lane rep with f32) so
+       * f2f16/f2f32/f2f64 pick the right FPExt/FPTrunc/identity in every case. */
+      /* f2f16_rtne is f2f16 with an explicit round-to-nearest-even request;
+       * from_float's FPTrunc-to-half already rounds RTNE under the default mode,
+       * so it shares the f2f16 path. SPIR-V OpQuantizeToF16 lowers to this. */
+      case nir_op_f2f16_rtne:
+      case nir_op_f2f16:
+      case nir_op_f2f32:
       case nir_op_f2f64: {
-         LLVMValueRef v = alu_src(t, alu, 0, c);
-         if (LLVMTypeOf(v) == t->i64) {
-            r = v;   /* already an f64 bit pattern */
-         } else {
-            r = LLVMBuildBitCast(t->b, LLVMBuildFPExt(t->b,
-               LLVMBuildBitCast(t->b, v, t->f32, ""), t->f64, ""),
-               t->i64, "f2f64");
-         }
-         break;
-      }
-      case nir_op_f2f32: {
-         LLVMValueRef v = alu_src(t, alu, 0, c);
-         if (LLVMTypeOf(v) == t->i32) {
-            r = v;   /* already an f32 bit pattern */
-         } else {
-            r = LLVMBuildBitCast(t->b, LLVMBuildFPTrunc(t->b,
-               LLVMBuildBitCast(t->b, v, t->f64, ""), t->f32, ""),
-               t->i32, "f2f32");
-         }
+         unsigned sb = nir_src_bit_size(alu->src[0].src);
+         unsigned db = alu->def.bit_size;
+         /* as_float yields the compute type (f32 for 16/32, f64 for 64); convert
+          * between compute types, then from_float rounds to f16 when db==16. An
+          * f16<->f32 convert is a no-op here — the round happens in from_float. */
+         LLVMValueRef s = as_float(t, alu_src(t, alu, 0, c), sb);
+         LLVMValueRef res =
+              (cty(t, db) == cty(t, sb)) ? s
+            : (db == 64) ? LLVMBuildFPExt(t->b, s, t->f64, "f2f")
+                         : LLVMBuildFPTrunc(t->b, s, t->f32, "f2f");
+         r = from_float(t, res, db);
          break;
       }
       /* integer modulo + 64-bit pack */
@@ -815,35 +1198,85 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
             LLVMBuildLShr(t->b, alu_src(t, alu, 0, c),
                           LLVMConstInt(t->i64, 32, false), ""), t->i32, "hi32");
          break;
-      /* bool -> int / float */
-      case nir_op_b2i32: case nir_op_b2f32: {
+      /* bool -> int / float (any result width). Floats round through from_float
+       * so b2f16 lands as a valid f16 bit pattern; sub-32-bit ints are held in
+       * the i32 lane. */
+      case nir_op_b2i8: case nir_op_b2i16:
+      case nir_op_b2i32: case nir_op_b2i64:
+      case nir_op_b2f16: case nir_op_b2f32: case nir_op_b2f64: {
+         unsigned db = alu->def.bit_size;
          LLVMValueRef v = alu_src(t, alu, 0, c);
          LLVMValueRef cond = (LLVMTypeOf(v) == LLVMInt1TypeInContext(t->ctx))
             ? v
             : LLVMBuildICmp(t->b, LLVMIntNE, v,
                             LLVMConstInt(LLVMTypeOf(v), 0, false), "");
-         if (alu->op == nir_op_b2i32)
-            r = LLVMBuildSelect(t->b, cond, LLVMConstInt(t->i32, 1, false),
-                                LLVMConstInt(t->i32, 0, false), "");
-         else
-            r = LLVMBuildBitCast(t->b,
-               LLVMBuildSelect(t->b, cond, LLVMConstReal(t->f32, 1.0),
-                               LLVMConstReal(t->f32, 0.0), ""), t->i32, "");
+         int is_float = (alu->op == nir_op_b2f16 || alu->op == nir_op_b2f32 ||
+                         alu->op == nir_op_b2f64);
+         if (is_float) {
+            LLVMTypeRef ft = cty(t, db);
+            r = from_float(t, LLVMBuildSelect(t->b, cond,
+                   LLVMConstReal(ft, 1.0), LLVMConstReal(ft, 0.0), ""), db);
+         } else {
+            LLVMTypeRef it = (db == 64) ? t->i64 : t->i32;
+            r = LLVMBuildSelect(t->b, cond, LLVMConstInt(it, 1, false),
+                                LLVMConstInt(it, 0, false), "");
+         }
          break;
       }
-      /* width conversions */
+      /* width conversions. Widening normalizes the source from its true bit size
+       * first (sign- or zero-extend), because sub-32-bit arithmetic runs in i32
+       * and can leave dirty high bits (e.g. a 16-bit iadd that wrapped). */
       case nir_op_u2u64:
-         r = LLVMBuildZExt(t->b, alu_src(t, alu, 0, c), t->i64, "u2u64");
+         r = LLVMBuildZExt(t->b,
+               norm_int_src(t, alu_src(t, alu, 0, c),
+                            nir_src_bit_size(alu->src[0].src), false),
+               t->i64, "u2u64");
          break;
       case nir_op_i2i64:
-         r = LLVMBuildSExt(t->b, alu_src(t, alu, 0, c), t->i64, "i2i64");
+         r = LLVMBuildSExt(t->b,
+               norm_int_src(t, alu_src(t, alu, 0, c),
+                            nir_src_bit_size(alu->src[0].src), true),
+               t->i64, "i2i64");
          break;
-      case nir_op_u2u32: case nir_op_i2i32:
-         /* 64-bit source -> 32: truncate; 32-bit source: identity. */
-         r = (LLVMTypeOf(alu_src(t, alu, 0, c)) == t->i64)
-            ? LLVMBuildTrunc(t->b, alu_src(t, alu, 0, c), t->i32, "")
-            : alu_src(t, alu, 0, c);
+      case nir_op_u2u32: case nir_op_i2i32: {
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         LLVMValueRef s = alu_src(t, alu, 0, c);
+         /* 64-bit source -> 32: truncate; otherwise normalize from sbs. */
+         r = (LLVMTypeOf(s) == t->i64)
+            ? LLVMBuildTrunc(t->b, s, t->i32, "")
+            : norm_int_src(t, s, sbs, alu->op == nir_op_i2i32);
          break;
+      }
+      /* Sub-32-bit int conversions. The lane ABI keeps every integer in an i32
+       * (ity() never yields i16/i8). Both the SOURCE and DEST widths matter: the
+       * source is first normalized from its own bit size (an i8 source may sit in
+       * the lane zero-extended, so a signed i2i16 must sign-extend from bit 8, not
+       * bit 16), then the result is produced at the destination width. Used by
+       * packed 8/16-bit math (16bit_storage add-immediate, integer-dot-product). */
+      case nir_op_u2u16: case nir_op_u2u8: {
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         unsigned dbs = (alu->op == nir_op_u2u16) ? 16u : 8u;
+         LLVMValueRef s = alu_src(t, alu, 0, c);
+         if (LLVMTypeOf(s) == t->i64)
+            s = LLVMBuildTrunc(t->b, s, t->i32, "");
+         s = norm_int_src(t, s, sbs, false);           /* clean unsigned source */
+         r = LLVMBuildAnd(t->b, s,
+                LLVMConstInt(t->i32, (1u << dbs) - 1u, false), "u2u");
+         break;
+      }
+      case nir_op_i2i16: case nir_op_i2i8: {
+         unsigned sbs = nir_src_bit_size(alu->src[0].src);
+         unsigned dbs = (alu->op == nir_op_i2i16) ? 16u : 8u;
+         LLVMValueRef s = alu_src(t, alu, 0, c);
+         if (LLVMTypeOf(s) == t->i64)
+            s = LLVMBuildTrunc(t->b, s, t->i32, "");
+         s = norm_int_src(t, s, sbs, true);            /* signed value from source */
+         unsigned sh = 32u - dbs;                       /* canonicalize as dbs-bit signed */
+         r = LLVMBuildAShr(t->b,
+                LLVMBuildShl(t->b, s, LLVMConstInt(t->i32, sh, false), ""),
+                LLVMConstInt(t->i32, sh, false), "i2i");
+         break;
+      }
       /* high 32 bits of a 32x32 multiply */
       case nir_op_umul_high: case nir_op_imul_high: {
          LLVMTypeRef ext = t->i64;
@@ -859,12 +1292,13 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          break;
       }
       /* float reciprocal */
-      case nir_op_frcp:
-         r = LLVMBuildBitCast(t->b,
-            LLVMBuildFDiv(t->b, LLVMConstReal(t->f32, 1.0),
-               LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), t->f32, ""), ""),
-            t->i32, "frcp");
+      case nir_op_frcp: {
+         unsigned bs = alu->def.bit_size;
+         r = from_float(t,
+            LLVMBuildFDiv(t->b, LLVMConstReal(cty(t, bs), 1.0),
+               as_float(t, alu_src(t, alu, 0, c), bs), ""), bs);
          break;
+      }
       /* ufind_msb: index of the highest set bit, -1 when the source is 0.
        * ctlz(0)=32, so 31-ctlz naturally yields -1 for a zero source. */
       case nir_op_ufind_msb:
@@ -874,12 +1308,57 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
       case nir_op_bit_count:
          r = emit_ctpop(t, alu_src(t, alu, 0, c));
          break;
+      case nir_op_bitfield_reverse:
+         r = emit_bitreverse(t, alu_src(t, alu, 0, c));
+         break;
+      /* find_lsb: index of the lowest set bit, -1 when the source is 0. cttz(0)
+       * is 32 (zero-is-not-poison), so a zero source is mapped to -1 explicitly. */
+      case nir_op_find_lsb: {
+         LLVMValueRef v  = alu_src(t, alu, 0, c);
+         LLVMValueRef tz = emit_cttz(t, v);
+         r = LLVMBuildSelect(t->b,
+             LLVMBuildICmp(t->b, LLVMIntEQ, v, LLVMConstInt(t->i32, 0, false), ""),
+             LLVMConstInt(t->i32, -1, true), tz, "find_lsb");
+         break;
+      }
       case nir_op_fpow: {
-         LLVMTypeRef  ft = fty(t, alu->def.bit_size);
-         LLVMValueRef x  = LLVMBuildBitCast(t->b, alu_src(t, alu, 0, c), ft, "");
-         LLVMValueRef y  = LLVMBuildBitCast(t->b, alu_src(t, alu, 1, c), ft, "");
-         r = LLVMBuildBitCast(t->b, emit_fpow(t, x, y),
-                              ity(t, alu->def.bit_size), "");
+         unsigned bs = alu->def.bit_size;
+         LLVMValueRef x = as_float(t, alu_src(t, alu, 0, c), bs);
+         LLVMValueRef y = as_float(t, alu_src(t, alu, 1, c), bs);
+         r = from_float(t, emit_fpow(t, x, y), bs);
+         break;
+      }
+      /* Unary float rounding + transcendentals. floor/ceil/trunc are synthesized
+       * (see emit_ftrunc) because their intrinsics don't lower in divergent
+       * codegen; fround_even maps to nearbyint (identical under the default
+       * round-to-nearest-even mode); exp2/log2/sin/cos use LLVM intrinsics that
+       * lower to libcalls. */
+      case nir_op_ffloor: case nir_op_fceil: case nir_op_ftrunc:
+      case nir_op_fround_even:
+      case nir_op_fexp2: case nir_op_flog2:
+      case nir_op_fsin: case nir_op_fcos: {
+         unsigned     bs = alu->def.bit_size;
+         LLVMValueRef fa = as_float(t, alu_src(t, alu, 0, c), bs);
+         LLVMValueRef res;
+         switch (alu->op) {
+         case nir_op_ffloor:      res = emit_ffloor(t, fa, bs); break;
+         case nir_op_fceil:       res = emit_fceil(t, fa, bs);  break;
+         case nir_op_ftrunc:      res = emit_ftrunc(t, fa, bs); break;
+         case nir_op_fround_even: res = emit_funary_intrin(t, "nearbyint", fa, bs); break;
+         case nir_op_fexp2:       res = emit_funary_intrin(t, "exp2", fa, bs); break;
+         case nir_op_flog2:       res = emit_funary_intrin(t, "log2", fa, bs); break;
+         case nir_op_fsin:        res = emit_funary_intrin(t, "sin",  fa, bs); break;
+         default:                 res = emit_funary_intrin(t, "cos",  fa, bs); break;
+         }
+         r = from_float(t, res, bs);
+         break;
+      }
+      /* ffract: x - floor(x). */
+      case nir_op_ffract: {
+         unsigned     bs = alu->def.bit_size;
+         LLVMValueRef fa = as_float(t, alu_src(t, alu, 0, c), bs);
+         LLVMValueRef fl = emit_ffloor(t, fa, bs);
+         r = from_float(t, LLVMBuildFSub(t->b, fa, fl, "ffract"), bs);
          break;
       }
       /* b2b1: normalize a bool to a 1-bit bool (nonzero -> true). */
@@ -1001,13 +1480,15 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
    ssa_set(t, d->def.index, 0, addr);
 }
 
-/* RTU emit helpers (defined after emit_vx_tex, below). */
+/* RTU emit helpers (defined after the TEX emitters, below). */
 static LLVMValueRef emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status);
 static LLVMValueRef emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene,
                                       LLVMValueRef flags_cull,
                                       LLVMValueRef ray[8]);
 static LLVMValueRef emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle);
 static void         emit_vx_rt_cb_ret(struct vp_tr *t, LLVMValueRef action);
+static void         emit_vx_rt_continue(struct vp_tr *t, LLVMValueRef action,
+                                        LLVMValueRef tval, LLVMValueRef attr);
 
 /* Emit an atomicrmw / cmpxchg at device pointer p, setting the intrinsic's def
  * to the old value. Data sources start at src index `di` (rmw: [di]=value;
@@ -1102,30 +1583,78 @@ img_desc_u32(struct vp_tr *t, LLVMValueRef desc, unsigned byte_off)
    return LLVMBuildLoad2(t->b, t->i32, p, "imgfld");
 }
 
-/* f32 in [0,1] -> unorm8 (round-to-nearest), value given as its i32 bit pattern. */
+/* f32 in [0,1] -> unsigned-normalized integer of `bits` width (round-to-nearest),
+ * value given as its i32 bit pattern. Covers the 8-bit channels of RGBA8_UNORM and
+ * the 10/2-bit channels of R10G10B10A2_UNORM. */
 static LLVMValueRef
-f32bits_to_unorm8(struct vp_tr *t, LLVMValueRef vi)
+f32bits_to_unorm(struct vp_tr *t, LLVMValueRef vi, unsigned bits)
 {
+   double maxv = (double)((1u << bits) - 1u);
    LLVMValueRef f   = LLVMBuildBitCast(t->b, vi, t->f32, "");
    LLVMValueRef z   = LLVMConstReal(t->f32, 0.0);
    LLVMValueRef one = LLVMConstReal(t->f32, 1.0);
    f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, f, z, ""), f, z, "");
    f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, f, one, ""), f, one, "");
    LLVMValueRef s = LLVMBuildFAdd(t->b,
-      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, 255.0), ""),
+      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, maxv), ""),
       LLVMConstReal(t->f32, 0.5), "");
    LLVMValueRef b = LLVMBuildFPToUI(t->b, s, t->i32, "");
-   return LLVMBuildAnd(t->b, b, LLVMConstInt(t->i32, 0xff, false), "");
+   return LLVMBuildAnd(t->b, b, LLVMConstInt(t->i32, (1u << bits) - 1u, false), "");
 }
 
-/* unorm8 (low byte of `word`) -> f32 in [0,1], returned as its i32 bit pattern. */
+/* `bits`-wide unsigned-normalized field (low bits of `word`) -> f32 in [0,1],
+ * returned as its i32 bit pattern. */
 static LLVMValueRef
-unorm8_to_f32bits(struct vp_tr *t, LLVMValueRef word)
+unorm_to_f32bits(struct vp_tr *t, LLVMValueRef word, unsigned bits)
 {
-   LLVMValueRef byte = LLVMBuildAnd(t->b, word, LLVMConstInt(t->i32, 0xff, false), "");
-   LLVMValueRef f = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte, t->f32, ""),
-                                 LLVMConstReal(t->f32, 1.0 / 255.0), "");
+   LLVMValueRef m = LLVMBuildAnd(t->b, word,
+      LLVMConstInt(t->i32, (1u << bits) - 1u, false), "");
+   LLVMValueRef f = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, m, t->f32, ""),
+      LLVMConstReal(t->f32, 1.0 / (double)((1u << bits) - 1u)), "");
    return LLVMBuildBitCast(t->b, f, t->i32, "");
+}
+
+/* f32 (as i32 bits) -> unsigned float, 5-bit exponent + `mbits` mantissa, no sign
+ * (the packed floats of R11G11B10: R,G use mbits=6, B uses mbits=5). These share
+ * the IEEE half's 5-bit exponent, so the value is relayed through a half: fptrunc
+ * supplies correct rounding/denormals/overflow, and the field is the top (5+mbits)
+ * bits of the half with the always-zero sign dropped. */
+static LLVMValueRef
+f32bits_to_ufloat(struct vp_tr *t, LLVMValueRef vi, unsigned mbits)
+{
+   unsigned shift = 10 - mbits;                 /* a half carries 10 mantissa bits */
+   unsigned mask  = (1u << (5 + mbits)) - 1u;
+   LLVMValueRef f = LLVMBuildBitCast(t->b, vi, t->f32, "");
+   f = LLVMBuildSelect(t->b,                    /* unsigned: clamp <=0 and NaN to 0 */
+      LLVMBuildFCmp(t->b, LLVMRealOGT, f, LLVMConstReal(t->f32, 0.0), ""),
+      f, LLVMConstReal(t->f32, 0.0), "");
+   LLVMValueRef hi = LLVMBuildZExt(t->b,
+      LLVMBuildBitCast(t->b, LLVMBuildFPTrunc(t->b, f,
+         LLVMHalfTypeInContext(t->ctx), ""), LLVMInt16TypeInContext(t->ctx), ""),
+      t->i32, "");
+   /* round the dropped low mantissa bits (round half up); a carry propagates
+    * through the mantissa into the exponent, matching IEEE overflow to inf. */
+   hi = LLVMBuildAdd(t->b, hi, LLVMConstInt(t->i32, 1u << (shift - 1), false), "");
+   return LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, hi, LLVMConstInt(t->i32, shift, false), ""),
+      LLVMConstInt(t->i32, mask, false), "");
+}
+
+/* inverse of f32bits_to_ufloat: unsigned-float field (low bits of `word`) -> f32
+ * bit pattern, via the same half relay. */
+static LLVMValueRef
+ufloat_to_f32bits(struct vp_tr *t, LLVMValueRef word, unsigned mbits)
+{
+   unsigned shift = 10 - mbits;
+   unsigned mask  = (1u << (5 + mbits)) - 1u;
+   LLVMValueRef fld = LLVMBuildAnd(t->b, word,
+      LLVMConstInt(t->i32, mask, false), "");
+   LLVMValueRef h16 = LLVMBuildTrunc(t->b,
+      LLVMBuildShl(t->b, fld, LLVMConstInt(t->i32, shift, false), ""),
+      LLVMInt16TypeInContext(t->ctx), "");
+   LLVMValueRef ff = LLVMBuildFPExt(t->b,
+      LLVMBuildBitCast(t->b, h16, LLVMHalfTypeInContext(t->ctx), ""), t->f32, "");
+   return LLVMBuildBitCast(t->b, ff, t->i32, "");
 }
 
 static void
@@ -1139,20 +1668,57 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          in->intrinsic == nir_intrinsic_load_workgroup_id ? VX_CSR_CTA_BLOCK_ID_X
        : in->intrinsic == nir_intrinsic_load_num_workgroups ? VX_CSR_CTA_GRID_DIM_X
                                                           : VX_CSR_CTA_THREAD_ID_X;
-      for (unsigned c = 0; c < in->def.num_components; c++)
-         ssa_set(t, in->def.index, c, emit_csr_read(t, base + c, "id"));
+      for (unsigned c = 0; c < in->def.num_components; c++) {
+         LLVMValueRef id = emit_csr_read(t, base + c, "id");
+         /* gl_WorkGroupID must include the vkCmdDispatchBase base offset
+          * (arg[2]=base_x|base_y<<32, arg[3]=base_z). The hardware block id is
+          * base-relative; the base rides in as a kernel dispatch parameter so
+          * this works identically on SimX and RTL with no KMU change. */
+         if (in->intrinsic == nir_intrinsic_load_workgroup_id && t->arg) {
+            unsigned slot = (c == 2) ? VP_ARG_GRID_BASE_Z : VP_ARG_GRID_BASE_XY;
+            LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg,
+               (LLVMValueRef[]){ LLVMConstInt(t->i64, slot, false) }, 1, "");
+            LLVMValueRef packed = LLVMBuildLoad2(t->b, t->i64, gep, "gbase");
+            if (c == 1)
+               packed = LLVMBuildLShr(t->b, packed, LLVMConstInt(t->i64, 32, false), "");
+            LLVMValueRef off = LLVMBuildTrunc(t->b, packed, t->i32, "");
+            id = LLVMBuildAdd(t->b, id, off, "wgid");
+         }
+         ssa_set(t, in->def.index, c, id);
+      }
       break;
    }
-   /* gl_VertexIndex: one Vortex thread per vertex, so it is the CTA
-    * thread id (vp_draw_vbo launches a single block of `count`). */
+   /* gl_VertexIndex is firstVertex + the draw position, while the vid is the
+    * 0-based position (the host folds firstVertex into the attribute bases, so
+    * the fetch must not see it twice). The base is zero on an indexed draw,
+    * where the vid is already the absolute index value, and on the
+    * zero-base opcode, which is 0-based by definition. */
    case nir_intrinsic_load_vertex_id:
+      ssa_set(t, in->def.index, 0,
+              t->base_vertex ? LLVMBuildAdd(t->b, t->vid, t->base_vertex, "vidx")
+                             : t->vid);
+      break;
    case nir_intrinsic_load_vertex_id_zero_base:
       ssa_set(t, in->def.index, 0, t->vid);
+      break;
+   case nir_intrinsic_load_base_vertex:
+      ssa_set(t, in->def.index, 0,
+              t->base_vertex ? t->base_vertex : LLVMConstInt(t->i32, 0, false));
       break;
    /* Instancing. gl_InstanceIndex lowers (nir_lower_system_values) to
     * load_instance_id + load_base_instance; the VS prologue resolves the
     * 0-based instance id and the base-instance from arg slots 3/4. On the
     * non-instanced fast path instance == 0 and first_instance == 0. */
+   /* gl_FrontFacing: the wrapper resolved the primitive's winding into the
+    * reserved system-value slot, because the primitive record is in scope there
+    * and not here. NIR wants a 1-bit value. */
+   case nir_intrinsic_load_front_face:
+      ssa_set(t, in->def.index, 0,
+              LLVMBuildICmp(t->b, LLVMIntNE,
+                 emit_load_i32(t, LLVMBuildAdd(t->b, t->fs_in_base,
+                    vp_iptr_const(t, t->fs_sysval_off), "")),
+                 LLVMConstInt(t->i32, 0, false), "frontface"));
+      break;
    case nir_intrinsic_load_instance_id:
       ssa_set(t, in->def.index, 0,
               t->instance ? t->instance : LLVMConstInt(t->i32, 0, false));
@@ -1252,14 +1818,25 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 1),
                                         t->i64, "");
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
-      LLVMTypeRef  lt   = ity(t, in->def.bit_size);
       unsigned     esz  = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(t->i64, c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "buf"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "buf"));
       }
+      break;
+   }
+   case nir_intrinsic_get_ssbo_size: {
+      /* Runtime length of an unsized SSBO array (GLSL .length()). src[0] is the
+       * buffer's descriptor device address; its lp_jit_buffer.num_elements
+       * (u32 at offset 8, == byte size for an SSBO) is what the intrinsic
+       * returns. The frontend divides by the array stride to get the count. */
+      LLVMValueRef desc = intr_src(t, in, 0);
+      LLVMValueRef sp = LLVMBuildIntToPtr(t->b,
+         LLVMBuildAdd(t->b, desc, LLVMConstInt(t->i64, 8, false), ""),
+         t->ptr, "");
+      ssa_set(t, in->def.index, 0, LLVMBuildLoad2(t->b, t->i32, sp, "ssbosize"));
       break;
    }
    case nir_intrinsic_store_ssbo: {
@@ -1294,7 +1871,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(t->i64, c * esz, false), "");
          if (v)
-            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
+                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
       break;
    }
@@ -1325,7 +1903,9 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
       LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "ssbobase");
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 1), t->i64, "");
-      LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
+      /* A suppressed fragment may not touch memory, and an atomic is a write
+       * like any other -- steer it to the sink exactly as store_ssbo is. */
+      LLVMValueRef addr = emit_store_addr(t, LLVMBuildAdd(t->b, base, off, ""));
       LLVMValueRef p    = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
       if (in->intrinsic == nir_intrinsic_ssbo_atomic_swap) {
          /* compare-and-swap: src[2]=compare, src[3]=new. cmpxchg returns
@@ -1376,7 +1956,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
     * at src[1] (swap: src[1]=compare, src[2]=new). */
    case nir_intrinsic_global_atomic:
    case nir_intrinsic_global_atomic_swap: {
-      LLVMValueRef p = LLVMBuildIntToPtr(t->b, intr_src(t, in, 0), t->ptr, "");
+      LLVMValueRef p = LLVMBuildIntToPtr(t->b,
+         emit_store_addr(t, intr_src(t, in, 0)), t->ptr, "");
       emit_atomic_at(t, in, p, 1,
                      in->intrinsic == nir_intrinsic_global_atomic_swap);
       break;
@@ -1390,7 +1971,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMBuildAdd(t->b, t->lmem_base,
             vp_iptr_const(t, nir_intrinsic_base(in)), ""),
          vp_to_iptr(t, intr_src(t, in, 0)), "shatomaddr");
-      LLVMValueRef p = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
+      LLVMValueRef p = LLVMBuildIntToPtr(t->b, emit_store_addr(t, addr),
+                                         t->ptr, "");
       emit_atomic_at(t, in, p, 1,
                      in->intrinsic == nir_intrinsic_shared_atomic_swap);
       break;
@@ -1409,13 +1991,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       }
       LLVMValueRef off  = LLVMBuildZExt(t->b, intr_src(t, in, 0), t->i64, "");
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
-      LLVMTypeRef  lt   = ity(t, in->def.bit_size);
       unsigned     esz  = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(t->i64, c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "push"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "push"));
       }
       break;
    }
@@ -1423,13 +2004,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_global:
    case nir_intrinsic_load_global_constant: {
       LLVMValueRef addr = intr_src(t, in, 0);
-      LLVMTypeRef  lt   = ity(t, in->def.bit_size);
       unsigned     esz  = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(LLVMTypeOf(addr), c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "gld"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "gld"));
       }
       break;
    }
@@ -1444,7 +2024,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(LLVMTypeOf(addr), c * esz, false), "");
          if (v)
-            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
+                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
       break;
    }
@@ -1455,13 +2036,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMBuildAdd(t->b, t->lmem_base,
             vp_iptr_const(t, nir_intrinsic_base(in)), ""),
          vp_to_iptr(t, intr_src(t, in, 0)), "shaddr");
-      LLVMTypeRef lt  = ity(t, in->def.bit_size);
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "sld"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "sld"));
       }
       break;
    }
@@ -1480,7 +2060,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          if (v)
-            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
+                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
       break;
    }
@@ -1488,12 +2069,11 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_scratch: {
       LLVMValueRef addr = LLVMBuildAdd(t->b, emit_scratch_base(t),
          vp_to_iptr(t, intr_src(t, in, 0)), "scaddr");
-      LLVMTypeRef lt  = ity(t, in->def.bit_size);
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr, vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "scld"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "scld"));
       }
       break;
    }
@@ -1508,7 +2088,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef v = ssa_get(t, in->src[0].ssa->index, c);
          LLVMValueRef a = LLVMBuildAdd(t->b, addr, vp_iptr_const(t, c * esz), "");
          if (v)
-            LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+            LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
+                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
       }
       break;
    }
@@ -1555,46 +2136,183 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
               LLVMBuildICmp(t->b, LLVMIntEQ, lane, low, "elect"));
       break;
    }
-   /* Inclusive prefix scan across the warp (subgroup): Hillis-Steele over
-    * shfl_up with a lane-id guard so a lane below the step distance keeps its
-    * own accumulator (shfl_up returns own value out of range — accumulating it
-    * would double-count). Unrolled to cover NT up to 32; steps past NT no-op. */
-   case nir_intrinsic_inclusive_scan: {
+   /* shuffle: each lane reads src[0] from the lane numbered src[1]. shfl_idx
+    * takes a dynamic source lane and preserves the value type, so this is a
+    * direct gather. */
+   case nir_intrinsic_shuffle:
+      ssa_set(t, in->def.index, 0,
+              emit_shfl_idx(t, intr_src(t, in, 0), intr_src(t, in, 1)));
+      break;
+   /* vote_all / vote_any: reduce a per-lane predicate over the ACTIVE lanes.
+    * active = ballot(1); votes = ballot(pred). all = (votes & active)==active;
+    * any = (votes & active)!=0. Restricting to the active mask is what makes the
+    * result correct under divergence. */
+   case nir_intrinsic_vote_all:
+   case nir_intrinsic_vote_any: {
+      LLVMValueRef pred = intr_src(t, in, 0);
+      if (LLVMTypeOf(pred) == LLVMInt1TypeInContext(t->ctx))
+         pred = LLVMBuildZExt(t->b, pred, t->i32, "");
+      LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+      LLVMValueRef votes  = LLVMBuildAnd(t->b, emit_ballot(t, pred), active, "");
+      LLVMValueRef r = in->intrinsic == nir_intrinsic_vote_all
+         ? LLVMBuildICmp(t->b, LLVMIntEQ, votes, active, "vote_all")
+         : LLVMBuildICmp(t->b, LLVMIntNE, votes,
+                         LLVMConstInt(t->i32, 0, false), "vote_any");
+      ssa_set(t, in->def.index, 0, r);
+      break;
+   }
+   /* vote_ieq / vote_feq: true iff src[0] is equal across all active lanes.
+    * Broadcast the lowest active lane's value, compare per-lane, then vote_all
+    * that comparison. feq uses ordered float equality (NaN => not-all-equal,
+    * which is the defined result). */
+   case nir_intrinsic_vote_ieq:
+   case nir_intrinsic_vote_feq: {
+      LLVMValueRef val    = intr_src(t, in, 0);
+      LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+      LLVMValueRef low    = emit_cttz(t, active);
+      LLVMValueRef first  = emit_shfl_idx(t, val, low);
+      LLVMValueRef eq;
+      if (in->intrinsic == nir_intrinsic_vote_feq) {
+         unsigned bs = in->src[0].ssa->bit_size;
+         eq = LLVMBuildFCmp(t->b, LLVMRealOEQ,
+                            as_float(t, val, bs), as_float(t, first, bs), "");
+      } else {
+         eq = LLVMBuildICmp(t->b, LLVMIntEQ, val, first, "");
+      }
+      LLVMValueRef votes = LLVMBuildAnd(t->b,
+         emit_ballot(t, LLVMBuildZExt(t->b, eq, t->i32, "")), active, "");
+      ssa_set(t, in->def.index, 0,
+              LLVMBuildICmp(t->b, LLVMIntEQ, votes, active, "vote_eq"));
+      break;
+   }
+   /* Subgroup scans/reduction over the warp. All three share the inclusive
+    * Hillis-Steele scan (emit_subgroup_incl_scan):
+    *   inclusive[i] = combine(lanes 0..i)
+    *   exclusive[i] = combine(lanes 0..i-1); lane 0 = identity  (= incl shifted up 1)
+    *   reduce       = combine(all active lanes) = inclusive of the highest active lane
+    * 32-bit lane values only (the shfl transport width).
+    *
+    * A reduce may additionally carry a cluster size: it then folds over each
+    * group of that many consecutive lanes independently rather than over the
+    * whole warp. Only reduce carries one — the scans never do — and a cluster
+    * spanning the entire subgroup has already been normalised to 0 upstream. */
+   case nir_intrinsic_inclusive_scan:
+   case nir_intrinsic_exclusive_scan:
+   case nir_intrinsic_reduce: {
       if (in->def.bit_size != 32) {
-         mesa_logw("vortexpipe: %u-bit inclusive_scan unsupported (32-bit only)",
+         mesa_logw("vortexpipe: %u-bit subgroup scan/reduce unsupported (32-bit only)",
                    in->def.bit_size);
          t->ok = false;
          break;
       }
-      nir_op rop = nir_intrinsic_reduction_op(in);
-      LLVMValueRef acc  = intr_src(t, in, 0);
-      LLVMValueRef lane = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
-      for (unsigned d = 1; d <= 16u; d <<= 1) {
-         LLVMValueRef nbr  = emit_shfl_up(t, acc, d);
-         LLVMValueRef comb = emit_scan_combine(t, rop, acc, nbr);
+      unsigned cluster = in->intrinsic == nir_intrinsic_reduce
+         ? nir_intrinsic_cluster_size(in) : 0u;
+      /* The cluster arithmetic below builds a power-of-two lane mask that must
+       * fit the 32-bit ballot, both of which Vulkan guarantees for a cluster no
+       * wider than the subgroup. Refuse anything else rather than fold over the
+       * wrong lanes. */
+      if ((cluster & (cluster - 1u)) || cluster > 32u) {
+         mesa_logw("vortexpipe: unsupported subgroup reduce cluster size %u",
+                   cluster);
+         t->ok = false;
+         break;
+      }
+      if (cluster == 1u) {
+         /* Each lane is its own cluster: the reduction is the lane's own value. */
+         ssa_set(t, in->def.index, 0, intr_src(t, in, 0));
+         break;
+      }
+      nir_op rop  = nir_intrinsic_reduction_op(in);
+      LLVMValueRef incl = emit_subgroup_incl_scan(t, rop, intr_src(t, in, 0),
+                                                  cluster);
+      if (!t->ok)
+         break;
+      LLVMValueRef r;
+      if (in->intrinsic == nir_intrinsic_inclusive_scan) {
+         r = incl;
+      } else if (in->intrinsic == nir_intrinsic_exclusive_scan) {
+         /* exclusive[i] = the inclusive value of the nearest LOWER active lane;
+          * the first active lane gets the op identity. Probe lower lanes at
+          * power-of-two distances and take the first in-range active one — the
+          * `got` flag keeps it to the NEAREST. Divergence-safe like the inclusive
+          * scan; a fixed shfl_up(1) would read an inactive neighbour under a
+          * strided active mask and deliver the wrong lane's value. */
+         LLVMValueRef lane   = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+         LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+         LLVMValueRef one    = LLVMConstInt(t->i32, 1, false);
+         LLVMValueRef zero   = LLVMConstInt(t->i32, 0, false);
+         LLVMTypeRef  i1t    = LLVMInt1TypeInContext(t->ctx);
+         r = emit_scan_identity(t, rop);
          if (!t->ok)
             break;
-         LLVMValueRef pred = LLVMBuildICmp(t->b, LLVMIntUGE, lane,
-                                           LLVMConstInt(t->i32, d, false), "");
-         acc = LLVMBuildSelect(t->b, pred, comb, acc, "scan");
+         LLVMValueRef got = LLVMConstInt(i1t, 0, false);
+         for (unsigned d = 1; d <= 16u; d <<= 1) {
+            LLVMValueRef dc      = LLVMConstInt(t->i32, d, false);
+            LLVMValueRef cand    = emit_shfl_up(t, incl, d);
+            LLVMValueRef inrange = LLVMBuildICmp(t->b, LLVMIntUGE, lane, dc, "");
+            LLVMValueRef srcbit  = LLVMBuildAnd(t->b,
+               LLVMBuildLShr(t->b, active,
+                             LLVMBuildSub(t->b, lane, dc, ""), ""), one, "");
+            LLVMValueRef srcact  = LLVMBuildICmp(t->b, LLVMIntNE, srcbit, zero, "");
+            LLVMValueRef here    = LLVMBuildAnd(t->b, inrange, srcact, "");
+            LLVMValueRef take    = LLVMBuildAnd(t->b, here,
+                                                LLVMBuildNot(t->b, got, ""), "");
+            r   = LLVMBuildSelect(t->b, take, cand, r, "excl");
+            got = LLVMBuildOr(t->b, got, here, "");
+         }
+      } else { /* reduce: broadcast the highest active lane's inclusive value */
+         LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+         if (cluster) {
+            /* Confine the search to this lane's cluster, or the broadcast would
+             * pull in the inclusive value of a lane the cluster does not
+             * contain -- which is the whole-warp answer, not the cluster's. */
+            LLVMValueRef lane = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+            LLVMValueRef base = LLVMBuildAnd(t->b, lane,
+               LLVMConstInt(t->i32, ~(cluster - 1u), false), "cbase");
+            LLVMValueRef cmask = LLVMBuildShl(t->b,
+               LLVMConstInt(t->i32, (1u << cluster) - 1u, false), base, "cmask");
+            active = LLVMBuildAnd(t->b, active, cmask, "cactive");
+         }
+         LLVMValueRef hi = LLVMBuildSub(t->b, LLVMConstInt(t->i32, 31, false),
+                                        emit_ctlz(t, active), "hi_lane");
+         r = emit_shfl_idx(t, incl, hi);
       }
-      if (t->ok)
-         ssa_set(t, in->def.index, 0, acc);
+      ssa_set(t, in->def.index, 0, r);
       break;
    }
    /* Flat CTA-linear lane id = warp_id * NT + lane (one CTA per core, so the
     * warp id within the core is the warp id within the workgroup). */
    case nir_intrinsic_load_local_invocation_index: {
-      LLVMValueRef wid = emit_csr_read(t, VX_CSR_WARP_ID,     "wid");
-      LLVMValueRef nt  = emit_csr_read(t, VX_CSR_NUM_THREADS, "nt");
-      LLVMValueRef tid = emit_csr_read(t, VX_CSR_THREAD_ID,   "tid");
-      ssa_set(t, in->def.index, 0,
-              LLVMBuildAdd(t->b, LLVMBuildMul(t->b, wid, nt, ""), tid, "lii"));
+      /* gl_LocalInvocationIndex is the row-major linearization of the 3D local
+       * invocation id over the workgroup size (Vulkan spec):
+       *   (z*dimY + y)*dimX + x.
+       * Derive it from the CTA-local thread id + block dims — NOT warp_id*NT+tid,
+       * which uses the PHYSICAL warp id (VX_CSR_WARP_ID) and is wrong whenever a
+       * CTA lands on a nonzero physical warp (e.g. single-thread workgroups on
+       * later warps read warp_id>0 → index = warp_id*NT instead of 0). */
+      LLVMValueRef x  = emit_csr_read(t, VX_CSR_CTA_THREAD_ID_X,     "ltx");
+      LLVMValueRef y  = emit_csr_read(t, VX_CSR_CTA_THREAD_ID_X + 1, "lty");
+      LLVMValueRef z  = emit_csr_read(t, VX_CSR_CTA_THREAD_ID_X + 2, "ltz");
+      LLVMValueRef dx = emit_csr_read(t, VX_CSR_CTA_BLOCK_DIM_X,     "bdx");
+      LLVMValueRef dy = emit_csr_read(t, VX_CSR_CTA_BLOCK_DIM_X + 1, "bdy");
+      LLVMValueRef idx = LLVMBuildAdd(t->b,
+         LLVMBuildMul(t->b,
+            LLVMBuildAdd(t->b, LLVMBuildMul(t->b, z, dy, ""), y, ""), dx, ""),
+         x, "lii");
+      ssa_set(t, in->def.index, 0, idx);
       break;
    }
-   /* workgroup barrier: only the execution-scoped form needs a sync;
-    * a pure memory barrier is a no-op in this per-thread model. */
+   /* workgroup barrier. The memory-scoped form must drain this thread's
+    * outstanding memory ops before proceeding: a shared/global atomic whose
+    * result is discarded is not scoreboard-tracked, so without a fence a later
+    * access to the same location can issue while the atomic is still in flight
+    * (observed: atomicAdd then a barrier then atomicExchange reordering). A real
+    * RISC-V fence maps to the LSU FENCE, which stalls the warp until its pending
+    * requests retire. The execution-scoped form additionally syncs CTA warps. */
    case nir_intrinsic_barrier:
+      if (nir_intrinsic_memory_scope(in) != SCOPE_NONE)
+         LLVMBuildFence(t->b, LLVMAtomicOrderingSequentiallyConsistent,
+                        /*singleThread*/ false, "");
       if (nir_intrinsic_execution_scope(in) != SCOPE_NONE)
          emit_vx_barrier(t);
       break;
@@ -1603,13 +2321,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    case nir_intrinsic_load_deref: {
       LLVMValueRef addr = intr_src(t, in, 0);
       if (!addr) { t->ok = false; break; }
-      LLVMTypeRef lt  = ity(t, in->def.bit_size);
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "ld"));
+         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "ld"));
       }
       break;
    }
@@ -1627,7 +2344,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         LLVMBuildStore(t->b, v, p);
+         LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[1]), v), p);
       }
       break;
    }
@@ -1661,6 +2378,12 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    }
    case nir_intrinsic_vortex_rt_cb_ret:
       emit_vx_rt_cb_ret(t, ssa_get(t, in->src[0].ssa->index, 0));
+      break;
+
+   case nir_intrinsic_vortex_rt_continue:
+      emit_vx_rt_continue(t, ssa_get(t, in->src[0].ssa->index, 0),
+                             ssa_get(t, in->src[1].ssa->index, 0),
+                             ssa_get(t, in->src[2].ssa->index, 0));
       break;
 
    /* Screen-space derivatives: the difference against this lane's quad neighbour
@@ -1716,18 +2439,43 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       bool store = (in->intrinsic == nir_intrinsic_image_store ||
                     in->intrinsic == nir_intrinsic_bindless_image_store);
       enum pipe_format fmt = nir_intrinsic_format(in);
-      unsigned bpp;
-      bool is_f32;
-      if (fmt == PIPE_FORMAT_R32G32B32A32_FLOAT) {
-         bpp = 16; is_f32 = true;
-      } else if (fmt == PIPE_FORMAT_R8G8B8A8_UNORM) {
-         bpp = 4;  is_f32 = false;
-      } else {
-         mesa_logw("vortexpipe: image %s: unsupported format %d "
-                   "(RGBA32F / RGBA8_UNORM only)", store ? "store" : "load", fmt);
+      /* Storage layouts by class: verbatim 32-bit lanes (RAW32: R/RG/RGBA x
+       * FLOAT/UINT/SINT, raw bits copied), one 16-bit half (F16), and single
+       * 32-bit packed words (UNORM8; R10G10B10A2 UNORM/UINT; R11G11B10 float).
+       * Only the format's own channels are touched. Single-mip 2D addressing. */
+      unsigned bpp, nchan;
+      enum { IMG_RAW32, IMG_UNORM8, IMG_F16, IMG_RGB10A2_UNORM,
+             IMG_RGB10A2_UINT, IMG_RG11B10F } cls;
+      bool is_float;
+      switch (fmt) {
+      case PIPE_FORMAT_R32G32B32A32_FLOAT: bpp=16; nchan=4; cls=IMG_RAW32; is_float=true;  break;
+      case PIPE_FORMAT_R32G32B32A32_UINT:
+      case PIPE_FORMAT_R32G32B32A32_SINT:  bpp=16; nchan=4; cls=IMG_RAW32; is_float=false; break;
+      case PIPE_FORMAT_R32G32_FLOAT:       bpp=8;  nchan=2; cls=IMG_RAW32; is_float=true;  break;
+      case PIPE_FORMAT_R32G32_UINT:
+      case PIPE_FORMAT_R32G32_SINT:        bpp=8;  nchan=2; cls=IMG_RAW32; is_float=false; break;
+      case PIPE_FORMAT_R32_FLOAT:          bpp=4;  nchan=1; cls=IMG_RAW32; is_float=true;  break;
+      case PIPE_FORMAT_R32_UINT:
+      case PIPE_FORMAT_R32_SINT:           bpp=4;  nchan=1; cls=IMG_RAW32; is_float=false; break;
+      case PIPE_FORMAT_R8G8B8A8_UNORM:     bpp=4;  nchan=4; cls=IMG_UNORM8;        is_float=true;  break;
+      case PIPE_FORMAT_R16_FLOAT:          bpp=2;  nchan=1; cls=IMG_F16;           is_float=true;  break;
+      case PIPE_FORMAT_R10G10B10A2_UNORM:  bpp=4;  nchan=4; cls=IMG_RGB10A2_UNORM; is_float=true;  break;
+      case PIPE_FORMAT_R10G10B10A2_UINT:   bpp=4;  nchan=4; cls=IMG_RGB10A2_UINT;  is_float=false; break;
+      case PIPE_FORMAT_R11G11B10_FLOAT:    bpp=4;  nchan=3; cls=IMG_RG11B10F;      is_float=true;  break;
+      default:
+         mesa_logw("vortexpipe: image %s: unsupported format %d",
+                   store ? "store" : "load", fmt);
          t->ok = false;
          break;
       }
+      if (!t->ok) break;
+      /* Field bit-offset and (for the two non-RAW packed classes) the per-channel
+       * width, indexed by component. RGB10A2: R,G,B are 10-bit, A is 2-bit at
+       * bit 30. R11G11B10: R,G are 11-bit at 0/11, B is 10-bit at 22. */
+      const unsigned f_off[4]   = { 0, 10, 20, 30 };  /* RGB10A2 field offsets */
+      const unsigned f_ubits[4] = { 10, 10, 10, 2 };  /* RGB10A2 field widths  */
+      const unsigned uf_off[3]  = { 0, 11, 22 };      /* R11G11B10 field offsets */
+      const unsigned uf_mant[3] = { 6, 6, 5 };        /* R11G11B10 mantissa bits */
       LLVMValueRef desc = intr_src(t, in, 0);
       LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
       LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "imgbase");
@@ -1743,47 +2491,134 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMBuildAdd(t->b, LLVMBuildMul(t->b, x, LLVMConstInt(t->i64, bpp, false), ""),
                             LLVMBuildMul(t->b, y, row, ""), ""), "");
       LLVMValueRef addr = LLVMBuildAdd(t->b, base, off, "");
+      LLVMTypeRef i16 = LLVMInt16TypeInContext(t->ctx);
+      LLVMTypeRef half = LLVMHalfTypeInContext(t->ctx);
       if (store) {
          addr = emit_store_addr(t, addr);
-         unsigned nc = nir_src_num_components(in->src[3]);
-         if (is_f32) {
-            for (unsigned c = 0; c < nc; c++) {
+         if (cls == IMG_RAW32) {
+            for (unsigned c = 0; c < nchan; c++) {
                LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, c);
                if (!v) continue;
                LLVMValueRef a = LLVMBuildAdd(t->b, addr,
                   LLVMConstInt(t->i64, c * 4u, false), "");
                LLVMBuildStore(t->b, v, LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
             }
+         } else if (cls == IMG_F16) {
+            /* one 16-bit half (relay through the same fptrunc as from_float) */
+            LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, 0);
+            LLVMValueRef h = LLVMBuildBitCast(t->b,
+               LLVMBuildFPTrunc(t->b, LLVMBuildBitCast(t->b, v, t->f32, ""), half, ""),
+               i16, "");
+            LLVMBuildStore(t->b, h, LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
          } else {
+            /* single 32-bit packed word: UNORM8, R10G10B10A2 (UNORM/UINT), R11G11B10F */
             LLVMValueRef packed = LLVMConstInt(t->i32, 0, false);
-            for (unsigned c = 0; c < nc; c++) {
+            for (unsigned c = 0; c < nchan; c++) {
                LLVMValueRef v = ssa_get(t, in->src[3].ssa->index, c);
                if (!v) continue;
-               LLVMValueRef b = f32bits_to_unorm8(t, v);
+               LLVMValueRef fld;
+               unsigned off;
+               switch (cls) {
+               case IMG_UNORM8:
+                  fld = f32bits_to_unorm(t, v, 8);  off = c * 8u; break;
+               case IMG_RGB10A2_UNORM:
+                  fld = f32bits_to_unorm(t, v, f_ubits[c]); off = f_off[c]; break;
+               case IMG_RGB10A2_UINT:
+                  fld = LLVMBuildAnd(t->b, v,
+                     LLVMConstInt(t->i32, (1u << f_ubits[c]) - 1u, false), "");
+                  off = f_off[c]; break;
+               default: /* IMG_RG11B10F */
+                  fld = f32bits_to_ufloat(t, v, uf_mant[c]); off = uf_off[c]; break;
+               }
                packed = LLVMBuildOr(t->b, packed,
-                  LLVMBuildShl(t->b, b, LLVMConstInt(t->i32, c * 8u, false), ""), "");
+                  LLVMBuildShl(t->b, fld, LLVMConstInt(t->i32, off, false), ""), "");
             }
             LLVMBuildStore(t->b, packed, LLVMBuildIntToPtr(t->b, addr, t->ptr, ""));
          }
       } else {
-         if (is_f32) {
-            LLVMTypeRef lt = ity(t, in->def.bit_size);
-            for (unsigned c = 0; c < in->def.num_components; c++) {
+         /* Image loads always yield a vec4; channels the format lacks read back
+          * as 0 (G,B) and 1 (A) per Vulkan storage-image semantics. */
+         LLVMValueRef word = NULL;
+         if (cls == IMG_UNORM8 || cls == IMG_RGB10A2_UNORM ||
+             cls == IMG_RGB10A2_UINT || cls == IMG_RG11B10F)
+            word = LLVMBuildLoad2(t->b, t->i32,
+               LLVMBuildIntToPtr(t->b, addr, t->ptr, ""), "img");
+         LLVMTypeRef lt = ity(t, in->def.bit_size);
+         unsigned one = is_float ? 0x3f800000u : 1u;
+         for (unsigned c = 0; c < in->def.num_components; c++) {
+            LLVMValueRef val;
+            if (c >= nchan) {
+               val = LLVMConstInt(lt, (c == 3) ? one : 0u, false);
+            } else switch (cls) {
+            case IMG_RAW32: {
                LLVMValueRef a = LLVMBuildAdd(t->b, addr,
                   LLVMConstInt(t->i64, c * 4u, false), "");
-               LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-               ssa_set(t, in->def.index, c, LLVMBuildLoad2(t->b, lt, p, "img"));
+               val = LLVMBuildLoad2(t->b, lt,
+                  LLVMBuildIntToPtr(t->b, a, t->ptr, ""), "img");
+               break;
             }
-         } else {
-            LLVMValueRef packed = LLVMBuildLoad2(t->b, t->i32,
-               LLVMBuildIntToPtr(t->b, addr, t->ptr, ""), "img");
-            for (unsigned c = 0; c < in->def.num_components; c++) {
-               LLVMValueRef w = LLVMBuildLShr(t->b, packed,
-                  LLVMConstInt(t->i32, c * 8u, false), "");
-               ssa_set(t, in->def.index, c, unorm8_to_f32bits(t, w));
+            case IMG_F16: {
+               LLVMValueRef h = LLVMBuildLoad2(t->b, i16,
+                  LLVMBuildIntToPtr(t->b, addr, t->ptr, ""), "img");
+               val = LLVMBuildBitCast(t->b,
+                  LLVMBuildFPExt(t->b, LLVMBuildBitCast(t->b, h, half, ""), t->f32, ""),
+                  t->i32, "");
+               break;
             }
+            case IMG_UNORM8:
+               val = unorm_to_f32bits(t,
+                  LLVMBuildLShr(t->b, word, LLVMConstInt(t->i32, c * 8u, false), ""), 8);
+               break;
+            case IMG_RGB10A2_UNORM:
+               val = unorm_to_f32bits(t,
+                  LLVMBuildLShr(t->b, word, LLVMConstInt(t->i32, f_off[c], false), ""),
+                  f_ubits[c]);
+               break;
+            case IMG_RGB10A2_UINT:
+               val = LLVMBuildAnd(t->b,
+                  LLVMBuildLShr(t->b, word, LLVMConstInt(t->i32, f_off[c], false), ""),
+                  LLVMConstInt(t->i32, (1u << f_ubits[c]) - 1u, false), "");
+               break;
+            default: /* IMG_RG11B10F */
+               val = ufloat_to_f32bits(t,
+                  LLVMBuildLShr(t->b, word, LLVMConstInt(t->i32, uf_off[c], false), ""),
+                  uf_mant[c]);
+               break;
+            }
+            ssa_set(t, in->def.index, c, val);
          }
       }
+      break;
+   }
+   case nir_intrinsic_image_atomic:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_image_atomic_swap:
+   case nir_intrinsic_bindless_image_atomic_swap: {
+      /* Storage-image atomics. Vulkan permits them only on 32-bit single-channel
+       * formats (R32_UINT/SINT, R32_FLOAT), so the pixel is one 4-byte word at
+       * the same single-mip 2D address as image load/store. The RMW reuses the
+       * device A-extension path: src[0]=image descriptor, src[1]=coordinate,
+       * src[2]=sample, src[3]=data (swap: src[3]=compare, src[4]=new). */
+      bool is_swap = (in->intrinsic == nir_intrinsic_image_atomic_swap ||
+                      in->intrinsic == nir_intrinsic_bindless_image_atomic_swap);
+      LLVMValueRef desc = intr_src(t, in, 0);
+      LLVMValueRef dp   = LLVMBuildIntToPtr(t->b, desc, t->ptr, "");
+      LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64, dp, "imgbase");
+      LLVMValueRef boff = LLVMBuildZExt(t->b,
+         img_desc_u32(t, desc, VP_JIT_IMG_BASE_OFFSET), t->i64, "");
+      LLVMValueRef row  = LLVMBuildZExt(t->b,
+         img_desc_u32(t, desc, VP_JIT_IMG_ROW_STRIDE), t->i64, "");
+      LLVMValueRef x = LLVMBuildZExt(t->b, ssa_get(t, in->src[1].ssa->index, 0),
+                                     t->i64, "");
+      LLVMValueRef y = (nir_src_num_components(in->src[1]) >= 2)
+         ? LLVMBuildZExt(t->b, ssa_get(t, in->src[1].ssa->index, 1), t->i64, "")
+         : LLVMConstInt(t->i64, 0, false);
+      LLVMValueRef off = LLVMBuildAdd(t->b, boff,
+         LLVMBuildAdd(t->b, LLVMBuildMul(t->b, x, LLVMConstInt(t->i64, 4, false), ""),
+                            LLVMBuildMul(t->b, y, row, ""), ""), "");
+      LLVMValueRef addr = emit_store_addr(t, LLVMBuildAdd(t->b, base, off, ""));
+      LLVMValueRef p = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
+      emit_atomic_at(t, in, p, 3, is_swap);
       break;
    }
    default:
@@ -1831,27 +2666,29 @@ emit_vx_gfx_get_after(struct vp_tr *t, unsigned slot, LLVMValueRef handle)
    return LLVMBuildCall2(t->b, fnty, ia, a, 1, "texw");
 }
 
-/* vx_tex: sample TEX stage 0 (custom-1 funct3=5, R4-type). u/v/lod ride
- * rs1/rs2/rs3 and the packed A8R8G8B8 texel returns in rd. */
+/* Software sampler: gfx_tex_sample_sw(&texstate[0], u, v, lod, filter) on the
+ * resident descriptor table (fs_main's 3rd param). Same fixed-point u/v/lod
+ * convention; `filter` (tap in bit0, mip-linear in bit1) is resolved by the caller.
+ * Returns the packed A8R8G8B8 texel. */
 static LLVMValueRef
-emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
-            LLVMValueRef lod)
+emit_tex_sw(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lod,
+            LLVMValueRef filter)
 {
-   /* Software sampler: call gfx_tex_sample_sw(&texstate[0], u, v, lod) on the
-    * resident descriptor table (fs_main's 3rd param) instead of the FF TEX unit.
-    * Same fixed-point u/v/lod convention; returns the packed A8R8G8B8 texel. */
-   if (t->sw_tex) {
-      LLVMTypeRef params[4] = { t->ptr, t->i32, t->i32, t->i32 };
-      LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 4, false);
-      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_sw");
-      if (!fn)
-         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_sw", fty);
-      LLVMValueRef a[4] = { t->fs_texstate, u, v, lod };  /* stage 0 = table[0] */
-      return LLVMBuildCall2(t->b, fty, fn, a, 4, "texsw");
-   }
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_sw", fty);
+   LLVMValueRef a[5] = { t->fs_texstate, u, v, lod, filter };  /* stage 0 = table[0] */
+   return LLVMBuildCall2(t->b, fty, fn, a, 5, "texsw");
+}
 
-   /* vx_tex: rs1=u, rs2=v, rs3=lod, rd=texel, funct2=stage(0). The TEX unit takes
-    * its operands in registers -- no window staging, no handle chaining. */
+/* vx_tex: sample TEX stage 0 (custom-1 funct3=5, R4-type). u/v/lod ride rs1/rs2/rs3
+ * and the packed A8R8G8B8 texel returns in rd. The tap filter is a per-draw DCR, so
+ * this path is only used for non-mipmapped draws (single filter, base level). */
+static LLVMValueRef
+emit_tex_hw(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lod)
+{
    const char *s = ".insn r4 43, 5, 0, $0, $1, $2, $3";
    LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 3, false);
@@ -1862,6 +2699,172 @@ emit_vx_tex(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
                                       /*CanThrow*/ false);
    LLVMValueRef a[3] = { u, v, lod };
    return LLVMBuildCall2(t->b, fnty, ia, a, 3, "texel");
+}
+
+/* The float[4] slot the float-returning texture ABI writes through. Allocated once
+ * in the entry block and reused: an alloca built at the emit site would be dynamic,
+ * growing the stack on every trip of a loop containing the fetch. The slot is dead
+ * across calls -- each fetch fills all four channels before they are read. */
+static LLVMValueRef
+tex_f32_scratch(struct vp_tr *t)
+{
+   if (!t->tex_f32_slot) {
+      LLVMBasicBlockRef cur = LLVMGetInsertBlock(t->b);
+      LLVMValueRef first = LLVMGetFirstInstruction(t->entry);
+      if (first)
+         LLVMPositionBuilderBefore(t->b, first);
+      else
+         LLVMPositionBuilderAtEnd(t->b, t->entry);
+      t->tex_f32_slot = LLVMBuildAlloca(t->b, LLVMArrayType(t->f32, 4), "texel_f32");
+      LLVMPositionBuilderAtEnd(t->b, cur);
+   }
+   return t->tex_f32_slot;
+}
+
+/* texelFetch returning floats: gfx_tex_fetch_f32(&texstate[0], x, y, lod, out) --
+ * the exact texel at integer (x,y) of integer lod, decoded to four float channels
+ * in RGBA order. Returns the scratch slot the callee filled. */
+static LLVMValueRef
+emit_tex_fetch_f32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y, LLVMValueRef lod)
+{
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->ptr };
+   LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_f32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_f32", fty);
+   LLVMValueRef out = tex_f32_scratch(t);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y, lod, out };
+   LLVMBuildCall2(t->b, fty, fn, a, 5, "");
+   return out;
+}
+
+/* The SW sampler delivered as four floats: gfx_tex_sample_f32(&texstate[0], u, v,
+ * lod, filter, out). A float-format texture holds values outside [0,1] and cannot be
+ * filtered through the 8-bit ARGB working space; the callee decodes and blends it in
+ * float, and delegates every other format to the packed sampler so those results stay
+ * bit-identical. Returns the scratch slot the callee filled. */
+static LLVMValueRef
+emit_tex_sw_f32(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lod,
+                LLVMValueRef filter)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->ptr };
+   LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_f32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_f32", fty);
+   LLVMValueRef out = tex_f32_scratch(t);
+   LLVMValueRef a[6] = { t->fs_texstate, u, v, lod, filter, out };
+   LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+   return out;
+}
+
+/* The int32[4] slot the integer texture ABI writes through; entry-block allocated
+ * and reused for the same reason as tex_f32_scratch. */
+static LLVMValueRef
+tex_i32_scratch(struct vp_tr *t)
+{
+   if (!t->tex_i32_slot) {
+      LLVMBasicBlockRef cur = LLVMGetInsertBlock(t->b);
+      LLVMValueRef first = LLVMGetFirstInstruction(t->entry);
+      if (first)
+         LLVMPositionBuilderBefore(t->b, first);
+      else
+         LLVMPositionBuilderAtEnd(t->b, t->entry);
+      t->tex_i32_slot = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 4), "texel_i32");
+      LLVMPositionBuilderAtEnd(t->b, cur);
+   }
+   return t->tex_i32_slot;
+}
+
+/* texelFetch for an integer sampler: gfx_tex_fetch_i32(&texstate[0], x, y, lod,
+ * layer, out) -- the texel's four channels as raw 0..255 values. Returns the
+ * scratch slot the callee filled. */
+static LLVMValueRef
+emit_tex_fetch_i32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y,
+                   LLVMValueRef lod, LLVMValueRef layer)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->ptr };
+   LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_i32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_i32", fty);
+   LLVMValueRef out = tex_i32_scratch(t);
+   LLVMValueRef a[6] = { t->fs_texstate, x, y, lod, layer, out };
+   LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+   return out;
+}
+
+/* texelFetch on a 2D array returning floats: the layer selects the slice, the
+ * channels come back as gfx_tex_fetch_f32's do. */
+static LLVMValueRef
+emit_tex_fetch_array_f32(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y,
+                         LLVMValueRef layer, LLVMValueRef lod)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->ptr };
+   LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_fetch_array_f32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_fetch_array_f32", fty);
+   LLVMValueRef out = tex_f32_scratch(t);
+   LLVMValueRef a[6] = { t->fs_texstate, x, y, layer, lod, out };
+   LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+   return out;
+}
+
+/* textureGather: gfx_tex_gather_sw(&texstate[0], x, y, comp) -- channel `comp` of
+ * the 2x2 footprint at (x,y), base level, packed in GL gather order as bytes
+ * x | y<<8 | z<<16 | w<<24. Unpack to the def's vec4 as floats in [0,1]. An array
+ * sampler passes its layer, which selects the slice the footprint is taken from. */
+static void
+emit_tex_gather(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y,
+                LLVMValueRef layer)
+{
+   const unsigned n = layer ? 5 : 4;
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, n, false);
+   const char *name = layer ? "gfx_tex_gather_array_sw" : "gfx_tex_gather_sw";
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, name);
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, name, fty);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y,
+                         LLVMConstInt(t->i32, tex->component, false), layer };
+   LLVMValueRef packed = LLVMBuildCall2(t->b, fty, fn, a, n, "gather");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
+      LLVMValueRef byte = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, packed, LLVMConstInt(t->i32, c * 8, false), ""),
+         LLVMConstInt(t->i32, 0xff, false), "");
+      LLVMValueRef f = LLVMBuildFMul(t->b,
+         LLVMBuildUIToFP(t->b, byte, t->f32, ""),
+         LLVMConstReal(t->f32, 1.0 / 255.0), "");
+      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
+   }
+}
+
+/* textureGatherCmp: compare each of the 2x2 depth taps against ref_bits and
+ * return the vec4 of 0/1 results (gfx_tex_gather_cmp_sw packs 0xff/0x00 per tap;
+ * the /255 unpack yields 0.0/1.0, matching the colour gather). */
+static void
+emit_tex_gather_cmp(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x,
+                    LLVMValueRef y, LLVMValueRef ref_bits, LLVMValueRef layer)
+{
+   unsigned n = layer ? 5 : 4;
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, n, false);
+   const char *name = layer ? "gfx_tex_gather_cmp_array_sw" : "gfx_tex_gather_cmp_sw";
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, name);
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, name, fty);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y, ref_bits, layer };
+   LLVMValueRef packed = LLVMBuildCall2(t->b, fty, fn, a, n, "gathercmp");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
+      LLVMValueRef byte = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, packed, LLVMConstInt(t->i32, c * 8, false), ""),
+         LLVMConstInt(t->i32, 0xff, false), "");
+      LLVMValueRef f = LLVMBuildFMul(t->b,
+         LLVMBuildUIToFP(t->b, byte, t->f32, ""),
+         LLVMConstReal(t->f32, 1.0 / 255.0), "");
+      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
+   }
 }
 
 /* ── RTU (ray-tracing unit) ops — ISA v2 window ABI ──────────────────
@@ -1972,53 +2975,1252 @@ emit_vx_rt_cb_ret(struct vp_tr *t, LLVMValueRef action)
    LLVMBuildCall2(t->b, fnty, ia, a, 1, "");
 }
 
-/* A NIR texture op: gfx-v1 supports a plain 2D `texture()` sampling
- * the single bound texture (TEX stage 0) at LOD 0. The interpolated
- * texcoord is the coord source; the texture/sampler deref sources are
- * fixed-function (TEX DCRs) and ignored. The result vec4 is the
- * unpacked A8R8G8B8 texel as four floats in [0,1]. */
+/* CONTINUE: resume traversal for the candidate this lane was handed, with its
+ * verdict in rs1, the hit distance in the FP operand and the attribute in rs3.
+ * An any-hit lane computes no distance of its own and passes the candidate's
+ * back. No result — the next vx_rt_wait on the handle collects the response. */
+static void
+emit_vx_rt_continue(struct vp_tr *t, LLVMValueRef action, LLVMValueRef tval,
+                    LLVMValueRef attr)
+{
+   const char *s = ".insn r4 43, 6, 0, x0, $0, $1, $2";
+   LLVMTypeRef args[3] = { t->i32, t->f32, t->i32 };
+   LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), args, 3, false);
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,f,r", 5,
+                                      /*HasSideEffects*/ true, false,
+                                      LLVMInlineAsmDialectATT, false);
+   /* The hit window is read as untyped 32-bit words, so a distance arrives as
+    * an integer-shaped value and has to be reinterpreted for the FP operand. */
+   if (LLVMTypeOf(tval) != t->f32)
+      tval = LLVMBuildBitCast(t->b, tval, t->f32, "rtcont_t");
+   LLVMValueRef a[3] = { action, tval, attr };
+   LLVMBuildCall2(t->b, fnty, ia, a, 3, "");
+}
+
+/* llvm.ctlz.i64: leading-zero count (is_zero_undef=false). */
+static LLVMValueRef
+emit_ctlz64(struct vp_tr *t, LLVMValueRef v)
+{
+   LLVMTypeRef  i1   = LLVMInt1TypeInContext(t->ctx);
+   LLVMTypeRef  args[2] = { t->i64, i1 };
+   LLVMTypeRef  fty  = LLVMFunctionType(t->i64, args, 2, false);
+   LLVMValueRef fn   = LLVMGetNamedFunction(t->mod, "llvm.ctlz.i64");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.ctlz.i64", fty);
+   LLVMValueRef a[2] = { v, LLVMConstInt(i1, 0, false) };
+   return LLVMBuildCall2(t->b, fty, fn, a, 2, "ctlz64");
+}
+
+/* One texel-space gradient: |a-b| widened to i64 and shifted left by the axis's
+ * log2 dimension. abs-vs-0 (not a sign-correct derivative) is all the LOD needs. */
+static LLVMValueRef
+emit_lod_grad(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b, LLVMValueRef logdim)
+{
+   LLVMValueRef d   = LLVMBuildSub(t->b, a, b, "");
+   LLVMValueRef abs = LLVMBuildSelect(t->b,
+      LLVMBuildICmp(t->b, LLVMIntSLT, d, LLVMConstInt(t->i32, 0, false), ""),
+      LLVMBuildNeg(t->b, d, ""), d, "");
+   return LLVMBuildShl(t->b, LLVMBuildZExt(t->b, abs, t->i64, ""),
+                       LLVMBuildZExt(t->b, logdim, t->i64, ""), "grad");
+}
+
+static LLVMValueRef
+emit_umax64(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b)
+{
+   return LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntUGT, a, b, ""), a, b, "");
+}
+
+/* Gradient-vector length sqrt(a^2 + b^2) of two orthogonal texel-space components.
+ * Computed in f32 (the FPU fsqrt.s) rather than i128 integer arithmetic: the LOD
+ * only needs ~log2(rho), so f32's precision is ample, and this is exact to the
+ * tolerance rather than a max+min approximation (which perturbs the trilinear blend). */
+static LLVMValueRef
+emit_grad_len(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b)
+{
+   LLVMValueRef af = LLVMBuildUIToFP(t->b, a, t->f32, "");
+   LLVMValueRef bf = LLVMBuildUIToFP(t->b, b, t->f32, "");
+   LLVMValueRef sq = LLVMBuildFAdd(t->b, LLVMBuildFMul(t->b, af, af, ""),
+                                   LLVMBuildFMul(t->b, bf, bf, ""), "");
+   return LLVMBuildFPToUI(t->b, emit_fsqrt(t, sq), t->i64, "grad_len");
+}
+
+/* The lane quad's texel-space gradient rho (S.FXD_FRAC fixed-point, i64): the max
+ * over the two screen directions of the gradient-vector length. log2(rho) - FXD_FRAC
+ * is lambda. logw/logh come from the resident TEX descriptor (fs_texstate) because the
+ * TEX DCRs are host-write-only; quad neighbours arrive through the quad-scoped SHFL
+ * (bfly), so this must run with the whole quad active. */
+static LLVMValueRef
+emit_tex_grad_rho(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v)
+{
+   LLVMValueRef off = LLVMConstInt(t->i32,
+      offsetof(gfx_sw_texstate_t, logdim), false);
+   LLVMValueRef p   = LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off, 1, "logdim_p");
+   LLVMValueRef logdim = LLVMBuildLoad2(t->b, t->i32, p, "logdim");
+   LLVMValueRef logw = LLVMBuildAnd(t->b, logdim,
+      LLVMConstInt(t->i32, 0xFFFF, false), "logw");
+   LLVMValueRef logh = LLVMBuildLShr(t->b, logdim,
+      LLVMConstInt(t->i32, 16, false), "logh");
+
+   /* quad bfly control: (mask 0x3c << 12) | (cval 3 << 6) | dir. */
+   LLVMValueRef bch = LLVMConstInt(t->i32, (0x3c << 12) | (3 << 6) | 1, false);
+   LLVMValueRef bcv = LLVMConstInt(t->i32, (0x3c << 12) | (3 << 6) | 2, false);
+   LLVMValueRef uh = emit_shfl(t, 6, u, bch), uv = emit_shfl(t, 6, u, bcv);
+   LLVMValueRef vh = emit_shfl(t, 6, v, bch), vv = emit_shfl(t, 6, v, bcv);
+
+   /* rho = max over the two screen directions (x = horizontal neighbour, y =
+    * vertical) of the gradient-vector length sqrt((du*W)^2 + (dv*H)^2), not the
+    * per-axis max of the four components. The per-axis max underestimates a
+    * diagonal gradient (du and dv varying together) by up to sqrt(2) ~ 0.5 LOD,
+    * which exceeds the deqp mipmap tolerance. */
+   LLVMValueRef gux = emit_lod_grad(t, u, uh, logw);
+   LLVMValueRef guy = emit_lod_grad(t, u, uv, logw);
+   LLVMValueRef gvx = emit_lod_grad(t, v, vh, logh);
+   LLVMValueRef gvy = emit_lod_grad(t, v, vv, logh);
+   return emit_umax64(t, emit_grad_len(t, gux, gvx), emit_grad_len(t, guy, gvy));
+}
+
+/* Load the resident TEX descriptor's filter word (fs_texstate). */
+static LLVMValueRef
+emit_tex_filter_word(struct vp_tr *t)
+{
+   LLVMValueRef off = LLVMConstInt(t->i32,
+      offsetof(gfx_sw_texstate_t, filter), false);
+   LLVMValueRef p = LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off, 1, "filter_p");
+   return LLVMBuildLoad2(t->b, t->i32, p, "filter");
+}
+
+/* The bound view's component swizzle word (gfx_sw_texstate_t.swizzle):
+ * r | g<<3 | b<<6 | a<<9, each field a PIPE_SWIZZLE_* (0..3 = R/G/B/A source
+ * channel, 4 = 0.0, 5 = 1.0). Identity packs to 1672. */
+static LLVMValueRef
+emit_tex_swizzle_word(struct vp_tr *t)
+{
+   LLVMValueRef off = LLVMConstInt(t->i32,
+      offsetof(gfx_sw_texstate_t, swizzle), false);
+   LLVMValueRef p = LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off, 1, "swz_p");
+   return LLVMBuildLoad2(t->b, t->i32, p, "swizzle");
+}
+
+/* Read the sampler's LOD bias (signed Q(VX_TEX_LOD_FRAC_BITS)) from texstate. */
+static LLVMValueRef
+emit_tex_lod_bias(struct vp_tr *t)
+{
+   LLVMValueRef o = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, lod_bias), false);
+   return LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &o, 1, ""), "lod_bias");
+}
+
+/* Clamp a signed Q(VX_TEX_LOD_FRAC_BITS) λ to the sampler's [min_lod, max_lod].
+ * Default sampler (min_lod=0, max_lod=LOD_MAX) makes this the identity for a
+ * minified λ and pins magnified/uniform λ (<0) to level 0. */
+static LLVMValueRef
+emit_tex_lod_clamp(struct vp_tr *t, LLVMValueRef lam)
+{
+   LLVMValueRef o_min = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, min_lod), false);
+   LLVMValueRef o_max = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, max_lod), false);
+   LLVMValueRef vmin = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &o_min, 1, ""), "min_lod");
+   LLVMValueRef vmax = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &o_max, 1, ""), "max_lod");
+   lam = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSLT, lam, vmin, ""), vmin, lam, "");
+   lam = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lam, vmax, ""), vmax, lam, "");
+   return lam;
+}
+
+/* Implicit-LOD sample of a mipmapped texture through the SW sampler: the HW TEX
+ * unit has one per-draw filter DCR and no inter-level blend, so a mipmapped sampler
+ * routes here. Resolve the tap filter per fragment from the sign of lambda (minified
+ * -> min tap, magnified -> mag tap), pick the mip level (round-to-nearest for
+ * mip-nearest, Q(VX_TEX_LOD_FRAC_BITS) fractional lambda for mip-linear), and sample.
+ * Must run with the whole quad active (the derivative SHFL). */
+static void
+emit_tex_resolve_auto_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
+                          LLVMValueRef shader_bias, LLVMValueRef *out_lod,
+                          LLVMValueRef *out_filter)
+{
+   LLVMValueRef rho  = emit_tex_grad_rho(t, u, v);
+   LLVMValueRef filt = emit_tex_filter_word(t);
+   LLVMValueRef zero64 = LLVMConstInt(t->i64, 0, false);
+   LLVMValueRef zero32 = LLVMConstInt(t->i32, 0, false);
+
+   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
+      zero32, "mip_lin");
+   LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
+      zero32, "mip_en");
+
+   /* Continuous signed LOD λ in Q(VX_TEX_LOD_FRAC_BITS) from the gradient rho
+    * (which carries VP_TEX_FXD_FRAC frac bits): λ = log2(rho) − FXD. Magnified
+    * fragments (rho < 2^FXD) give a negative integer part. */
+   LLVMValueRef msb = LLVMBuildSub(t->b, LLVMConstInt(t->i64, 63, false),
+                                   emit_ctlz64(t, rho), "msb");
+   LLVMValueRef one_msb = LLVMBuildShl(t->b, LLVMConstInt(t->i64, 1, false), msb, "one_msb");
+   LLVMValueRef ip = LLVMBuildShl(t->b,
+      LLVMBuildSub(t->b, msb, LLVMConstInt(t->i64, VP_TEX_FXD_FRAC, false), ""),
+      LLVMConstInt(t->i64, VX_TEX_LOD_FRAC_BITS, false), "");
+   LLVMValueRef mant = LLVMBuildAnd(t->b, rho,
+      LLVMBuildSub(t->b, one_msb, LLVMConstInt(t->i64, 1, false), ""), "");
+   LLVMValueRef fp = LLVMBuildLShr(t->b,
+      LLVMBuildShl(t->b, mant, LLVMConstInt(t->i64, VX_TEX_LOD_FRAC_BITS, false), ""),
+      msb, "");
+   LLVMValueRef lam64 = LLVMBuildAdd(t->b, ip, fp, "lambda_q8");
+   /* rho==0 (uniform quad): λ = −inf → a large negative sentinel (the msb/one_msb
+    * math is poison for rho==0; the select discards it). */
+   lam64 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntEQ, rho, zero64, ""),
+      LLVMConstInt(t->i64, (uint64_t)(int64_t)(-(64 << VX_TEX_LOD_FRAC_BITS)), true),
+      lam64, "");
+
+   /* Vulkan LOD pipeline: λ' = λ + lodBias (min/mag decision uses λ', BEFORE the
+    * min/max clamp); the sampled level uses clamp(λ', minLod, maxLod). */
+   LLVMValueRef lam_b = LLVMBuildAdd(t->b, LLVMBuildTrunc(t->b, lam64, t->i32, ""),
+                                     emit_tex_lod_bias(t), "lam_biased");
+   /* textureBias(): the shader's per-fragment LOD bias adds on top of the sampler
+    * mipLodBias, before the min/max clamp. */
+   if (shader_bias)
+      lam_b = LLVMBuildAdd(t->b, lam_b, shader_bias, "lam_shbias");
+   /* Sampled λ = clamp(λ + bias, minLod, maxLod). Vulkan/deqp derive min-vs-mag
+    * from the CLAMPED λ (so minLod>0 forces minification, and the level follows);
+    * a non-mipmapped sampler always reads the base level. */
+   LLVMValueRef lam_c = emit_tex_lod_clamp(t, lam_b);
+   LLVMValueRef minified = LLVMBuildICmp(t->b, LLVMIntSGT, lam_c, zero32, "minified");
+   LLVMValueRef lam = LLVMBuildSelect(t->b, mip_en, lam_c, zero32, "");
+
+   /* tap: min (bit3) when minified, mag (bit0) otherwise. */
+   LLVMValueRef mag_tap = LLVMBuildAnd(t->b, filt, LLVMConstInt(t->i32, 1, false), "mag_tap");
+   LLVMValueRef min_tap = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, filt, LLVMConstInt(t->i32, 3, false), ""),
+      LLVMConstInt(t->i32, 1, false), "min_tap");
+   LLVMValueRef tap = LLVMBuildSelect(t->b, minified, min_tap, mag_tap, "tap");
+
+   /* Inter-level blend only for a minified fragment of a mip-linear sampler with a
+    * real mip chain (mip-enable). mip-linear consumes the Q8 λ; otherwise the
+    * rounded integer level (0 when magnified or non-mipmapped). */
+   LLVMValueRef mip_active = LLVMBuildAnd(t->b, LLVMBuildAnd(t->b, minified, mip_lin, ""),
+                                          mip_en, "mip_active");
+   LLVMValueRef level = LLVMBuildAShr(t->b,
+      LLVMBuildAdd(t->b, lam,
+         LLVMConstInt(t->i32, 1 << (VX_TEX_LOD_FRAC_BITS - 1), false), ""),
+      LLVMConstInt(t->i32, VX_TEX_LOD_FRAC_BITS, false), "level");
+   LLVMValueRef lod = LLVMBuildSelect(t->b, mip_active, lam, level, "lod");
+   LLVMValueRef mip_bit = LLVMBuildSelect(t->b, mip_active,
+      LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), zero32, "");
+   *out_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+   *out_lod = lod;
+}
+
+static LLVMValueRef
+emit_tex_sw_resolved(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
+                     LLVMValueRef shader_bias)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_auto_lod(t, u, v, shader_bias, &lod, &filter);
+   return emit_tex_sw(t, u, v, lod, filter);
+}
+
+/* Same sample, delivered as four floats in the scratch slot. */
+static LLVMValueRef
+emit_tex_sw_resolved_f32(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v,
+                         LLVMValueRef shader_bias)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_auto_lod(t, u, v, shader_bias, &lod, &filter);
+   return emit_tex_sw_f32(t, u, v, lod, filter);
+}
+
+/* Encode an EXPLICIT float lambda into the LOD value the SW sampler expects for
+ * the bound sampler's mip mode: Q(VX_TEX_LOD_FRAC_BITS) fixed-point when mip-linear
+ * (the sampler splits it into floor level + blend), else round(lambda) as an
+ * integer level; a non-mipmapped sampler (mip-enable clear) forces level 0. Shared
+ * by the 2D textureLod path and the array/cube entries (which read the same
+ * descriptor filter). `lam_bits` is the lod source's raw i32 (f32 bits). */
+static LLVMValueRef
+emit_encode_explicit_lod(struct vp_tr *t, LLVMValueRef lam_bits)
+{
+   LLVMValueRef filt = emit_tex_filter_word(t);
+   LLVMValueRef zerof = LLVMConstReal(t->f32, 0.0);
+   LLVMValueRef lam = LLVMBuildBitCast(t->b, lam_bits, t->f32, "lambda");
+   LLVMValueRef minified = LLVMBuildFCmp(t->b, LLVMRealOGT, lam, zerof, "minified");
+   LLVMValueRef lam_c = LLVMBuildSelect(t->b, minified, lam, zerof, "lam_c");
+
+   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
+      LLVMConstInt(t->i32, 0, false), "mip_lin");
+
+   LLVMValueRef maxlod_i = LLVMConstInt(t->i32, VX_TEX_LOD_MAX, false);
+   LLVMValueRef lod_near = LLVMBuildFPToSI(t->b,
+      LLVMBuildFAdd(t->b, lam_c, LLVMConstReal(t->f32, 0.5), ""), t->i32, "lod_near");
+   lod_near = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_near, maxlod_i, ""),
+                              maxlod_i, lod_near, "");
+   LLVMValueRef maxlod_q = LLVMConstInt(t->i32, VX_TEX_LOD_MAX << VX_TEX_LOD_FRAC_BITS, false);
+   LLVMValueRef lod_lin = LLVMBuildFPToSI(t->b,
+      LLVMBuildFMul(t->b, lam_c,
+         LLVMConstReal(t->f32, (double)(1u << VX_TEX_LOD_FRAC_BITS)), ""), t->i32, "lod_lin");
+   lod_lin = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, lod_lin, maxlod_q, ""),
+                             maxlod_q, lod_lin, "");
+
+   LLVMValueRef lod = LLVMBuildSelect(t->b, mip_lin, lod_lin, lod_near, "lod");
+   LLVMValueRef mip_en = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, GFX_SW_TEX_FILTER_MIP_ENABLE, false), ""),
+      LLVMConstInt(t->i32, 0, false), "mip_en");
+   return LLVMBuildSelect(t->b, mip_en, lod, LLVMConstInt(t->i32, 0, false), "");
+}
+
+/* textureLod: sample with an EXPLICIT lambda (float lod source) rather than the
+ * quad-gradient-derived rho. Same tap + mip resolution as emit_tex_sw_resolved,
+ * but driven by lambda directly: minified when lambda>0 (pick the min tap, else
+ * mag); the mip level is encoded by emit_encode_explicit_lod. `lam_bits` is the
+ * lod source's raw i32 (f32 bits). */
+static void
+emit_tex_resolve_explicit_lod(struct vp_tr *t, LLVMValueRef lam_bits,
+                              LLVMValueRef *out_lod, LLVMValueRef *out_filter)
+{
+   LLVMValueRef filt = emit_tex_filter_word(t);
+   LLVMValueRef zerof = LLVMConstReal(t->f32, 0.0);
+   LLVMValueRef lam = LLVMBuildBitCast(t->b, lam_bits, t->f32, "lambda");
+   LLVMValueRef minified = LLVMBuildFCmp(t->b, LLVMRealOGT, lam, zerof, "minified");
+
+   /* tap: min (bit3) when minified, mag (bit0) otherwise. */
+   LLVMValueRef mag_tap = LLVMBuildAnd(t->b, filt, LLVMConstInt(t->i32, 1, false), "mag_tap");
+   LLVMValueRef min_tap = LLVMBuildAnd(t->b,
+      LLVMBuildLShr(t->b, filt, LLVMConstInt(t->i32, 3, false), ""),
+      LLVMConstInt(t->i32, 1, false), "min_tap");
+   LLVMValueRef tap = LLVMBuildSelect(t->b, minified, min_tap, mag_tap, "tap");
+
+   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filt,
+         LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
+      LLVMConstInt(t->i32, 0, false), "mip_lin");
+
+   *out_lod = emit_encode_explicit_lod(t, lam_bits);
+   LLVMValueRef mip_bit = LLVMBuildSelect(t->b,
+      LLVMBuildAnd(t->b, minified, mip_lin, ""),
+      LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false),
+      LLVMConstInt(t->i32, 0, false), "");
+   *out_filter = LLVMBuildOr(t->b, tap, mip_bit, "sw_filter");
+}
+
+static LLVMValueRef
+emit_tex_sw_lod(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lam_bits)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_explicit_lod(t, lam_bits, &lod, &filter);
+   return emit_tex_sw(t, u, v, lod, filter);
+}
+
+/* Same sample, delivered as four floats in the scratch slot. */
+static LLVMValueRef
+emit_tex_sw_lod_f32(struct vp_tr *t, LLVMValueRef u, LLVMValueRef v, LLVMValueRef lam_bits)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_explicit_lod(t, lam_bits, &lod, &filter);
+   return emit_tex_sw_f32(t, u, v, lod, filter);
+}
+
+/* mip-0 {width,height} from the resident TEX descriptor, as i32. A descriptor
+ * whose width/height is 0 is a power-of-two texture; derive the dim from logdim. */
+static void
+emit_tex_mip0_dims(struct vp_tr *t, LLVMValueRef *out_w, LLVMValueRef *out_h)
+{
+   LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef off_ld = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, logdim), false);
+   LLVMValueRef logdim = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_ld, 1, ""), "logdim");
+   LLVMValueRef off_w = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, width), false);
+   LLVMValueRef w0 = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_w, 1, ""), "twidth");
+   LLVMValueRef off_h = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, height), false);
+   LLVMValueRef h0 = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_h, 1, ""), "theight");
+   LLVMValueRef potw = LLVMBuildShl(t->b, one,
+      LLVMBuildAnd(t->b, logdim, LLVMConstInt(t->i32, 0xffff, false), ""), "");
+   LLVMValueRef poth = LLVMBuildShl(t->b, one,
+      LLVMBuildLShr(t->b, logdim, LLVMConstInt(t->i32, 16, false), ""), "");
+   *out_w = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntNE, w0, zero, ""), w0, potw, "w0");
+   *out_h = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntNE, h0, zero, ""), h0, poth, "h0");
+}
+
+/* textureSize (also the intermediate emitted when textureGrad's txd is lowered to
+ * a size query + explicit-LOD sample): the (width,height) of mip level `lod` from
+ * the resident TEX descriptor -- no sample. The def is integer: component c =
+ * max(dim >> lod, 1). */
+static void
+emit_tex_size(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef lod_int)
+{
+   LLVMValueRef lod = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef one  = LLVMConstInt(t->i32, 1, false);
+   LLVMValueRef w0, h0;
+   emit_tex_mip0_dims(t, &w0, &h0);
+
+   /* level dim = max(dim >> lod, 1). */
+   LLVMValueRef wl = LLVMBuildLShr(t->b, w0, lod, "");
+   LLVMValueRef hl = LLVMBuildLShr(t->b, h0, lod, "");
+   wl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntULT, wl, one, ""), one, wl, "wl");
+   hl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntULT, hl, one, ""), one, hl, "hl");
+
+   /* Third component: the descriptor's depth field carries the layer count for
+    * arrays (cube count for cube arrays) and the slice count for 3D. Layers do
+    * not shrink with the mip level; 3D slices halve like the other axes. */
+   LLVMValueRef dims[3] = { wl, hl, one };
+   if (tex->def.num_components >= 3) {
+      LLVMValueRef off_d = LLVMConstInt(t->i32,
+         offsetof(gfx_sw_texstate_t, depth), false);
+      LLVMValueRef d0 = LLVMBuildLoad2(t->b, t->i32,
+         LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &off_d, 1, ""), "tdepth");
+      LLVMValueRef dl = (tex->sampler_dim == GLSL_SAMPLER_DIM_3D)
+         ? LLVMBuildLShr(t->b, d0, lod, "")
+         : d0;
+      dims[2] = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntULT, dl, one, ""), one, dl, "dl");
+   }
+   for (unsigned c = 0; c < tex->def.num_components && c < 3; c++)
+      ssa_set(t, tex->def.index, c, dims[c]);
+}
+
+/* Write a sampled vec4 to the def, applying the view's component swizzle. `chan`
+ * holds the four source channels (R,G,B,A) as i32 bit patterns, and `czero`/`cone`
+ * are the swizzle's constant arms in the same encoding -- a float sampler passes
+ * bitcast 0.0/1.0, an integer sampler passes 0/1. Output component c takes source
+ * channel map (0..3 = R/G/B/A), or a constant (map 4 -> czero, map 5 -> cone);
+ * those stay literals, so a VK_COMPONENT_SWIZZLE_ONE returns one whatever the texel
+ * holds. Identity (1672) is a passthrough. */
+static void
+emit_tex_swizzle_store(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef chan[4],
+                       LLVMValueRef czero, LLVMValueRef cone)
+{
+   LLVMValueRef swz = emit_tex_swizzle_word(t);
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
+      LLVMValueRef map = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, swz, LLVMConstInt(t->i32, c * 3, false), ""),
+         LLVMConstInt(t->i32, 0x7, false), "map");
+      LLVMValueRef is0 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 0, false), "");
+      LLVMValueRef is1 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 1, false), "");
+      LLVMValueRef is2 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 2, false), "");
+      LLVMValueRef v = LLVMBuildSelect(t->b, is0, chan[0],
+                       LLVMBuildSelect(t->b, is1, chan[1],
+                       LLVMBuildSelect(t->b, is2, chan[2], chan[3], ""), ""), "src_chan");
+      LLVMValueRef is4 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 4, false), "");
+      LLVMValueRef is5 = LLVMBuildICmp(t->b, LLVMIntEQ, map, LLVMConstInt(t->i32, 5, false), "");
+      v = LLVMBuildSelect(t->b, is4, czero, v, "");
+      v = LLVMBuildSelect(t->b, is5, cone, v, "");
+      ssa_set(t, tex->def.index, c, v);
+   }
+}
+
+/* The swizzle constants for a float sampler: 0.0 and 1.0 as i32 bit patterns. */
+static void
+tex_swizzle_float_consts(struct vp_tr *t, LLVMValueRef *czero, LLVMValueRef *cone)
+{
+   *czero = LLVMBuildBitCast(t->b, LLVMConstReal(t->f32, 0.0), t->i32, "");
+   *cone  = LLVMBuildBitCast(t->b, LLVMConstReal(t->f32, 1.0), t->i32, "");
+}
+
+/* Write four stored bytes to an integer sampler's def as the raw values they hold:
+ * a signed sampler reinterprets each as int8 (the stored value spans -128..127), an
+ * unsigned one takes it as-is. No normalisation -- an isampler/usampler yields the
+ * stored integer and the shader's own vec4() cast converts.
+ *
+ * Exact only because the integer formats reach the sampler as VX_TEX_FORMAT_A8R8G8B8
+ * (vp_vx_tex_format), whose decode preserves every byte. Giving them their own VX
+ * format above VX_TEX_FORMAT_FF_MAX would break this silently -- TexDecodeExtended's
+ * default arm returns a=0xff, rgb=0. */
+static void
+emit_tex_store_int8_chan(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef byte[4],
+                         bool is_signed)
+{
+   LLVMValueRef chan[4];
+   for (unsigned s = 0; s < 4; s++) {
+      /* byte -> int8: (v ^ 0x80) - 0x80 */
+      chan[s] = is_signed
+         ? LLVMBuildSub(t->b,
+              LLVMBuildXor(t->b, byte[s], LLVMConstInt(t->i32, 0x80, false), ""),
+              LLVMConstInt(t->i32, 0x80, false), "sext8")
+         : byte[s];
+   }
+   emit_tex_swizzle_store(t, tex, chan, LLVMConstInt(t->i32, 0, false),
+                          LLVMConstInt(t->i32, 1, false));
+}
+
+/* Unpack a float[4] scratch slot (emit_tex_fetch_f32) to the def's vec4. The
+ * channels are already the sampled values -- no /255 -- so a float-format texel
+ * keeps its real magnitude. */
+static void
+emit_tex_unpack_f32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out)
+{
+   LLVMValueRef chan[4];
+   for (unsigned s = 0; s < 4; s++) {
+      LLVMValueRef idx[2] = { LLVMConstInt(t->i32, 0, false),
+                              LLVMConstInt(t->i32, s, false) };
+      LLVMValueRef p = LLVMBuildGEP2(t->b, LLVMArrayType(t->f32, 4), out, idx, 2, "");
+      chan[s] = LLVMBuildBitCast(t->b,
+         LLVMBuildLoad2(t->b, t->f32, p, "texel_f"), t->i32, "");
+   }
+   LLVMValueRef czero, cone;
+   tex_swizzle_float_consts(t, &czero, &cone);
+   emit_tex_swizzle_store(t, tex, chan, czero, cone);
+}
+
+/* Unpack an int32[4] scratch slot (emit_tex_fetch_i32) to an integer sampler's
+ * def. The channels arrive as the raw 0..255 stored bytes. */
+static void
+emit_tex_unpack_i32(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef out,
+                    bool is_signed)
+{
+   LLVMValueRef byte[4];
+   for (unsigned s = 0; s < 4; s++) {
+      LLVMValueRef idx[2] = { LLVMConstInt(t->i32, 0, false),
+                              LLVMConstInt(t->i32, s, false) };
+      LLVMValueRef p = LLVMBuildGEP2(t->b, LLVMArrayType(t->i32, 4), out, idx, 2, "");
+      byte[s] = LLVMBuildLoad2(t->b, t->i32, p, "texel_i");
+   }
+   emit_tex_store_int8_chan(t, tex, byte, is_signed);
+}
+
+/* Does this sampler yield integers (isampler/usampler) rather than floats? Decides
+ * which carrier a sample travels in and how it is written to the def.
+ *
+ * The BASE type only, never the size bits: lavapipe runs nir_opt_16bit_tex_image with
+ * int/uint in opt_tex_dest_types, so dest_type may arrive narrowed. */
+static bool
+tex_dest_is_int(const nir_tex_instr *tex)
+{
+   nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+   return base == nir_type_int || base == nir_type_uint;
+}
+
+/* Split a packed A8R8G8B8 word into its four source channel bytes (R,G,B,A). */
+static void
+tex_argb_bytes(struct vp_tr *t, LLVMValueRef texel, LLVMValueRef byte[4])
+{
+   static const unsigned shift[4] = { 16, 8, 0, 24 };
+   for (unsigned s = 0; s < 4; s++)
+      byte[s] = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, texel, LLVMConstInt(t->i32, shift[s], false), ""),
+         LLVMConstInt(t->i32, 0xff, false), "");
+}
+
+/* Scale four channel bytes to [0,1]. The multiply-by-reciprocal (not a divide) is
+ * what the SW sampler's float decode also uses, so the two agree bit-for-bit on a
+ * non-float format. */
+static void
+tex_bytes_to_f32(struct vp_tr *t, LLVMValueRef byte[4], LLVMValueRef out[4])
+{
+   LLVMValueRef c1 = LLVMConstReal(t->f32, 1.0 / 255.0);
+   for (unsigned s = 0; s < 4; s++)
+      out[s] = LLVMBuildFMul(t->b, LLVMBuildUIToFP(t->b, byte[s], t->f32, ""), c1, "");
+}
+
+/* Unpack a packed A8R8G8B8 texel into the tex def's components: floats [0,1] for a
+ * float sampler, the raw stored integers for an isampler/usampler. This is the common
+ * tail of every packed-texel sampler (2D, array, cube, cube-array, 3D) on both the SW
+ * and HW paths, so the sampler's result type is resolved here rather than in each. */
+static void
+emit_tex_unpack(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef texel)
+{
+   LLVMValueRef byte[4];
+   tex_argb_bytes(t, texel, byte);
+
+   /* An integer sampler must yield the stored value, not a normalised colour. Integer
+    * formats sample point-only (Vulkan gates VK_FILTER_LINEAR on a format feature no
+    * integer format advertises), so the packed word holds the four stored bytes
+    * unblended. */
+   if (tex_dest_is_int(tex)) {
+      const bool is_signed =
+         nir_alu_type_get_base_type(tex->dest_type) == nir_type_int;
+      emit_tex_store_int8_chan(t, tex, byte, is_signed);
+      return;
+   }
+
+   LLVMValueRef f[4], chan[4];
+   tex_bytes_to_f32(t, byte, f);
+   for (unsigned s = 0; s < 4; s++)
+      chan[s] = LLVMBuildBitCast(t->b, f[s], t->i32, "");
+   LLVMValueRef czero, cone;
+   tex_swizzle_float_consts(t, &czero, &cone);
+   emit_tex_swizzle_store(t, tex, chan, czero, cone);
+}
+
+/* Expand a packed A8R8G8B8 texel into the float[4] scratch slot, so a packed
+ * producer (the HW TEX unit) can feed the same float unpack the float-returning SW
+ * sampler feeds. Returns the slot. */
+static LLVMValueRef
+emit_tex_argb_to_f32_scratch(struct vp_tr *t, LLVMValueRef texel)
+{
+   LLVMValueRef byte[4], f[4];
+   tex_argb_bytes(t, texel, byte);
+   tex_bytes_to_f32(t, byte, f);
+   LLVMValueRef out = tex_f32_scratch(t);
+   for (unsigned s = 0; s < 4; s++) {
+      LLVMValueRef idx[2] = { LLVMConstInt(t->i32, 0, false),
+                              LLVMConstInt(t->i32, s, false) };
+      LLVMValueRef p = LLVMBuildGEP2(t->b, LLVMArrayType(t->f32, 4), out, idx, 2, "");
+      LLVMBuildStore(t->b, f[s], p);
+   }
+   return out;
+}
+
+/* The software arm of a 2D sampling op, in whichever carrier the sampler's result
+ * type calls for: textureLod samples the explicit lambda, textureBias adds its bias
+ * to the quad-gradient LOD, and plain texture() takes the gradient alone. */
+static LLVMValueRef
+emit_tex_sw_arm(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef ux, LLVMValueRef vx,
+                LLVMValueRef lod_bits, LLVMValueRef bias_q8, bool as_f32)
+{
+   if (tex->op == nir_texop_txl)
+      return as_f32 ? emit_tex_sw_lod_f32(t, ux, vx, lod_bits)
+                    : emit_tex_sw_lod(t, ux, vx, lod_bits);
+
+   LLVMValueRef bias = (tex->op == nir_texop_txb) ? bias_q8 : NULL;
+   return as_f32 ? emit_tex_sw_resolved_f32(t, ux, vx, bias)
+                 : emit_tex_sw_resolved(t, ux, vx, bias);
+}
+
+/* sampler2DShadow: gfx_tex_shadow_sw(&texstate[0], x, y, ref_bits, filter) --
+ * sample the depth texture at (x,y), compare each tap against ref with the
+ * descriptor's compare_func, and return the 0..1 result as a float bit-pattern
+ * (0/1 point, PCF fraction for a bilinear sampler). The result is a scalar float,
+ * so write it directly to every def component (bypassing the ARGB unpack). */
+static void
+emit_tex_shadow(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y,
+                LLVMValueRef ref_bits, LLVMValueRef lod)
+{
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_sw", fty);
+   LLVMValueRef a[6] = { t->fs_texstate, x, y, ref_bits, emit_tex_filter_word(t), lod };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 6, "shadow");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
+      ssa_set(t, tex->def.index, c, res);
+}
+
+/* sampler2DArrayShadow: like emit_tex_shadow, but the integer `layer` selects the
+ * array slice before the depth compare (gfx_tex_shadow_array_sw). */
+static void
+emit_tex_shadow_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x,
+                      LLVMValueRef y, LLVMValueRef layer, LLVMValueRef ref_bits,
+                      LLVMValueRef lod)
+{
+   LLVMTypeRef params[7] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 7, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_array_sw", fty);
+   LLVMValueRef a[7] = { t->fs_texstate, x, y, layer, ref_bits,
+                         emit_tex_filter_word(t), lod };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 7, "shadowarray");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
+      ssa_set(t, tex->def.index, c, res);
+}
+
+/* samplerCubeShadow: the (sc,tc,rc) direction picks the face + projects; compare
+ * against ref at that face's slice (gfx_tex_shadow_cube_sw). */
+static void
+emit_tex_shadow_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
+                     LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef ref_bits,
+                     LLVMValueRef lod)
+{
+   LLVMTypeRef params[7] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 7, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_cube_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_cube_sw", fty);
+   LLVMValueRef a[7] = { t->fs_texstate, sc, tc, rc, ref_bits,
+                         emit_tex_filter_word(t), lod };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 7, "shadowcube");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
+      ssa_set(t, tex->def.index, c, res);
+}
+
+/* samplerCubeArrayShadow: array_index selects the cube, (sc,tc,rc) the face;
+ * compare against ref at slice array_index*6 + face. */
+static void
+emit_tex_shadow_cube_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
+                           LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef array_index,
+                           LLVMValueRef ref_bits, LLVMValueRef lod)
+{
+   LLVMTypeRef params[8] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32, t->i32,
+                             t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 8, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_shadow_cube_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_shadow_cube_array_sw", fty);
+   LLVMValueRef a[8] = { t->fs_texstate, sc, tc, rc, array_index, ref_bits,
+                         emit_tex_filter_word(t), lod };
+   LLVMValueRef res = LLVMBuildCall2(t->b, fty, fn, a, 8, "shadowcubearray");
+   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++)
+      ssa_set(t, tex->def.index, c, res);
+}
+
+/* sampler2DArray: gfx_tex_sample_array_sw(&texstate[0], x, y, layer, lod) -- sample
+ * the integer `layer` slice at (x,y) of the given LOD, then unpack the A8R8G8B8
+ * texel to the def's vec4. The layer stride comes from the resident descriptor. */
+static void
+emit_tex_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef x, LLVMValueRef y,
+               LLVMValueRef layer, LLVMValueRef lod)
+{
+   /* A float sampler takes the four-float form: a float-format texel leaves [0,1] and
+    * cannot survive the packed word. An array sample is always software, so unlike the
+    * 2D path there is no second arm to merge. */
+   if (!tex_dest_is_int(tex)) {
+      LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->ptr };
+      LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_array_f32");
+      if (!fn)
+         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_array_f32", fty);
+      LLVMValueRef out = tex_f32_scratch(t);
+      LLVMValueRef a[6] = { t->fs_texstate, x, y, layer, lod, out };
+      LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+      emit_tex_unpack_f32(t, tex, out);
+      return;
+   }
+
+   LLVMTypeRef params[5] = { t->ptr, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_array_sw", fty);
+   LLVMValueRef a[5] = { t->fs_texstate, x, y, layer, lod };
+   emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 5, "texarray"));
+}
+
+/* samplerCube: gfx_tex_sample_cube_sw(&texstate[0], sc, tc, rc, lod) -- pick the
+ * face from the major axis of the (sc,tc,rc) direction, project, and sample; the
+ * six faces are slices of the resident descriptor (layer_stride apart). Unpack the
+ * A8R8G8B8 texel to the def's vec4. */
+static void
+emit_tex_cube(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc, LLVMValueRef tc,
+              LLVMValueRef rc, LLVMValueRef lod)
+{
+   /* A float sampler takes the four-float form (see emit_tex_array); a cube sample is
+    * always software, so there is no second arm to merge. */
+   if (!tex_dest_is_int(tex)) {
+      LLVMTypeRef params[6] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->ptr };
+      LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 6, false);
+      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_cube_f32");
+      if (!fn)
+         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_cube_f32", fty);
+      LLVMValueRef out = tex_f32_scratch(t);
+      LLVMValueRef a[6] = { t->fs_texstate, sc, tc, rc, lod, out };
+      LLVMBuildCall2(t->b, fty, fn, a, 6, "");
+      emit_tex_unpack_f32(t, tex, out);
+      return;
+   }
+
+   LLVMTypeRef params[5] = { t->ptr, t->f32, t->f32, t->f32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 5, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_cube_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_cube_sw", fty);
+   LLVMValueRef a[5] = { t->fs_texstate, sc, tc, rc, lod };
+   emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 5, "texcube"));
+}
+
+/* samplerCubeArray: `array_index` selects the cube, (sc,tc,rc) the face; the SW
+ * entry addresses the slice array_index*6 + face. */
+static void
+emit_tex_cube_array(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef sc,
+                    LLVMValueRef tc, LLVMValueRef rc, LLVMValueRef array_index,
+                    LLVMValueRef lod)
+{
+   /* A float sampler takes the four-float form (see emit_tex_array); a cube-array
+    * sample is always software, so there is no second arm to merge. */
+   if (!tex_dest_is_int(tex)) {
+      LLVMTypeRef params[7] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32, t->ptr };
+      LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 7, false);
+      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_cube_array_f32");
+      if (!fn)
+         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_cube_array_f32", fty);
+      LLVMValueRef out = tex_f32_scratch(t);
+      LLVMValueRef a[7] = { t->fs_texstate, sc, tc, rc, array_index, lod, out };
+      LLVMBuildCall2(t->b, fty, fn, a, 7, "");
+      emit_tex_unpack_f32(t, tex, out);
+      return;
+   }
+
+   LLVMTypeRef params[6] = { t->ptr, t->f32, t->f32, t->f32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_cube_array_sw");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_cube_array_sw", fty);
+   LLVMValueRef a[6] = { t->fs_texstate, sc, tc, rc, array_index, lod };
+   emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 6, "texcubearray"));
+}
+
+/* sampler3D: sample at S.23 (u,v,w). The LOD and the min/mag tap come from the
+ * shared resolvers, so a 3D sample follows the same lambda rules as a 2D one. A
+ * mip-linear sampler passes the Q8 lambda with the mip-linear bit set so the sampler
+ * blends the two bracketing levels (full trilinear = 2 levels x 2 slices x bilinear);
+ * otherwise it passes the rounded integer level (nearest-mip). The sampler picks the
+ * depth slice from w (nearest slice, or a linear blend of the two bracketing slices
+ * on a linear tap). A non-mipmapped sampler forces level 0.
+ *
+ * The auto-LOD lambda still comes from the u,v gradient alone, so a volume whose
+ * depth axis is the steepest gradient picks too low a level. */
+static void
+emit_tex_3d(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef u, LLVMValueRef v,
+            LLVMValueRef w, LLVMValueRef lod_bits, LLVMValueRef bias_q8)
+{
+   /* Resolve the mip level and per-fragment tap exactly as the 2D path does -- same
+    * op-to-resolver mapping as emit_tex_sw_arm -- so every sampler shape derives its
+    * LOD through one implementation. textureLod takes the explicit lambda; texture()
+    * and textureBias take the quad gradient, the latter adding the shader bias. */
+   LLVMValueRef lod, sw_filter;
+   if (tex->op == nir_texop_txl) {
+      emit_tex_resolve_explicit_lod(t, lod_bits, &lod, &sw_filter);
+   } else {
+      emit_tex_resolve_auto_lod(t, u, v,
+                                tex->op == nir_texop_txb ? bias_q8 : NULL,
+                                &lod, &sw_filter);
+   }
+
+   /* A float sampler takes the four-float form (see emit_tex_array); a 3D sample is
+    * always software, so there is no second arm to merge. The lambda and tap above
+    * are shared -- only the final call differs. */
+   if (!tex_dest_is_int(tex)) {
+      LLVMTypeRef params[7] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32, t->ptr };
+      LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), params, 7, false);
+      LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_3d_f32");
+      if (!fn) {
+         fn = LLVMAddFunction(t->mod, "gfx_tex_sample_3d_f32", fty);
+      }
+      LLVMValueRef out = tex_f32_scratch(t);
+      LLVMValueRef a[7] = { t->fs_texstate, u, v, w, lod, sw_filter, out };
+      LLVMBuildCall2(t->b, fty, fn, a, 7, "");
+      emit_tex_unpack_f32(t, tex, out);
+      return;
+   }
+
+   LLVMTypeRef params[6] = { t->ptr, t->i32, t->i32, t->i32, t->i32, t->i32 };
+   LLVMTypeRef fty = LLVMFunctionType(t->i32, params, 6, false);
+   LLVMValueRef fn = LLVMGetNamedFunction(t->mod, "gfx_tex_sample_3d_sw");
+   if (!fn) {
+      fn = LLVMAddFunction(t->mod, "gfx_tex_sample_3d_sw", fty);
+   }
+   LLVMValueRef a[6] = { t->fs_texstate, u, v, w, lod, sw_filter };
+   emit_tex_unpack(t, tex, LLVMBuildCall2(t->b, fty, fn, a, 6, "tex3d"));
+}
+
+/* A NIR texture op: a 2D `texture()`/`textureLod()`/`textureBias()` sampling the
+ * single bound texture (TEX stage 0), or `texelFetch()` (integer-coord fetch, no
+ * filter). The interpolated texcoord is the coord source; the texture/sampler
+ * deref sources are fixed-function (TEX DCRs). For implicit-LOD `tex`, the mip
+ * level is derived from the quad's coordinate gradients; explicit-LOD/bias take
+ * level 0 (no bias arithmetic yet). The result vec4 is the unpacked A8R8G8B8
+ * texel as four floats in [0,1]. A sampler2DShadow op returns a single depth-
+ * compare float instead (emit_tex_shadow). */
 static void
 emit_tex(struct vp_tr *t, nir_tex_instr *tex)
 {
-   LLVMValueRef u = NULL, v = NULL;
+   /* Every texture route -- the SW sampler and the HW TEX path alike -- reads the
+    * resident descriptor table for the filter word and the log2 dimensions. Only
+    * the fragment entry carries that table, so a texture op in any other stage has
+    * no descriptor to read. Refuse the shader rather than build a GEP on a null. */
+   if (!t->fs_texstate) {
+      t->ok = false;
+      return;
+   }
+   /* The gather footprint is addressed in one face's 2D space, so a cube gather
+    * would have to resolve taps that cross a face edge. The cube branches below
+    * precede the gather one and would otherwise take a cube tg4 as an ordinary
+    * cube sample -- a wrong result rather than a refusal. */
+   if (tex->op == nir_texop_tg4 &&
+       tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+      mesa_logw("vortexpipe: vp_nir_to_llvm: textureGather on a cube sampler "
+                "is unimplemented");
+      t->ok = false;
+      return;
+   }
+   LLVMValueRef u = NULL, v = NULL, lod_int = NULL, bias_f = NULL;
+   LLVMValueRef off_x = NULL, off_y = NULL, cmp = NULL;
+   unsigned coord_ssa = 0;
    for (unsigned i = 0; i < tex->num_srcs; i++) {
       if (tex->src[i].src_type == nir_tex_src_coord) {
+         coord_ssa = tex->src[i].src.ssa->index;
          u = ssa_get(t, tex->src[i].src.ssa->index, 0);
          v = ssa_get(t, tex->src[i].src.ssa->index, 1);
+      } else if (tex->src[i].src_type == nir_tex_src_lod) {
+         lod_int = ssa_get(t, tex->src[i].src.ssa->index, 0);
+      } else if (tex->src[i].src_type == nir_tex_src_bias) {
+         bias_f = ssa_get(t, tex->src[i].src.ssa->index, 0);
+      } else if (tex->src[i].src_type == nir_tex_src_offset) {
+         off_x = ssa_get(t, tex->src[i].src.ssa->index, 0);
+         off_y = ssa_get(t, tex->src[i].src.ssa->index, 1);
+      } else if (tex->src[i].src_type == nir_tex_src_comparator) {
+         cmp = ssa_get(t, tex->src[i].src.ssa->index, 0);
       }
    }
-   /* Accept auto-LOD (tex) and explicit-LOD/bias (txl/txb) sampling; the device
-    * path samples base level, so the LOD/bias source is ignored. Ray-tracing and
-    * compute shaders emit txl since they have no implicit derivatives. */
-   if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
-        tex->op != nir_texop_txb) || !u || !v) {
+   /* textureBias(): the shader LOD bias as signed Q(VX_TEX_LOD_FRAC_BITS). */
+   LLVMValueRef bias_q8 = bias_f
+      ? LLVMBuildFPToSI(t->b,
+           LLVMBuildFMul(t->b, LLVMBuildBitCast(t->b, bias_f, t->f32, ""),
+              LLVMConstReal(t->f32, (double)(1 << VX_TEX_LOD_FRAC_BITS)), ""),
+           t->i32, "bias_q8")
+      : NULL;
+
+   /* Shadow mip level: textureLod / textureGrad (lowered to txl) carry an explicit
+    * LOD; encode it as the colour path does (mip-nearest level or mip-linear Q,
+    * gated by the sampler's mip-enable). texture()/textureProj sample the base
+    * level (auto-LOD shadow is magnified in the demanded tests). */
+   LLVMValueRef shadow_lod = (tex->op == nir_texop_txl && lod_int)
+      ? emit_encode_explicit_lod(t, lod_int)
+      : LLVMConstInt(t->i32, 0, false);
+
+   /* sampler2DArrayShadow: coord.z is the array layer, the comparator src (or, when
+    * folded into the coord, component 3) is the reference. Select the layer slice,
+    * then compare. Handled before the plain 2D-shadow branch (which drops the
+    * layer) and before the array-colour branch (which drops the compare). */
+   if (tex->is_shadow && tex->is_array && tex->op != nir_texop_tg4 &&
+       tex->sampler_dim == GLSL_SAMPLER_DIM_2D && u && v) {
+      LLVMValueRef ref = cmp ? cmp : ssa_get(t, coord_ssa, 3);
+      LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+      LLVMValueRef layer = LLVMBuildFPToSI(t->b,
+         LLVMBuildFAdd(t->b, zf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "layer");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      layer = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, layer, zero, ""), zero, layer, "");
+      LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "uf");
+      LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "vf");
+      LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+      LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
+      LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
+      emit_tex_shadow_array(t, tex, ux, vx, layer, ref, shadow_lod);
+      return;
+   }
+
+   /* samplerCubeArrayShadow: coord.xyz is the direction, coord.w the array index,
+    * the comparator src the reference. Select the face + project, then compare at
+    * slice array_index*6 + face. Handled before the plain cube-shadow (!is_array). */
+   if (tex->is_shadow && tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
+       tex->is_array && u && v) {
+      LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "sc");
+      LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "tc");
+      LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "rc");
+      LLVMValueRef wf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 3), t->f32, "");
+      LLVMValueRef idx = LLVMBuildFPToSI(t->b,
+         LLVMBuildFAdd(t->b, wf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "cubeidx");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      idx = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, idx, zero, ""), zero, idx, "");
+      emit_tex_shadow_cube_array(t, tex, sc, tc, rc, idx, cmp, shadow_lod);
+      return;
+   }
+
+   /* samplerCubeShadow: coord.xyz is the direction vector, the comparator src (or
+    * folded coord component 3) is the reference. Select the face + project, then
+    * compare. Handled before the plain 2D-shadow branch and the cube-colour branch. */
+   if (tex->is_shadow && tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE &&
+       !tex->is_array && u && v) {
+      LLVMValueRef ref = cmp ? cmp : ssa_get(t, coord_ssa, 3);
+      LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "sc");
+      LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "tc");
+      LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "rc");
+      emit_tex_shadow_cube(t, tex, sc, tc, rc, ref, shadow_lod);
+      return;
+   }
+
+   /* sampler2DShadow: the depth-compare reference is the comparator src, or, when
+    * a lowering folds it in, coord component 2. Sample the depth texture, compare
+    * against ref per the sampler's compareOp, and return the 0..1 result (scalar).
+    * A shadow op is still nir_texop_tex/txl, so handle it before that dispatch. A
+    * textureGatherCmp (tg4) is a 2x2 gather, not a single compare -- fall through. */
+   if (tex->is_shadow && tex->op != nir_texop_tg4 && u && v) {
+      LLVMValueRef ref = cmp ? cmp : ssa_get(t, coord_ssa, 2);
+      LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "uf");
+      LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "vf");
+      LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+      LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
+      LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
+      emit_tex_shadow(t, tex, ux, vx, ref, shadow_lod);
+      return;
+   }
+
+   /* sampler2DArray: coord.z is the array layer (round to nearest, clamp >= 0);
+    * sample that slice via the SW array entry (base + layer*layer_stride). Handled
+    * before the 2D dispatch since an array sample is still nir_texop_tex/txl. */
+   if (tex->is_array && tex->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+       tex->op != nir_texop_txf && tex->op != nir_texop_tg4 && u && v) {
+      LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+      LLVMValueRef layer = LLVMBuildFPToSI(t->b,
+         LLVMBuildFAdd(t->b, zf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "layer");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      layer = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, layer, zero, ""), zero, layer, "");
+      LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "");
+      LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "");
+      LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+      LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
+      LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
+      /* Explicit-LOD (textureLod) carries a float LOD; the array entry reads the
+       * descriptor filter, so encode the LOD the same way (mip-linear Q or
+       * mip-nearest level). Auto-LOD and base take level 0. */
+      LLVMValueRef lod = (tex->op == nir_texop_txl && lod_int)
+         ? emit_encode_explicit_lod(t, lod_int) : zero;
+      emit_tex_array(t, tex, ux, vx, layer, lod);
+      return;
+   }
+
+   /* samplerCube: coord.xyz is the direction vector; the SW cube entry selects the
+    * face and projects. Handled before the 2D dispatch (a cube sample is still
+    * nir_texop_tex/txl). */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && !tex->is_array &&
+       tex->op != nir_texop_txf && u && v) {
+      LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "");
+      LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "");
+      LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      /* txl carries a float LOD; the cube entry reads the descriptor filter, so
+       * encode the LOD the same way (mip-linear Q or mip-nearest level). Auto-LOD
+       * and base take level 0. */
+      LLVMValueRef lod = (tex->op == nir_texop_txl && lod_int)
+         ? emit_encode_explicit_lod(t, lod_int) : zero;
+      emit_tex_cube(t, tex, sc, tc, rc, lod);
+      return;
+   }
+
+   /* samplerCubeArray: coord.xyz is the direction, coord.w the array index. The
+    * SW entry addresses the slice array_index*6 + face. Handled before the plain
+    * cube (which requires !is_array) and the 2D dispatch. */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && tex->is_array &&
+       !tex->is_shadow && tex->op != nir_texop_txf && u && v) {
+      LLVMValueRef sc = LLVMBuildBitCast(t->b, u, t->f32, "");
+      LLVMValueRef tc = LLVMBuildBitCast(t->b, v, t->f32, "");
+      LLVMValueRef rc = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+      LLVMValueRef wf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 3), t->f32, "");
+      LLVMValueRef idx = LLVMBuildFPToSI(t->b,
+         LLVMBuildFAdd(t->b, wf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "cubeidx");
+      LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+      idx = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, idx, zero, ""), zero, idx, "");
+      LLVMValueRef lod = (tex->op == nir_texop_txl && lod_int)
+         ? emit_encode_explicit_lod(t, lod_int) : zero;
+      emit_tex_cube_array(t, tex, sc, tc, rc, idx, lod);
+      return;
+   }
+
+   /* texelFetch: integer (x,y,lod), no wrap/filter/mip -- the coord and lod are
+    * already integers, so skip the float->fixed conversion below. */
+   if (tex->op == nir_texop_txf) {
+      if (!u || !v) {
+         mesa_logw("vortexpipe: vp_nir_to_llvm: texelFetch missing coord");
+         t->ok = false;
+         return;
+      }
+      LLVMValueRef lod = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
+      /* texelFetchOffset: the offset is a texel delta added to the integer coord. */
+      LLVMValueRef x = off_x ? LLVMBuildAdd(t->b, u, off_x, "") : u;
+      LLVMValueRef y = off_y ? LLVMBuildAdd(t->b, v, off_y, "") : v;
+      /* 2D array: coord.z is the integer layer slice. */
+      LLVMValueRef layer = tex->is_array ? ssa_get(t, coord_ssa, 2)
+                                         : LLVMConstInt(t->i32, 0, false);
+      /* An isampler/usampler must yield the stored integer; everything else takes
+       * the float path, where a float-format texel keeps its real magnitude (its
+       * range is not [0,1]) and a non-float format decodes to the same [0,1]
+       * channels the packed-ARGB unpack yields. Branch on the base type only --
+       * the size bits are not guaranteed. */
+      nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+      if (base == nir_type_int || base == nir_type_uint) {
+         emit_tex_unpack_i32(t, tex, emit_tex_fetch_i32(t, x, y, lod, layer),
+                             base == nir_type_int);
+      } else if (tex->is_array) {
+         emit_tex_unpack_f32(t, tex, emit_tex_fetch_array_f32(t, x, y, layer, lod));
+      } else {
+         emit_tex_unpack_f32(t, tex, emit_tex_fetch_f32(t, x, y, lod));
+      }
+      return;
+   }
+
+   /* textureSize: a dimension query from the descriptor, no coord/sample. Also the
+    * intermediate a lowered textureGrad emits to scale its gradients. */
+   if (tex->op == nir_texop_txs) {
+      emit_tex_size(t, tex, lod_int);
+      return;
+   }
+
+   /* textureGather: the 2x2 footprint's `comp` channel, base level, SW-only. */
+   if (tex->op == nir_texop_tg4) {
+      if (!u || !v) {
+         mesa_logw("vortexpipe: vp_nir_to_llvm: textureGather missing coord");
+         t->ok = false;
+         return;
+      }
+      LLVMValueRef guf = LLVMBuildBitCast(t->b, u, t->f32, "");
+      LLVMValueRef gvf = LLVMBuildBitCast(t->b, v, t->f32, "");
+      /* textureGatherOffset: a constant texel offset added to the coord as
+       * offset/dim (mip-0 dims), so the 2x2 footprint shifts by whole texels. */
+      if (off_x || off_y) {
+         LLVMValueRef w0, h0;
+         emit_tex_mip0_dims(t, &w0, &h0);
+         if (off_x)
+            guf = LLVMBuildFAdd(t->b, guf,
+               LLVMBuildFDiv(t->b, LLVMBuildSIToFP(t->b, off_x, t->f32, ""),
+                             LLVMBuildUIToFP(t->b, w0, t->f32, ""), ""), "");
+         if (off_y)
+            gvf = LLVMBuildFAdd(t->b, gvf,
+               LLVMBuildFDiv(t->b, LLVMBuildSIToFP(t->b, off_y, t->f32, ""),
+                             LLVMBuildUIToFP(t->b, h0, t->f32, ""), ""), "");
+      }
+      LLVMValueRef gscale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
+      LLVMValueRef gux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, guf, gscale, ""), t->i32, "");
+      LLVMValueRef gvx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, gvf, gscale, ""), t->i32, "");
+      LLVMValueRef glayer = NULL;
+      if (tex->is_array) {
+         LLVMValueRef zf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "");
+         LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+         glayer = LLVMBuildFPToSI(t->b,
+            LLVMBuildFAdd(t->b, zf, LLVMConstReal(t->f32, 0.5), ""), t->i32, "glayer");
+         glayer = LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntSLT, glayer, zero, ""), zero, glayer, "");
+      }
+      /* textureGatherCmp (sampler2DShadow): compare each tap against the reference. */
+      if (tex->is_shadow)
+         emit_tex_gather_cmp(t, tex, gux, gvx,
+            cmp ? cmp : ssa_get(t, coord_ssa, tex->is_array ? 3 : 2), glayer);
+      else
+         emit_tex_gather(t, tex, gux, gvx, glayer);
+      return;
+   }
+
+   /* Accept auto-LOD (tex) and explicit-LOD/bias (txl/txb) sampling. Ray-tracing
+    * and compute shaders emit txl since they have no implicit derivatives. */
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txb) {
       mesa_logw("vortexpipe: vp_nir_to_llvm: unsupported texture op %d", tex->op);
       t->ok = false;
       return;
    }
+   /* A 1D texture is one row of a 2D one, so supplying the second coordinate
+    * lets the whole 2D path -- filtering, mip selection, wrap -- apply as it
+    * stands. A 1D array carries its layer in the second component instead and
+    * needs its own handling, so it is left to the guard below. */
+   if (!v && u && tex->sampler_dim == GLSL_SAMPLER_DIM_1D && !tex->is_array) {
+      v = LLVMConstInt(t->i32, 0, false);          /* 0.0f is all-zero bits */
+   }
+   /* What still reaches here without a second component is a 1D array, whose
+    * second coordinate is a layer rather than an axis. That is a missing
+    * dimension, not a rejected op, and reporting it as one would send the
+    * reader to the op switch. */
+   if (!u || !v) {
+      mesa_logw("vortexpipe: vp_nir_to_llvm: texture op %d: no %s coordinate "
+                "component (unsupported sampler dimensionality)",
+                tex->op, u ? "second" : "first");
+      t->ok = false;
+      return;
+   }
+
+   LLVMValueRef uf = LLVMBuildBitCast(t->b, u, t->f32, "uf");
+   LLVMValueRef vf = LLVMBuildBitCast(t->b, v, t->f32, "vf");
+
+   /* textureOffset: a constant texel offset added to the normalized coord as
+    * offset/dim (mip-0 dims -- deqp's offset cases sample the base level). */
+   if (off_x || off_y) {
+      LLVMValueRef w0, h0;
+      emit_tex_mip0_dims(t, &w0, &h0);
+      if (off_x)
+         uf = LLVMBuildFAdd(t->b, uf,
+            LLVMBuildFDiv(t->b, LLVMBuildSIToFP(t->b, off_x, t->f32, ""),
+                          LLVMBuildUIToFP(t->b, w0, t->f32, ""), ""), "uoff");
+      if (off_y)
+         vf = LLVMBuildFAdd(t->b, vf,
+            LLVMBuildFDiv(t->b, LLVMBuildSIToFP(t->b, off_y, t->f32, ""),
+                          LLVMBuildUIToFP(t->b, h0, t->f32, ""), ""), "voff");
+   }
 
    /* float UV -> the TEX unit's S.23 fixed-point coordinate. */
    LLVMValueRef scale = LLVMConstReal(t->f32, (double)(1u << VP_TEX_FXD_FRAC));
-   LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
-      LLVMBuildBitCast(t->b, u, t->f32, ""), scale, ""), t->i32, "");
-   LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b,
-      LLVMBuildBitCast(t->b, v, t->f32, ""), scale, ""), t->i32, "");
+   LLVMValueRef ux = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, uf, scale, ""), t->i32, "");
+   LLVMValueRef vx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, vf, scale, ""), t->i32, "");
 
-   LLVMValueRef texel = emit_vx_tex(t, ux, vx,
-                                    LLVMConstInt(t->i32, 0, false));
+   /* The explicit-LOD source, as the raw f32 bits every LOD resolver expects; an op
+    * without one never reads it. */
+   LLVMValueRef lod_bits = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
 
-   /* unpack A8R8G8B8 -> {r,g,b,a} floats in [0,1]. */
-   static const unsigned shift[4] = { 16, 8, 0, 24 };
-   for (unsigned c = 0; c < tex->def.num_components && c < 4; c++) {
-      LLVMValueRef byte = LLVMBuildAnd(t->b,
-         LLVMBuildLShr(t->b, texel,
-                       LLVMConstInt(t->i32, shift[c], false), ""),
-         LLVMConstInt(t->i32, 0xff, false), "");
-      LLVMValueRef f = LLVMBuildFMul(t->b,
-         LLVMBuildUIToFP(t->b, byte, t->f32, ""),
-         LLVMConstReal(t->f32, 1.0 / 255.0), "");
-      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, f, t->i32, ""));
+   /* sampler3D: the third coordinate selects the depth slice (SW-sampled). */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_3D && !tex->is_array) {
+      LLVMValueRef wf = LLVMBuildBitCast(t->b, ssa_get(t, coord_ssa, 2), t->f32, "wf");
+      LLVMValueRef wx = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, wf, scale, ""), t->i32, "");
+      emit_tex_3d(t, tex, ux, vx, wx, lod_bits, bias_q8);
+      return;
    }
+
+   /* Sample. Implicit-LOD `texture()` on a HW-TEX device: a mipmapped sampler
+    * (texstate.filter mip-enable bit) routes to the SW sampler, which resolves the
+    * min/mag tap per fragment and the mip level (nearest or trilinear); a non-
+    * mipmapped sampler stays on the fast HW TEX path at the base level. mip-enable is
+    * a uniform descriptor bit, so the branch never diverges. On a TEX-less device
+    * (t->sw_tex) every sample is software. Explicit-LOD/bias (txl/txb) have no
+    * derivatives and take the base level.
+    *
+    * The sample is carried as four floats for a float sampler -- a float-format texel
+    * leaves [0,1] and cannot survive the packed 8-bit word -- and as that packed word
+    * for an integer sampler, whose formats are all 8-bit and FF. The carrier follows
+    * the sampler's static result type, so only one form is ever emitted. */
+   const bool as_f32 = !tex_dest_is_int(tex);
+
+   if (t->sw_tex) {
+      /* TEX-less device: software always. The SW arm resolves min/mag + mip itself
+       * (a non-mipmapped sampler falls out as magnified -> base level). */
+      LLVMValueRef r = emit_tex_sw_arm(t, tex, ux, vx, lod_bits, bias_q8, as_f32);
+      if (as_f32)
+         emit_tex_unpack_f32(t, tex, r);
+      else
+         emit_tex_unpack(t, tex, r);
+      return;
+   }
+
+   /* Route to the SW sampler when the sampler is mipmapped, the texture is NPOT (the
+    * FF vx_tex4 unit is POT-only), or its format is above the FF set (the FF unit has
+    * no decoder or texel stride for it); otherwise the fast HW path. All are uniform
+    * descriptor bits, so the branch never diverges (derivatives safe). A float format
+    * always sets the extended-format bit, so the HW unit never sees a wide texel.
+    *
+    * A border wrap is NOT among them: the unit carries a border colour of its own
+    * and substitutes the taps that leave the texture. A mipmapped border sampler
+    * still lands in software, on the mip bit -- which is the one border combination
+    * the unit has no test for. */
+   LLVMValueRef use_sw = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, emit_tex_filter_word(t),
+         LLVMConstInt(t->i32,
+            GFX_SW_TEX_FILTER_MIP_ENABLE | GFX_SW_TEX_FILTER_NPOT |
+            GFX_SW_TEX_FILTER_EXT_FORMAT, false), ""),
+      LLVMConstInt(t->i32, 0, false), "tex_use_sw");
+   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
+   LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_sw");
+   LLVMBasicBlockRef bb_hw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_hw");
+   LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_merge");
+   LLVMBuildCondBr(t->b, use_sw, bb_sw, bb_hw);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_sw);
+   LLVMValueRef texel_sw = emit_tex_sw_arm(t, tex, ux, vx, lod_bits, bias_q8, as_f32);
+   LLVMBasicBlockRef end_sw = LLVMGetInsertBlock(t->b);
+   LLVMBuildBr(t->b, bb_mg);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_hw);
+   LLVMValueRef texel_hw = emit_tex_hw(t, ux, vx, LLVMConstInt(t->i32, 0, false));
+   if (as_f32)
+      emit_tex_argb_to_f32_scratch(t, texel_hw);
+   LLVMBasicBlockRef end_hw = LLVMGetInsertBlock(t->b);
+   LLVMBuildBr(t->b, bb_mg);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_mg);
+   if (as_f32) {
+      /* Both arms filled the one scratch slot, so there is nothing to merge: the
+       * slot is the entry block's alloca, which dominates this block whichever arm
+       * ran. */
+      emit_tex_unpack_f32(t, tex, texel_sw);
+      return;
+   }
+   LLVMValueRef texel = LLVMBuildPhi(t->b, t->i32, "texel");
+   LLVMValueRef vals[2] = { texel_sw, texel_hw };
+   LLVMBasicBlockRef bbs[2] = { end_sw, end_hw };
+   LLVMAddIncoming(texel, vals, bbs, 2);
+   emit_tex_unpack(t, tex, texel);
 }
 
 /* A NIR phi -> one LLVM phi per component. The incoming values are
@@ -2202,6 +4404,7 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
                 struct vp_vs_layout *out_vs)
 {
    unsigned next = 16;   /* slot 0 reserved for gl_Position */
+   unsigned vs_scalars = 0;
    nir_foreach_shader_out_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
       int off;
@@ -2210,18 +4413,35 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
       } else {
          off = (int)next;
          next += 16;
-         if (out_vs && out_vs->num_varyings < VP_VS_MAX_VARYINGS) {
+         if (out_vs) {
+            if (out_vs->num_varyings >= VP_VS_MAX_VARYINGS) {
+               mesa_logw("vortexpipe: VS declares more than %u generic "
+                         "varyings; this draw runs on llvmpipe",
+                         VP_VS_MAX_VARYINGS);
+               t->ok = false; return;
+            }
             out_vs->varying_loc[out_vs->num_varyings]   = var->data.location;
             out_vs->varying_comps[out_vs->num_varyings] =
                glsl_get_components(var->type);
-         }
-         if (out_vs)
             out_vs->num_varyings++;
+            vs_scalars += glsl_get_components(var->type);
+         }
       }
       t->vars[t->nvars].var     = var;
       t->vars[t->nvars].alloca  = NULL;
       t->vars[t->nvars].out_off = off;
       t->nvars++;
+   }
+   /* The front end carries varyings in VP_RAST_MAX_PLANES scalar interpolation
+    * planes and drops whatever does not fit, so a shader that writes more than
+    * that loses varyings with no diagnostic and the fragment reads a
+    * fixed-function default in their place. Refuse it here instead: the draw
+    * takes the llvmpipe fallback and produces the right answer slowly. */
+   if (vs_scalars > VP_RAST_MAX_PLANES) {
+      mesa_logw("vortexpipe: VS varyings need %u interpolation planes, "
+                "device carries %u; this draw runs on llvmpipe",
+                vs_scalars, VP_RAST_MAX_PLANES);
+      t->ok = false; return;
    }
    t->out_stride = next;   /* 16 * (1 + num_varyings) */
    if (out_vs)
@@ -2235,21 +4455,73 @@ static void
 fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
 {
    unsigned off = 0;
+   unsigned fs_scalars = 0;
+   t->fs_pos_off = -1;
    nir_foreach_shader_in_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      /* A flat varying bypasses the interpolator: its bit pattern is not
+       * necessarily a number -- which is why every integer varying is flat --
+       * and the plane path would premultiply it by 1/w and quantise it to
+       * Q7.24, turning a small integer into zero. Setup carries the provoking
+       * vertex's words verbatim in a side array instead, which the fill below
+       * reads without arithmetic.
+       *
+       * noperspective has no such carry: it needs a plane that is interpolated
+       * but not premultiplied, which is a third path neither side implements.
+       * Refuse it rather than treat it as smooth -- silently mistreating an
+       * interpolation mode is what this whole path exists to stop doing. */
+      if (var->data.interpolation == INTERP_MODE_NOPERSPECTIVE) {
+         mesa_logw("vortexpipe: FS input at location %u uses noperspective "
+                   "interpolation, which the device varying path does not "
+                   "implement; this draw runs on llvmpipe",
+                   var->data.location);
+         t->ok = false; return;
+      }
+      /* gl_FragCoord is a system value wearing an input's clothes. It takes a
+       * slot in the record like any other input, but the wrapper writes it from
+       * the pixel address and the primitive rather than from an interpolated
+       * plane -- so it must not claim one, or every varying declared after it
+       * reads its neighbour's. */
+      if (var->data.location == VARYING_SLOT_POS) {
+         t->fs_pos_off = (int)off;
+      } else {
+         fs_scalars += glsl_get_components(var->type);
+      }
       t->vars[t->nvars].var     = var;
       t->vars[t->nvars].alloca  = NULL;
       t->vars[t->nvars].out_off = (int)off;
       t->nvars++;
       off += 16;
    }
+   /* One slot past the declared inputs for the system values with no variable
+    * of their own (gl_FrontFacing). */
+   t->fs_sysval_off = off;
+   /* The record is a fixed-size alloca in the wrapper, so a shader declaring
+    * more inputs than it holds would have the wrapper write past it. The plane
+    * budget below does not bound this: twelve scalars are twelve slots. */
+   if (off + 16u > VP_FS_IN_WORDS * 4u) {
+      mesa_logw("vortexpipe: FS declares %u input slots, record holds %u; "
+                "this draw runs on llvmpipe",
+                off / 16u, (VP_FS_IN_WORDS * 4u) / 16u - 1u);
+      t->ok = false; return;
+   }
+   /* Same plane budget as the VS side, checked here too because the two are
+    * compiled independently: a fragment shader reading past the last plane is
+    * left holding the fixed-function default, silently. */
+   if (fs_scalars > VP_RAST_MAX_PLANES) {
+      mesa_logw("vortexpipe: FS inputs need %u interpolation planes, "
+                "device carries %u; this draw runs on llvmpipe",
+                fs_scalars, VP_RAST_MAX_PLANES);
+      t->ok = false; return;
+   }
    /* Output slots are keyed by render-target index: a colour output at
     * FRAG_RESULT_DATA0+k lands at out slot k*16, so the wrapper can pack colours
     * 0..num_color-1 deterministically regardless of declaration order. Non-colour
-    * outputs (gl_FragDepth/stencil — unsupported on gfx-v1, depth comes from the
-    * plane) get a scratch slot past the colour area so their stores never corrupt
-    * a colour and are never read back. */
+    * outputs get a slot past the colour area, where a store cannot corrupt a
+    * colour; gl_FragDepth's is read back for the fragment's depth, and anything
+    * else there is written and ignored. */
    unsigned num_color = 0, scratch = 0;
+   t->fs_depth_off = -1;
    nir_foreach_shader_out_variable(var, nir) {
       if (t->nvars >= VP_MAXV) { t->ok = false; return; }
       unsigned loc = var->data.location;
@@ -2277,6 +4549,8 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
       t->vars[t->nvars].var     = var;
       t->vars[t->nvars].alloca  = NULL;
       t->vars[t->nvars].out_off = (int)(slot * 16);
+      if (loc == FRAG_RESULT_DEPTH)
+         t->fs_depth_off = (int)(slot * 16);
       t->nvars++;
    }
    t->fs_num_color = num_color ? num_color : 1;
@@ -2387,7 +4661,12 @@ emit_vx_om_export(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef colour,
                   LLVMValueRef depth)
 {
    const char *s = ".insn r4 43, 3, 3, x0, $0, $1, $2";
-   LLVMTypeRef args[3] = { t->i32, t->i32, t->i32 };
+   /* The address is pointer-wide: the LSU decodes the aperture by comparing the
+    * whole address against the aperture range, and rv64 holds a 32-bit value in
+    * a register SIGN-extended -- so an i32 base of 0xE0000000 would arrive as
+    * 0xffffffff_e0000000 and match nothing. Colour and depth are payload and
+    * stay 32-bit. */
+   LLVMTypeRef args[3] = { t->iptr, t->i32, t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
                                        args, 3, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "r,r,r", 6,
@@ -2399,20 +4678,24 @@ emit_vx_om_export(struct vp_tr *t, LLVMValueRef addr, LLVMValueRef colour,
    LLVMBuildCall2(t->b, fnty, ia, a, 3, "");
 }
 
-/* Aperture address of one pixel:
- *   base + ((face << (xbits+ybits)) | (y << xbits) | x) << record_shift
- * xbits/ybits/record_shift are unpacked from the FS arg block (per-draw). */
+/* Aperture address of one pixel of one colour attachment:
+ *   base + ((((rt << 1) | face) << (xbits+ybits)) | (y << xbits) | x) << record_shift
+ * xbits/ybits/record_shift are unpacked from the FS arg block (per-draw). The
+ * attachment index sits ABOVE the cube face, so rt == 0 reproduces the
+ * single-attachment encoding bit for bit. */
 static LLVMValueRef
 emit_om_aperture_addr(struct vp_tr *t, LLVMValueRef xbits, LLVMValueRef ybits,
                       LLVMValueRef shift, LLVMValueRef x, LLVMValueRef y,
-                      LLVMValueRef face)
+                      LLVMValueRef face, LLVMValueRef rt)
 {
+   LLVMValueRef sel = LLVMBuildOr(t->b,
+      LLVMBuildShl(t->b, rt, LLVMConstInt(t->i32, 1, false), ""), face, "");
    LLVMValueRef idx = LLVMBuildOr(t->b,
-      LLVMBuildShl(t->b, face, LLVMBuildAdd(t->b, xbits, ybits, ""), ""),
+      LLVMBuildShl(t->b, sel, LLVMBuildAdd(t->b, xbits, ybits, ""), ""),
       LLVMBuildOr(t->b, LLVMBuildShl(t->b, y, xbits, ""), x, ""), "");
    return LLVMBuildAdd(t->b,
-      LLVMConstInt(t->i32, (uint32_t)VX_MEM_OM_BASE_ADDR, false),
-      LLVMBuildShl(t->b, idx, shift, ""), "");
+      LLVMConstInt(t->iptr, (uint32_t)VX_MEM_OM_BASE_ADDR, false),
+      vp_to_iptr(t, LLVMBuildShl(t->b, idx, shift, "")), "");
 }
 
 /* reinterpret a raw fixed-point i32 as float: (float)raw / 2^frac */
@@ -2494,24 +4777,27 @@ emit_arg_i32(struct vp_tr *t, LLVMValueRef arg, unsigned k)
  * gfx-v1 fixed-function varying mapping -- a real GPU interpolates
  * arbitrary user varyings, gfx-v1 has exactly these planes. */
 static void
-emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
-                      LLVMValueRef in_addr,
+emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim, LLVMValueRef flat,
+                      LLVMValueRef in_addr, LLVMValueRef px, LLVMValueRef py,
                       LLVMValueRef dxq, LLVMValueRef dyq)
 {
-   /* The front end interpolates 6 scalar planes; expand_k packed the VS varyings
-    * into them in declaration order [u,v,r,g,b,a] (gfx_frontend_k.h). Read them
-    * back the same way: each FS input varying claims the next nc lanes, so a draw
-    * carrying several varyings never collides them onto one plane (the old
-    * nc<=2->texcoord / else->colour heuristic aliased every >=3-component varying
-    * onto r,g,b,a). */
-   static const unsigned lane[6] = {
-      VP_RAST_ATTR_U, VP_RAST_ATTR_V,
-      VP_RAST_ATTR_R, VP_RAST_ATTR_G, VP_RAST_ATTR_B, VP_RAST_ATTR_A };
+   /* The front end interpolates 12 scalar planes; expand_k packed the VS varyings
+    * into them in declaration order [u,v,r,g,b,a,w0..w5] (gfx_frontend_k.h). Read
+    * them back the same way: each FS input varying claims the next nc lanes, so a
+    * draw may carry any mix of varyings (a texcoord + a scalar lod, or a
+    * samplerCube textureGrad's coord + dPdx + dPdy = 9 scalars) without the planes
+    * colliding. Twelve planes are the [u,v,r,g,b,a] six plus w0..w5. */
+   static const unsigned lane[VP_RAST_MAX_PLANES] = {
+      VP_RAST_ATTR_U,  VP_RAST_ATTR_V,
+      VP_RAST_ATTR_R,  VP_RAST_ATTR_G,  VP_RAST_ATTR_B,  VP_RAST_ATTR_A,
+      VP_RAST_ATTR_W0, VP_RAST_ATTR_W1, VP_RAST_ATTR_W2,
+      VP_RAST_ATTR_W3, VP_RAST_ATTR_W4, VP_RAST_ATTR_W5 };
 
    /* Perspective recovery: setup premultiplied every colour/uv plane by 1/w and
-    * carries a separate 1/w plane, so the true attribute is
-    * interp(a/w)/interp(1/w) (gfx_setup.h). For a screen-aligned triangle 1/w is
-    * constant, so this is an exact divide. */
+    * carries a separate 1/w plane, so the true attribute is interp(a/w)/interp(1/w)
+    * (gfx_setup.h). setup also folds a common power-of-2 into 1/w to keep large
+    * texcoords inside the Q7.24 range; that same divide undoes it. For a
+    * screen-aligned triangle 1/w is constant 1, so this is an exact divide by 1. */
    LLVMValueRef rhw_f = emit_fixed_to_float(t,
       emit_interp(t, addk(t, prim, VP_RAST_ATTR_RHW), dxq, dyq), 24);
    LLVMValueRef nz = LLVMBuildFCmp(t->b, LLVMRealONE, rhw_f,
@@ -2527,7 +4813,21 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
          continue;
       unsigned nc = glsl_get_components(var->type);
       LLVMValueRef slot = addk(t, in_addr, (unsigned)t->vars[i].out_off);
-      for (unsigned c = 0; c < nc && li < 6u; c++, li++) {
+      if (var->data.location == VARYING_SLOT_POS) {
+         continue;   /* system value; written below, and claims no plane */
+      }
+      /* A flat varying is held constant over the primitive, so it is read from
+       * the words setup copied out of the provoking vertex rather than
+       * interpolated. No arithmetic is applied on the way: the value may be an
+       * integer whose float reinterpretation is a denormal, and the plane path
+       * would quantise that to zero. */
+      const bool is_flat = (var->data.interpolation == INTERP_MODE_FLAT);
+      for (unsigned c = 0; c < nc && li < VP_RAST_MAX_PLANES; c++, li++) {
+         if (is_flat) {
+            emit_store_i32(t, addk(t, slot, c * 4),
+                           emit_load_i32(t, addk(t, flat, li * 4)));
+            continue;
+         }
          LLVMValueRef q = emit_interp(t, addk(t, prim, lane[li]), dxq, dyq);
          LLVMValueRef f = LLVMBuildFMul(t->b, emit_fixed_to_float(t, q, 24),
                                         inv_rhw, "");
@@ -2535,6 +4835,69 @@ emit_fs_fill_varyings(struct vp_tr *t, LLVMValueRef prim,
                         LLVMBuildBitCast(t->b, f, t->i32, ""));
       }
    }
+
+   /* gl_FragCoord. x,y are the pixel CENTRE, which is the sample position the
+    * whole pipeline shades at. z is the same fixed-function depth plane the
+    * merger and the early-Z read, so a shader comparing gl_FragCoord.z against
+    * what it wrote sees one value, not two. w is 1/w_clip: the rhw plane
+    * interpolates that directly, but setup premultiplied it by a normalization
+    * factor that cancels in a varying's interp(a*rhw)/interp(rhw) and does NOT
+    * cancel here, so it is divided back out. */
+   if (t->fs_pos_off >= 0) {
+      LLVMValueRef slot = addk(t, in_addr, (unsigned)t->fs_pos_off);
+      LLVMValueRef half = LLVMConstReal(t->f32, 0.5);
+      LLVMValueRef xf = LLVMBuildFAdd(t->b,
+         LLVMBuildSIToFP(t->b, px, t->f32, ""), half, "fcx");
+      LLVMValueRef yf = LLVMBuildFAdd(t->b,
+         LLVMBuildSIToFP(t->b, py, t->f32, ""), half, "fcy");
+
+      LLVMValueRef zpx = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z));
+      LLVMValueRef zpy = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z + 4));
+      LLVMValueRef zpz = emit_load_i32(t, addk(t, prim, VP_RAST_ATTR_Z + 8));
+      LLVMValueRef zacc = LLVMBuildAdd(t->b,
+         LLVMBuildAdd(t->b,
+            LLVMBuildMul(t->b, LLVMBuildSExt(t->b, zpx, t->i64, ""),
+                               LLVMBuildSExt(t->b, px, t->i64, ""), ""),
+            LLVMBuildMul(t->b, LLVMBuildSExt(t->b, zpy, t->i64, ""),
+                               LLVMBuildSExt(t->b, py, t->i64, ""), ""), ""),
+         LLVMBuildSExt(t->b, zpz, t->i64, ""), "");
+      LLVMValueRef z32 = LLVMBuildTrunc(t->b, zacc, t->i32, "");
+      LLVMValueRef zmask = LLVMConstInt(t->i32, 0xffffff, false);
+      LLVMValueRef zsat = LLVMBuildSelect(t->b,
+         LLVMBuildICmp(t->b, LLVMIntSLT, z32, LLVMConstInt(t->i32, 0, false), ""),
+         LLVMConstInt(t->i32, 0, false),
+         LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntSGT, z32, zmask, ""), zmask, z32, ""), "");
+      LLVMValueRef zf = LLVMBuildFDiv(t->b,
+         LLVMBuildUIToFP(t->b, zsat, t->f32, ""),
+         LLVMConstReal(t->f32, (double)0xffffff), "fcz");
+
+      LLVMValueRef scale = LLVMBuildBitCast(t->b,
+         emit_load_i32(t, addk(t, prim, VP_RAST_PRIM_RHW_SCALE)), t->f32, "");
+      LLVMValueRef snz = LLVMBuildFCmp(t->b, LLVMRealONE, scale,
+                                       LLVMConstReal(t->f32, 0.0), "");
+      LLVMValueRef wf = LLVMBuildFDiv(t->b, rhw_f,
+         LLVMBuildSelect(t->b, snz, scale, LLVMConstReal(t->f32, 1.0), ""), "fcw");
+
+      emit_store_i32(t, addk(t, slot, 0),
+                     LLVMBuildBitCast(t->b, xf, t->i32, ""));
+      emit_store_i32(t, addk(t, slot, 4),
+                     LLVMBuildBitCast(t->b, yf, t->i32, ""));
+      emit_store_i32(t, addk(t, slot, 8),
+                     LLVMBuildBitCast(t->b, zf, t->i32, ""));
+      emit_store_i32(t, addk(t, slot, 12),
+                     LLVMBuildBitCast(t->b, wf, t->i32, ""));
+   }
+
+   /* gl_FrontFacing. EdgeEquation flips a backward-wound triangle's edges so the
+    * interior is positive either way, which erases the winding; setup records it
+    * beforehand, and this is the only place it can still be read. */
+   emit_store_i32(t, addk(t, in_addr, t->fs_sysval_off),
+      LLVMBuildZExt(t->b,
+         LLVMBuildICmp(t->b, LLVMIntEQ,
+            emit_load_i32(t, addk(t, prim, VP_RAST_PRIM_FACING)),
+            LLVMConstInt(t->i32, 0, false), ""),
+         t->i32, "frontfacing"));
 }
 
 /* Source of a covered quad's per-corner edge (barycentric) values, the one
@@ -2548,6 +4911,13 @@ struct vp_bc_src {
    bool         from_window;  /* HW: recompute from the primitive's edge planes */
    LLVMValueRef quad_addr;    /* SW: iptr address of the gfx_rast_quad_t */
    LLVMValueRef sub;          /* SW: this lane's corner within that quad (0..3) */
+   unsigned     bcoord_word0; /* SW: word index of bcoords[0] in that record --
+                               * 1 single-sample, 5 multisample (the wider record
+                               * carries sample_masks[4] between the two) */
+   LLVMValueRef sample_mask;  /* SW multisample: this corner's per-sample coverage
+                               * (bit k = sample k). NULL on every single-sample
+                               * path, and on the fixed-function path, which has no
+                               * per-sample coverage to give. */
 };
 
 /* Edge value F[axis] at this lane's pixel, as a float (fixed_t<16> raw).
@@ -2568,11 +4938,12 @@ emit_bc(struct vp_tr *t, const struct vp_bc_src *bc, LLVMValueRef prim,
          LLVMBuildAdd(t->b, LLVMBuildMul(t->b, ex, px, ""),
                             LLVMBuildMul(t->b, ey, py, ""), ""), ez, "bcraw");
    } else {
-      /* gfx_rast_quad_t: pos_mask @word0, bcoords[axis*4+corner] @word 1+..
-       * The corner is this lane's sub, a runtime value, so index it dynamically. */
+      /* bcoords[axis*4+corner], at bcoord_word0 + .. in the quad record (word 1
+       * single-sample, word 5 multisample). The corner is this lane's sub, a
+       * runtime value, so index it dynamically. */
       LLVMValueRef off = LLVMBuildShl(t->b,
          LLVMBuildAdd(t->b, bc->sub,
-            LLVMConstInt(t->i32, 1 + axis * 4, false), ""),
+            LLVMConstInt(t->i32, bc->bcoord_word0 + axis * 4, false), ""),
          LLVMConstInt(t->i32, 2, false), "bcoff");
       raw = emit_load_i32(t,
          LLVMBuildAdd(t->b, bc->quad_addr, vp_to_iptr(t, off), ""));
@@ -2615,7 +4986,8 @@ emit_om_aperture_load(struct vp_tr *t, LLVMValueRef arg)
 static void
 emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
                  LLVMValueRef fs_main, LLVMTypeRef fs_main_ty,
-                 LLVMValueRef prim, LLVMValueRef in_scr, LLVMValueRef out_scr,
+                 LLVMValueRef prim, LLVMValueRef flat,
+                 LLVMValueRef in_scr, LLVMValueRef out_scr,
                  LLVMValueRef in_addr, LLVMValueRef out_addr,
                  LLVMValueRef texstate_ptr, LLVMValueRef omstate_ptr,
                  LLVMValueRef desc_ptr, LLVMValueRef mrt_ptr,
@@ -2646,7 +5018,7 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
 
       /* interpolate the RASTER attribute planes into the FS input
        * varyings (colour and/or texcoord, by declaration). */
-      emit_fs_fill_varyings(t, prim, in_addr, dxq, dyq);
+      emit_fs_fill_varyings(t, prim, flat, in_addr, pxc, pyc, dxq, dyq);
 
       /* run the programmable fragment shader (3rd arg = SW texstate table,
        * 4th = resident FS descriptor table, 5th = the discard/demote flag). A
@@ -2661,17 +5033,25 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
       cov = LLVMBuildAnd(t->b, cov,
          LLVMBuildLoad2(t->b, t->i32, live, "live.v"), "cov_live");
 
-      /* pack a render target's FS output (4 floats at out_addr + rt*16) into an
-       * R8G8B8A8 pixel. */
+      /* pack a render target's FS output (4 floats at out_addr + rt*16) into a
+       * single pixel word, in that attachment's own channel order: red in the
+       * low byte, or blue there when it is blue-first. The order is per target,
+       * so a draw writing two attachments may pack them differently. The merger
+       * stores the word unmodified and the host reads the buffer back byte for
+       * byte, so this is the only place the order is decided. Alpha stays in
+       * the high byte either way, which is what keeps every alpha blend factor
+       * order-independent. */
       unsigned num_color = t->fs_num_color ? t->fs_num_color : 1;
       LLVMValueRef rgba_rt[GFX_OM_MAX_RT];
       for (unsigned rt = 0; rt < num_color && rt < GFX_OM_MAX_RT; rt++) {
+         const bool bgra = (t->fs_bgra_mask >> rt) & 1u;
          LLVMValueRef rgba = LLVMConstInt(t->i32, 0, false);
          for (unsigned c = 0; c < 4; c++) {
+            const unsigned byte = (bgra && c < 3) ? (2u - c) : c;
             LLVMValueRef fc = LLVMBuildBitCast(t->b,
                emit_load_i32(t, addk(t, out_addr, rt * 16 + c * 4)), t->f32, "");
             LLVMValueRef bc8 = LLVMBuildShl(t->b, emit_to_byte(t, fc),
-               LLVMConstInt(t->i32, c * 8, false), "");
+               LLVMConstInt(t->i32, byte * 8, false), "");
             rgba = LLVMBuildOr(t->b, rgba, bc8, "");
          }
          rgba_rt[rt] = rgba;
@@ -2702,7 +5082,80 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
             LLVMBuildICmp(t->b, LLVMIntSGT, z32, zmask, ""), zmask, z32, ""),
          "depth");
 
-      if (t->sw_om && num_color > 1) {
+      /* gl_FragDepth replaces the interpolated plane: the shader's [0,1] value
+       * scales to the same 24-bit range the plane path saturates to, so the
+       * merger tests and stores it without knowing which produced it. */
+      if (t->fs_depth_off >= 0) {
+         LLVMValueRef zf = LLVMBuildBitCast(t->b,
+            emit_load_i32(t, addk(t, out_addr, (unsigned)t->fs_depth_off)),
+            t->f32, "fragdepth");
+         LLVMValueRef zero_f = LLVMConstReal(t->f32, 0.0);
+         LLVMValueRef one_f  = LLVMConstReal(t->f32, 1.0);
+         /* Ordered compares select the bound on an unordered result, so a NaN
+          * depth resolves to a defined value instead of poisoning fptoui. */
+         zf = LLVMBuildSelect(t->b,
+            LLVMBuildFCmp(t->b, LLVMRealOLT, zf, one_f, ""), zf, one_f, "");
+         zf = LLVMBuildSelect(t->b,
+            LLVMBuildFCmp(t->b, LLVMRealOGT, zf, zero_f, ""), zf, zero_f, "");
+         LLVMValueRef zi = LLVMBuildFPToUI(t->b,
+            LLVMBuildFAdd(t->b,
+               LLVMBuildFMul(t->b, zf,
+                  LLVMConstReal(t->f32, (double)0xffffff), ""),
+               LLVMConstReal(t->f32, 0.5), ""), t->i32, "fragdepth_i");
+         /* 0xffffff+0.5 is not representable in f32 and rounds up, so z == 1.0
+          * lands one past the field; saturate as the plane path does. */
+         depth_i = LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntUGT, zi, zmask, ""), zmask, zi, "depth");
+      }
+
+      /* Multisample merge is legal to emit only when this kernel was translated
+       * for it AND this call site actually carries per-sample coverage. The two
+       * clauses check different things, and both are load-bearing: the
+       * fixed-function wrapper fails the second unconditionally, which is what
+       * keeps the shared emitter from taking this arm where there is no mask to
+       * read. A kernel built for multisample whose source cannot feed it is a
+       * translator bug, not a runtime case -- bail rather than silently emit the
+       * single-sample arm and render subtly wrong coverage. */
+      const bool msaa = t->fs_samples > 1 && bc->sample_mask && t->sw_om;
+      if (t->fs_samples > 1 && !msaa) {
+         mesa_logw("vortexpipe: multisample FS variant lacks a per-sample "
+                   "coverage source or a software merger; runs on llvmpipe");
+         t->ok = false;
+      }
+      /* MRT under multisampling has no device ABI -- gfx_om_fragment_mrt_sw is
+       * single-sample only, and merging through it would write plausible garbage
+       * into buffers strided for S samples. Refuse the translation so the variant
+       * never exists and the draw falls to llvmpipe, which renders it correctly. */
+      if (msaa && num_color > 1) {
+         mesa_logw("vortexpipe: multisample MRT has no device merge path; "
+                   "this shader runs on llvmpipe");
+         t->ok = false;
+      }
+
+      if (msaa && num_color <= 1) {
+         /* Per-sample merge: gfx_om_fragment_msaa_sw(omstate, samples,
+          * sample_mask, px, py, face, colour, depth). `cov` was already folded
+          * with the shader's discard flag above, so gating the whole mask on it
+          * applies discard exactly once -- the per-fragment flag cannot be
+          * expressed inside a per-sample mask any other way, which is why the
+          * callee's contract puts the fold on us. An all-zero mask is dropped by
+          * the callee, keeping this straight-line like the single-sample call. */
+         LLVMValueRef mask_live = LLVMBuildSelect(t->b,
+            LLVMBuildICmp(t->b, LLVMIntNE, cov,
+                          LLVMConstInt(t->i32, 0, false), ""),
+            bc->sample_mask, LLVMConstInt(t->i32, 0, false), "smask_live");
+         LLVMTypeRef params[8] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
+                                   t->i32, t->i32, t->i32 };
+         LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx),
+                                            params, 8, false);
+         LLVMValueRef ofn = LLVMGetNamedFunction(t->mod, "gfx_om_fragment_msaa_sw");
+         if (!ofn)
+            ofn = LLVMAddFunction(t->mod, "gfx_om_fragment_msaa_sw", fty);
+         LLVMValueRef a[8] = { omstate_ptr,
+                               LLVMConstInt(t->i32, t->fs_samples, false),
+                               mask_live, pxc, pyc, face, rgba, depth_i };
+         LLVMBuildCall2(t->b, fty, ofn, a, 8, "");
+      } else if (t->sw_om && num_color > 1) {
          /* >1 colour attachment merges via gfx_om_fragment_mrt_sw(
           * omstate, rt[], num_color, covered, px, py, face, colours[], depth) —
           * one shared depth op then a per-attachment blend + colour write. Pack
@@ -2738,12 +5191,19 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
          LLVMValueRef a[7] = { omstate_ptr, cov, pxc, pyc, face, rgba, depth_i };
          LLVMBuildCall2(t->b, fty, ofn, a, 7, "");
       } else {
-         /* FF output-merger: export this pixel as a store into the OM aperture.
-          * An uncovered lane must be skipped -- there is no coverage mask
-          * downstream, and the ingress turns every aperture store into a
-          * fragment. The branch diverges across lanes; the thread mask handles
-          * it, and it is placed AFTER the shader body so a helper lane still
-          * runs the shader. */
+         /* FF output-merger: export this pixel as a store into the OM aperture,
+          * once per colour attachment. An uncovered lane must be skipped --
+          * there is no coverage mask downstream, and the ingress turns every
+          * aperture store into a fragment. The branch diverges across lanes; the
+          * thread mask handles it, and it is placed AFTER the shader body so a
+          * helper lane still runs the shader.
+          *
+          * Each export re-runs the depth/stencil stage, so several of them are
+          * only self-consistent while that stage cannot change state between
+          * them -- the draw path keeps a depth- or stencil-WRITING multi-
+          * attachment draw on the software merger, and both the RTL and the
+          * SimX model assert it rather than trusting that. num_color == 1
+          * unrolls to exactly the single-attachment export. */
          LLVMBasicBlockRef bb_do   = LLVMAppendBasicBlockInContext(t->ctx, fn, "om_do");
          LLVMBasicBlockRef bb_skip = LLVMAppendBasicBlockInContext(t->ctx, fn, "om_skip");
          LLVMBuildCondBr(t->b,
@@ -2752,10 +5212,13 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
             bb_do, bb_skip);
 
          LLVMPositionBuilderAtEnd(t->b, bb_do);
-         emit_vx_om_export(t,
-            emit_om_aperture_addr(t, t->om_ap_xbits, t->om_ap_ybits,
-                                  t->om_ap_shift, pxc, pyc, face),
-            rgba, depth_i);
+         for (unsigned rt = 0; rt < num_color && rt < GFX_OM_MAX_RT; rt++) {
+            emit_vx_om_export(t,
+               emit_om_aperture_addr(t, t->om_ap_xbits, t->om_ap_ybits,
+                                     t->om_ap_shift, pxc, pyc, face,
+                                     LLVMConstInt(t->i32, rt, false)),
+               rgba_rt[rt], depth_i);
+         }
          LLVMBuildBr(t->b, bb_skip);
 
          LLVMPositionBuilderAtEnd(t->b, bb_skip);
@@ -2786,16 +5249,13 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
     * DCRs, so the kernel only needs the primitive buffer (arg[0]). */
    LLVMPositionBuilderAtEnd(t->b, entry);
    LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
-   /* SW sampler: arg[1] is the resident gfx_sw_texstate_t[] device address
-    * (the host fills it when texturing is routed to software); null on the HW
-    * path. Passed to fs_main as its 3rd param. */
-   LLVMValueRef texstate_ptr;
-   if (t->sw_tex) {
-      LLVMValueRef ts_addr = emit_arg_i32(t, arg, 1);
-      texstate_ptr = LLVMBuildIntToPtr(t->b, ts_addr, t->ptr, "texstate");
-   } else {
-      texstate_ptr = LLVMConstNull(t->ptr);
-   }
+   LLVMValueRef flat_base = emit_arg_i32(t, arg, GFX_FS_ARG_FLAT);
+   /* arg[1] is the resident gfx_sw_texstate_t[] device address (host-filled for
+    * any textured draw). The SW sampler reads the whole descriptor; the HW-tex FS
+    * reads only logdim from it to compute the mip LOD. Untextured draws leave
+    * arg[1] zero and never dereference it. Passed to fs_main as its 3rd param. */
+   LLVMValueRef texstate_ptr = LLVMBuildIntToPtr(t->b,
+      emit_arg_i32(t, arg, 1), t->ptr, "texstate");
    /* SW output-merger: arg[2] is the resident gfx_sw_omstate_t device address
     * (host-filled when OM is routed to software). The wrapper merges each covered
     * sub-pixel via gfx_om_fragment_sw over the LSU instead of staging + vx_om4. */
@@ -2815,7 +5275,7 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
    LLVMValueRef mrt_ptr = LLVMConstNull(t->ptr);
    LLVMValueRef mrt_colors_addr = LLVMConstNull(t->iptr);
    unsigned nrt = t->fs_num_color ? t->fs_num_color : 1;
-   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16),
+   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, VP_FS_IN_WORDS),
                                           "fs_in");
    LLVMValueRef out_scr = LLVMBuildAlloca(t->b,
       LLVMArrayType(t->i32, t->fs_out_words ? t->fs_out_words : 4), "fs_out");
@@ -2847,11 +5307,17 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
       LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base,
                                     vp_to_iptr(t, poff), "prim");
+   /* The provoking vertex's flat words for this primitive, in a side array the
+    * front end fills in step with the primitive buffer and indexed by the same
+    * id. Zero when nothing bound declares a flat input, and then never read. */
+   LLVMValueRef flat = LLVMBuildAdd(t->b, flat_base,
+      vp_to_iptr(t, LLVMBuildMul(t->b, pid,
+         LLVMConstInt(t->i32, GFX_FS_FLAT_WORDS * 4u, false), "")), "flat");
 
    /* HW raster: edge values are recomputed in-shader from prim[pid]'s edge planes
     * (the window carries only pos + pid; P2 dropped the bcoord payload). */
    struct vp_bc_src bc = { .from_window = true, .quad_addr = NULL, .sub = NULL };
-   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
+   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, flat, in_scr, out_scr,
                     in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
                     mrt_ptr, mrt_colors_addr, live, px, py, cov, &bc);
 
@@ -2880,7 +5346,31 @@ emit_fs_wrapper(struct vp_tr *t, LLVMValueRef fs_main, LLVMTypeRef fs_main_ty)
  * [8]=scissor_h. */
 #define VP_SW_RAST_TILE_LOG  3u                                  /* 8x8 px tile  */
 #define VP_SW_RAST_MAX_QUADS (1u << (2 * (VP_SW_RAST_TILE_LOG - 1)))/* (tile/2)^2 */
-#define VP_RAST_QUAD_WORDS   13u                  /* sizeof(gfx_rast_quad_t)/4    */
+/* Quad-record widths, derived from the device ABI rather than copied from it:
+ * both structs come from gfx_sw_abi.h, so a change there cannot silently
+ * desynchronise the stride the emitter walks with. */
+#define VP_RAST_QUAD_WORDS      ((unsigned)(sizeof(gfx_rast_quad_t) / 4))
+#define VP_RAST_MSAA_QUAD_WORDS ((unsigned)(sizeof(gfx_rast_msaa_quad_t) / 4))
+static_assert(VP_RAST_QUAD_WORDS == 13,
+              "gfx_rast_quad_t width moved; the FF frag payload layout changed");
+static_assert(VP_RAST_MSAA_QUAD_WORDS == 17,
+              "gfx_rast_msaa_quad_t width moved; check the bcoord base word");
+
+/* The emitter builds the call to the walk by hand -- it writes the LLVM
+ * function type rather than calling the C declaration -- so nothing in the
+ * compiler checks it against gfx_sw_abi.h, and a parameter list that grows on
+ * the device side leaves the arguments shifted. The failure is silent: the walk
+ * reads a scissor bound out of a pointer, rejects every sample, and the draw
+ * renders black. Bind each declaration to the shape the emitter assumes, so the
+ * next change over there is a build error here instead. */
+typedef uint32_t (*vp_walk_fn)(const void *, uint32_t, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                               gfx_rast_quad_t *, uint32_t);
+typedef uint32_t (*vp_walk_msaa_fn)(const void *, uint32_t, uint32_t, uint32_t,
+                                    uint32_t, uint32_t, uint32_t, uint32_t,
+                                    uint32_t, gfx_rast_msaa_quad_t *, uint32_t);
+static const vp_walk_fn      vp_walk_sig      = gfx_rast_walk_tile_sw;
+static const vp_walk_msaa_fn vp_walk_msaa_sig = gfx_rast_walk_tile_msaa_sw;
 
 static LLVMValueRef
 emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
@@ -2907,9 +5397,11 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
     * mem2reg promotes the loop induction; no hand-built phi). */
    LLVMPositionBuilderAtEnd(t->b, entry);
    LLVMValueRef prim_base = emit_arg_i32(t, arg, 0);
-   LLVMValueRef texstate_ptr = LLVMConstNull(t->ptr);
-   if (t->sw_tex)
-      texstate_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 1), t->ptr, "texstate");
+   LLVMValueRef flat_base = emit_arg_i32(t, arg, GFX_FS_ARG_FLAT);
+   /* arg[1] = resident texstate for any textured draw (HW-tex reads logdim from
+    * it for the mip LOD, SW sampler reads all of it); zero + unused if untextured. */
+   LLVMValueRef texstate_ptr = LLVMBuildIntToPtr(t->b,
+      emit_arg_i32(t, arg, 1), t->ptr, "texstate");
    LLVMValueRef omstate_ptr = LLVMConstNull(t->ptr);
    if (t->sw_om)
       omstate_ptr = LLVMBuildIntToPtr(t->b, emit_arg_i32(t, arg, 2), t->ptr, "omstate");
@@ -2934,7 +5426,7 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMValueRef mrt_ptr = LLVMConstNull(t->ptr);
    LLVMValueRef mrt_colors_addr = LLVMConstNull(t->iptr);
    unsigned nrt = t->fs_num_color ? t->fs_num_color : 1;
-   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, 16), "fs_in");
+   LLVMValueRef in_scr  = LLVMBuildAlloca(t->b, LLVMArrayType(t->i32, VP_FS_IN_WORDS), "fs_in");
    LLVMValueRef out_scr = LLVMBuildAlloca(t->b,
       LLVMArrayType(t->i32, t->fs_out_words ? t->fs_out_words : 4), "fs_out");
    if (t->sw_om && nrt > 1) {
@@ -2944,8 +5436,16 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
          LLVMArrayType(t->i32, nrt), "fs_colors");
       mrt_colors_addr = LLVMBuildPtrToInt(t->b, col_scr, t->iptr, "");
    }
+   /* Multisample quads carry per-sample coverage, so their record is wider and
+    * the walk that fills it is a different entry point. Both are selected here,
+    * once, from the variant's sample count -- a single-sample kernel keeps the
+    * narrower per-lane quad buffer rather than paying for a field it cannot use. */
+   const bool ms = t->fs_samples > 1;
+   const unsigned quad_words = ms ? VP_RAST_MSAA_QUAD_WORDS : VP_RAST_QUAD_WORDS;
+   const char *walk_name = ms ? "gfx_rast_walk_tile_msaa_sw"
+                              : "gfx_rast_walk_tile_sw";
    LLVMValueRef quadbuf = LLVMBuildAlloca(t->b,
-      LLVMArrayType(t->i32, VP_SW_RAST_MAX_QUADS * VP_RAST_QUAD_WORDS), "quads");
+      LLVMArrayType(t->i32, VP_SW_RAST_MAX_QUADS * quad_words), "quads");
    /* Entry-block slot: this wrapper shades inside a loop nest, and an alloca built
     * at the shade site would grow the stack once per quad. */
    LLVMValueRef live      = LLVMBuildAlloca(t->b, t->i32, "fs_live");
@@ -2990,16 +5490,28 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
    LLVMValueRef poff = LLVMBuildMul(t->b, pid,
       LLVMConstInt(t->i32, VP_RAST_PRIM_STRIDE, false), "");
    LLVMValueRef prim = LLVMBuildAdd(t->b, prim_base, vp_to_iptr(t, poff), "prim");
-   LLVMTypeRef wparams[9] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
-                              t->i32, t->i32, t->ptr, t->i32 };
-   LLVMTypeRef wty = LLVMFunctionType(t->i32, wparams, 9, false);
-   LLVMValueRef wfn = LLVMGetNamedFunction(t->mod, "gfx_rast_walk_tile_sw");
+   LLVMValueRef flat = LLVMBuildAdd(t->b, flat_base,
+      vp_to_iptr(t, LLVMBuildMul(t->b, pid,
+         LLVMConstInt(t->i32, GFX_FS_FLAT_WORDS * 4u, false), "")), "flat");
+   /* The walk confines coverage to a rect, not an extent: left and top are
+    * separate parameters because a scissored sub-rectangle has a non-zero
+    * origin. The arg block carries only the extent today, so the origin is the
+    * framebuffer's -- the same rect the walk was confined to when the callee
+    * took a width and a height and pinned its own corner to (0,0). Handing it
+    * an app scissor origin is a separate change, and needs the host to put one
+    * in the arg block first. */
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMTypeRef wparams[11] = { t->ptr, t->i32, t->i32, t->i32, t->i32,
+                               t->i32, t->i32, t->i32, t->i32, t->ptr, t->i32 };
+   LLVMTypeRef wty = LLVMFunctionType(t->i32, wparams, 11, false);
+   LLVMValueRef wfn = LLVMGetNamedFunction(t->mod, walk_name);
    if (!wfn)
-      wfn = LLVMAddFunction(t->mod, "gfx_rast_walk_tile_sw", wty);
-   LLVMValueRef wargs[9] = {
+      wfn = LLVMAddFunction(t->mod, walk_name, wty);
+   LLVMValueRef wargs[11] = {
       LLVMBuildIntToPtr(t->b, prim, t->ptr, "primp"), pid, tx, ty, logc,
-      scis_w, scis_h, quadbuf, LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false) };
-   LLVMValueRef cnt = LLVMBuildCall2(t->b, wty, wfn, wargs, 9, "cnt");
+      zero, zero, scis_w, scis_h,
+      quadbuf, LLVMConstInt(t->i32, VP_SW_RAST_MAX_QUADS, false) };
+   LLVMValueRef cnt = LLVMBuildCall2(t->b, wty, wfn, wargs, 11, "cnt");
    LLVMBuildStore(t->b, cnt, cnt_slot);
    /* One lane is one pixel, so a quad is four ADJACENT lanes: lane L takes corner
     * L&3 of quad L>>2, and the warp holds NT/4 quads at a time. */
@@ -3041,12 +5553,19 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
     * buffers — the split is over corners, not over data. */
    LLVMPositionBuilderAtEnd(t->b, qbody);
    LLVMValueRef qoff = LLVMBuildMul(t->b, base,
-      LLVMConstInt(t->i32, VP_RAST_QUAD_WORDS * 4, false), "");
+      LLVMConstInt(t->i32, quad_words * 4, false), "");
    LLVMValueRef quad_addr = LLVMBuildAdd(t->b, quad_base, vp_to_iptr(t, qoff), "quad");
    LLVMValueRef pos_mask = emit_load_i32(t, quad_addr);
 
    /* pos_mask: mask@[3:0], qx@[4+:DIM-1], qy@[4+DIM-1+:DIM-1]. This lane's pixel is
-    * px=(qx<<1)|(sub&1), py=(qy<<1)|(sub>>1), covered = mask[sub]. */
+    * px=(qx<<1)|(sub&1), py=(qy<<1)|(sub>>1), covered = mask[sub].
+    *
+    * The position fields decode identically in both records, but the coverage
+    * nibble does NOT: rast_emit_quad_msaa builds pos_mask from the quad position
+    * alone and leaves [3:0] zero, because multisample coverage is "any sample
+    * inside" and cannot be expressed as one bit per pixel. Reading it there would
+    * mask every fragment off and render an empty image with no diagnostic, so the
+    * multisample coverage comes from sample_masks[sub] instead. */
    const uint32_t dim_mask = (1u << (VX_RASTER_DIM_BITS - 1)) - 1;
    LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
    LLVMValueRef qx = LLVMBuildAnd(t->b,
@@ -3060,12 +5579,28 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
       LLVMBuildAnd(t->b, sub, one, ""), "px");
    LLVMValueRef py = LLVMBuildOr(t->b, LLVMBuildShl(t->b, qy, one, ""),
       LLVMBuildLShr(t->b, sub, one, ""), "py");
-   LLVMValueRef cov = LLVMBuildAnd(t->b,
-      LLVMBuildLShr(t->b, pos_mask, sub, ""), one, "cov");
+   LLVMValueRef smask = NULL;
+   LLVMValueRef cov;
+   if (ms) {
+      /* sample_masks[sub] at word 1+sub; covered = any sample of this corner. */
+      LLVMValueRef soff = LLVMBuildShl(t->b,
+         LLVMBuildAdd(t->b, sub, one, ""),
+         LLVMConstInt(t->i32, 2, false), "smoff");
+      smask = emit_load_i32(t,
+         LLVMBuildAdd(t->b, quad_addr, vp_to_iptr(t, soff), ""));
+      cov = LLVMBuildZExt(t->b,
+         LLVMBuildICmp(t->b, LLVMIntNE, smask,
+                       LLVMConstInt(t->i32, 0, false), ""), t->i32, "cov");
+   } else {
+      cov = LLVMBuildAnd(t->b,
+         LLVMBuildLShr(t->b, pos_mask, sub, ""), one, "cov");
+   }
 
    struct vp_bc_src bc = { .from_window = false, .quad_addr = quad_addr,
-                           .sub = sub };
-   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, in_scr, out_scr,
+                           .sub = sub,
+                           .bcoord_word0 = ms ? 5u : 1u,
+                           .sample_mask = smask };
+   emit_shade_pixel(t, fn, fs_main, fs_main_ty, prim, flat, in_scr, out_scr,
                     in_addr, out_addr, texstate_ptr, omstate_ptr, desc_ptr,
                     mrt_ptr, mrt_colors_addr, live, px, py, cov, &bc);
    /* builder is now at emit_shade_pixel's trailing fall-through block. */
@@ -3090,7 +5625,8 @@ emit_fs_wrapper_sw_raster(struct vp_tr *t, LLVMValueRef fs_main,
 bool
 vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
                struct vp_vs_layout *out_vs,
-               const struct vp_sw_routing *routing)
+               const struct vp_sw_routing *routing,
+               unsigned samples, uint8_t bgra_mask)
 {
    if (out_ir)
       *out_ir = NULL;
@@ -3105,6 +5641,49 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       fprintf(stderr, "=== end NIR ===\n");
    }
 
+   /* A descriptor the scan could not record is a descriptor the relocation
+    * never rewrites, leaving the device to dereference a host address. That is
+    * a host-side array bound, invisible to everything else here, so it is
+    * turned into an ordinary translation failure: the shader falls back to
+    * llvmpipe, which has no such limit. Refused before the module is built,
+    * since nothing downstream can change the answer -- but after the NIR dump
+    * above, so the shader that tripped it can still be looked at. */
+   if (vp_descriptors_overflow(nir)) {
+      mesa_logw("vortexpipe: shader touches more than %u distinct descriptors, "
+                "which is more than the relocation can carry", VP_MAX_DESCS);
+      return false;
+   }
+
+   /* lavapipe numbers a descriptor set's constant buffer set+1, without
+    * compacting, so the highest index a shader reaches says which set it needs
+    * and the bound to compare it against is whatever that stage can address. */
+   const unsigned max_cbuf = vp_descriptors_max_cbuf(nir);
+
+   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      /* Compute's argument block carries set 0's blob and has no slot for a
+       * second, and no table to index either. Refusing matters more than it
+       * looks -- two sets number their bindings from zero independently, so a
+       * set-1 descriptor carries the same offset as its set-0 counterpart, and
+       * the launch relocation would rewrite one on top of the other rather than
+       * merely miss it. */
+      if (max_cbuf > VP_CBUF_SET0) {
+         mesa_logw("vortexpipe: compute shader reaches a descriptor set other "
+                   "than set 0, which the launch argument block has no slot for");
+         return false;
+      }
+   } else if (max_cbuf >= GFX_FS_DESC_SLOTS) {
+      /* The vertex and fragment stages read their blob bases from a resident
+       * table of GFX_FS_DESC_SLOTS entries, indexed by the shader with no bound
+       * check of its own -- an index past the end is loaded as readily as one
+       * inside, and whatever follows the table is dereferenced as a
+       * constant-buffer base. The host side is sized to match and simply never
+       * records that buffer, so nothing downstream notices either. */
+      mesa_logw("vortexpipe: shader reaches constant buffer %u, past the "
+                "%u-entry descriptor table", max_cbuf,
+                (unsigned)GFX_FS_DESC_SLOTS);
+      return false;
+   }
+
    struct vp_tr t = {0};
    t.ok    = true;
    t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
@@ -3113,6 +5692,15 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    t.sw_tex    = (t.is_fs && routing && routing->sw_tex);
    t.sw_om     = (t.is_fs && routing && routing->sw_om);
    t.sw_raster = (t.is_fs && routing && routing->sw_raster);
+   /* Samples per pixel this kernel is built for. Above 1 the merge is per-sample
+    * and the coverage the rasterizer hands over is a sample mask rather than a
+    * single bit, so it changes what is emitted, not just what is passed in. */
+   t.fs_samples = (t.is_fs && samples > 1) ? samples : 1u;
+   /* Colour attachment channel order, one bit per render target. The wrapper
+    * stores each merged pixel as a word and nothing downstream reinterprets it,
+    * so the order the shader packs is the order that reaches memory -- and the
+    * targets of one draw need not agree, so this is a mask. */
+   t.fs_bgra_mask = t.is_fs ? bgra_mask : 0u;
    t.ctx   = LLVMContextCreate();
    t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
    LLVMSetTarget(t.mod, vp_target_triple());
@@ -3167,7 +5755,13 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    if (t.is_fs) {
       LLVMValueRef sink = LLVMBuildAlloca(t.b, LLVMArrayType(t.i32, 8),
                                           "discard_sink");
-      t.fs_sink = LLVMBuildPtrToInt(t.b, sink, t.iptr, "");
+      /* Blinded: the sink is never read, so an optimizer that can still see the
+       * alloca proves a store to it dead and rewrites the branchless address
+       * select into a conditional store. That branch tests a per-lane predicate,
+       * and the warp takes or skips it as one -- so a single suppressed lane
+       * suppresses its neighbours' stores too. The address has to stay an
+       * address for the store to remain unconditional. */
+      t.fs_sink = emit_opaque(&t, LLVMBuildPtrToInt(t.b, sink, t.iptr, ""));
    }
 
    /* Vertex-shader prologue: assign output slots, then read the
@@ -3192,6 +5786,25 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       t.vid = LLVMBuildAdd(t.b,
                 LLVMBuildMul(t.b, vid_block_id, vid_block_dim, "blkofs"),
                 vid_thread_id, "vid");
+      /* Stop the threads the padding created, before anything they would touch.
+       * The padded output slots are harmless -- the buffer is sized for them and
+       * the host stops reading at the real count -- but the index-buffer load
+       * below and any store the shader itself performs are addressed by the
+       * vertex id, and for a thread past the end both land outside the draw. */
+      LLVMValueRef vcnt_idx = LLVMConstInt(t.i32, VP_ARG_VS_COUNT, false);
+      LLVMValueRef vcnt_p   = LLVMBuildGEP2(t.b, t.i64, t.arg, &vcnt_idx, 1, "");
+      LLVMValueRef vcnt64   = LLVMBuildLoad2(t.b, t.i64, vcnt_p, "vcount64");
+      LLVMValueRef vcnt     = LLVMBuildTrunc(t.b, vcnt64, t.i32, "vcount");
+      LLVMValueRef in_draw  = LLVMBuildICmp(t.b, LLVMIntULT, t.vid, vcnt,
+                                            "vs_in_draw");
+      LLVMBasicBlockRef vs_go_bb  =
+         LLVMAppendBasicBlockInContext(t.ctx, fn, "vs_go");
+      LLVMBasicBlockRef vs_end_bb =
+         LLVMAppendBasicBlockInContext(t.ctx, fn, "vs_end");
+      LLVMBuildCondBr(t.b, in_draw, vs_go_bb, vs_end_bb);
+      LLVMPositionBuilderAtEnd(t.b, vs_end_bb);
+      LLVMBuildRetVoid(t.b);
+      LLVMPositionBuilderAtEnd(t.b, vs_go_bb);
       /* %arg[0] / %arg[1] are i64 device addresses from the host runtime.
        * On rv64 the device stack base is 0x1FFFF0000 (33-bit), so we keep
        * iptr width: cast the i64 down only on rv32. */
@@ -3232,6 +5845,13 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       LLVMValueRef fip   = LLVMBuildGEP2(t.b, t.i64, t.arg, &four, 1, "");
       LLVMValueRef fi64  = LLVMBuildLoad2(t.b, t.i64, fip, "firstinst64");
       t.first_instance   = LLVMBuildTrunc(t.b, fi64, t.i32, "firstinst");
+      /* arg slot 5: base vertex (gl_BaseVertex / the firstVertex half of
+       * gl_VertexIndex); 0 on an indexed draw and on a draw that starts at
+       * vertex 0, which keeps the emitted code identical to the prior ABI. */
+      LLVMValueRef five  = LLVMConstInt(t.i32, 5, false);
+      LLVMValueRef bvp   = LLVMBuildGEP2(t.b, t.i64, t.arg, &five, 1, "");
+      LLVMValueRef bv64  = LLVMBuildLoad2(t.b, t.i64, bvp, "basevert64");
+      t.base_vertex      = LLVMBuildTrunc(t.b, bv64, t.i32, "basevert");
       LLVMValueRef vpi_is0   = LLVMBuildICmp(t.b, LLVMIntEQ, vpi,
                                              LLVMConstInt(t.i32, 0, false), "vpi0");
       /* guard the div/rem against a zero divisor on the non-instanced fast path */
@@ -3264,6 +5884,19 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       LLVMBasicBlockRef vin_bb[2] = { from_bb, idx_bb };
       LLVMAddIncoming(vphi, vin_vals, vin_bb, 2);
       t.vid = vphi;
+
+      /* Every arg-block slot this stage reads is resolved above, so t.arg can
+       * now be repointed at the VS constant-buffer table (VP_ARG_VS_DESC). The
+       * shared load_ubo / load_ssbo / load_push_constant lowering indexes t.arg
+       * by constant-buffer index, exactly as the fragment stage does; slots 0-4
+       * carry vertex meanings, so reading the arg block directly would return
+       * the attribute table's address for a UBO and the output buffer's for a
+       * push constant. vp_raster_draw always supplies the table (zero-filled
+       * when the VS binds nothing), so this never yields a null t.arg. */
+      LLVMValueRef dsc   = LLVMConstInt(t.i32, VP_ARG_VS_DESC, false);
+      LLVMValueRef dscp  = LLVMBuildGEP2(t.b, t.i64, t.arg, &dsc, 1, "");
+      LLVMValueRef dsc64 = LLVMBuildLoad2(t.b, t.i64, dscp, "vsdesc64");
+      t.arg = LLVMBuildIntToPtr(t.b, dsc64, t.ptr, "vsdesc");
    }
 
    /* Fragment-shader prologue: assign varying/output slots. fs_main's
@@ -3420,9 +6053,11 @@ vp_desc_addr_offset(nir_def *def, unsigned *cbuf_index)
    return -1;
 }
 
-void
-vp_scan_descriptors(struct nir_shader *nir,
-                    struct vp_desc *out, unsigned *num_out)
+/* Record the distinct descriptors a shader touches, up to `cap`, and return how
+ * many were found -- a count that stops rising at `cap`, so a caller wanting to
+ * know whether the shader exceeds a smaller limit has to pass room above it. */
+static unsigned
+vp_scan_descs_into(struct nir_shader *nir, struct vp_desc *out, unsigned cap)
 {
    unsigned n = 0;
    nir_foreach_function_impl(impl, nir) {
@@ -3434,33 +6069,61 @@ vp_scan_descriptors(struct nir_shader *nir,
             int off = -1;
             enum vp_desc_kind kind = VP_DESC_BUFFER;
             unsigned elem_bytes = 1;            /* SSBO: num_elements is bytes */
-            unsigned cbuf_index = 1;            /* default set-0 blob (index 1) */
+            unsigned cbuf_index = VP_CBUF_SET0;  /* until the address says otherwise */
+            bool writable = false;
             switch (in->intrinsic) {
             case nir_intrinsic_load_ssbo:
                off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                break;
             case nir_intrinsic_store_ssbo:
                off = vp_desc_addr_offset(in->src[1].ssa, &cbuf_index);
+               writable = true;
                break;
             case nir_intrinsic_ssbo_atomic:
             case nir_intrinsic_ssbo_atomic_swap:
                /* atomic RMW targets the same SSBO descriptor (src[0]); its
                 * data pointer must be relocated like a load/store_ssbo. */
                off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
+               writable = true;
                break;
-            case nir_intrinsic_image_load:
-            case nir_intrinsic_bindless_image_load:
             case nir_intrinsic_image_store:
             case nir_intrinsic_bindless_image_store:
+            case nir_intrinsic_image_atomic:
+            case nir_intrinsic_bindless_image_atomic:
+            case nir_intrinsic_image_atomic_swap:
+            case nir_intrinsic_bindless_image_atomic_swap:
+               writable = true;
+               FALLTHROUGH;
+            case nir_intrinsic_image_load:
+            case nir_intrinsic_bindless_image_load:
                /* storage image: src[0] is the bindless descriptor address, in
                 * the same const_buf_base+binding form as an SSBO. lp_jit_image
-                * sizing (height*row_stride) is done in the launch relocation. */
+                * sizing (height*row_stride) is done in the launch relocation.
+                * The atomics take the descriptor in src[0] as well, and a shader
+                * whose only access to an image is an atomic still needs the
+                * descriptor relocated for that atomic to land on the device
+                * copy rather than the host one. */
                off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                kind = VP_DESC_IMAGE;
                elem_bytes = 0;
                break;
             case nir_intrinsic_load_ubo:
-               if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+               if (nir_intrinsic_range(in) == -1) {
+                  /* lavapipe reads the acceleration-structure handle as an
+                   * UNBOUNDED ubo, and gives every other ubo read a real byte
+                   * range — including the push constants it rewrites into one.
+                   * The unbounded range is therefore the marker, and it marks an
+                   * AS in every stage: a fragment shader's ray query reaches its
+                   * structure through exactly this read, and a stage test ahead
+                   * of this one would classify that as an ordinary buffer and
+                   * relocate it as one. src[0] is the constant cbuf index. */
+                  if (nir_src_is_const(in->src[1]))
+                     off = (int)nir_src_as_uint(in->src[1]);
+                  if (nir_src_is_const(in->src[0]))
+                     cbuf_index = (unsigned)nir_src_as_uint(in->src[0]);
+                  kind = VP_DESC_AS;
+                  elem_bytes = 0;
+               } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
                   /* A fragment UBO is a buffer descriptor reached via
                    * load_ubo(load_const_buf_base_addr_lvp(set+1)+binding, off) —
                    * relocate its lp_jit_buffer.ptr like an SSBO. A constant src[0]
@@ -3470,16 +6133,6 @@ vp_scan_descriptors(struct nir_shader *nir,
                      continue;
                   off = vp_desc_addr_offset(in->src[0].ssa, &cbuf_index);
                   elem_bytes = 4;
-               } else if (nir_intrinsic_range(in) == -1) {
-                  /* compute: lavapipe reads the acceleration-structure handle as
-                   * an UNBOUNDED ubo (range == -1), so only that read is an AS —
-                   * src[0] is the constant cbuf index and off is 0. */
-                  if (nir_src_is_const(in->src[1]))
-                     off = (int)nir_src_as_uint(in->src[1]);
-                  if (nir_src_is_const(in->src[0]))
-                     cbuf_index = (unsigned)nir_src_as_uint(in->src[0]);
-                  kind = VP_DESC_AS;
-                  elem_bytes = 0;
                } else {
                   /* compute: a finite-range load_ubo is a data UBO (camera /
                    * scene uniforms) reached through load_ubo(const_buf_base(set)
@@ -3498,22 +6151,93 @@ vp_scan_descriptors(struct nir_shader *nir,
             if (off < 0)
                continue;
             /* Distinct by (cbuf_index, offset): the same byte offset in two sets
-             * is two different descriptors. */
+             * is two different descriptors. A descriptor that is both loaded
+             * and stored appears once per access, so writability accumulates
+             * onto the entry already recorded -- dropping the duplicate
+             * outright would lose the store when the load was seen first. */
             bool dup = false;
             for (unsigned k = 0; k < n; k++)
                if (out[k].offset == (unsigned)off &&
-                   out[k].cbuf_index == cbuf_index) { dup = true; break; }
-            if (dup || n >= VP_MAX_DESCS)
+                   out[k].cbuf_index == cbuf_index) {
+                  out[k].writable |= writable;
+                  dup = true;
+                  break;
+               }
+            if (dup || n >= cap)
                continue;
             out[n].offset     = (unsigned)off;
             out[n].cbuf_index = cbuf_index;
             out[n].kind       = kind;
             out[n].elem_bytes = elem_bytes;
+            out[n].writable   = writable;
             n++;
          }
       }
    }
-   *num_out = n;
+   return n;
+}
+
+/* Enough room above VP_MAX_DESCS to tell "exactly at the limit" from "past it".
+ * A shader with more distinct descriptors than even this is past the limit by
+ * any measure, so saturating here loses nothing. */
+#define VP_DESC_SCAN_MAX 128
+
+void
+vp_scan_descriptors(struct nir_shader *nir,
+                    struct vp_desc *out, unsigned *num_out)
+{
+   *num_out = vp_scan_descs_into(nir, out, VP_MAX_DESCS);
+}
+
+bool
+vp_descriptors_overflow(struct nir_shader *nir)
+{
+   struct vp_desc scratch[VP_DESC_SCAN_MAX];
+   return vp_scan_descs_into(nir, scratch, VP_DESC_SCAN_MAX) > VP_MAX_DESCS;
+}
+
+unsigned
+vp_descriptors_max_cbuf(struct nir_shader *nir)
+{
+   struct vp_desc scratch[VP_DESC_SCAN_MAX];
+   unsigned n = vp_scan_descs_into(nir, scratch, VP_DESC_SCAN_MAX);
+   unsigned max = 0;
+   for (unsigned i = 0; i < n; i++)
+      if (scratch[i].cbuf_index > max)
+         max = scratch[i].cbuf_index;
+   return max;
+}
+
+/* Locate the FS's TEX-stage-0 texture descriptor: the sampled image's lp_descriptor
+ * within its descriptor-set blob, from the first tex instruction's
+ * nir_tex_src_texture_handle (the bindless descriptor address, in the same
+ * const_buf_base+binding form as a storage image). Returns true + (cbuf_index,
+ * offset) so the draw can read lp_jit_texture.base and select the sampled texture.
+ * gfx-v1 drives a single TEX stage, so the first textured sample suffices. */
+bool
+vp_scan_tex_descriptor(struct nir_shader *nir, unsigned *cbuf_index, unsigned *offset)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(blk, impl) {
+         nir_foreach_instr(instr, blk) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            for (unsigned i = 0; i < tex->num_srcs; i++) {
+               if (tex->src[i].src_type != nir_tex_src_texture_handle)
+                  continue;
+               unsigned cb = 1;
+               int off = vp_desc_addr_offset(tex->src[i].src.ssa, &cb);
+               if (off < 0)
+                  return false;
+               *cbuf_index = cb;
+               *offset     = (unsigned)off;
+               return true;
+            }
+         }
+      }
+   }
+   return false;
 }
 
 /* Bitmask of set_shader_buffers slots the shader reads as a CONSTANT-index

@@ -14,6 +14,8 @@
 #include <stdbool.h>
 
 #include "vortex2.h"
+
+struct pipe_screen;
 #include "vp_nir_to_llvm.h"      /* struct vp_desc */
 
 #ifdef __cplusplus
@@ -50,30 +52,44 @@ struct vp_ssbo {
  * the arg block. The kernel runs over grid x block; writable descriptor
  * buffers are copied back. `lmem_size` is the per-workgroup shared memory.
  *
+ * `module_io`/`kernel_io` are caller-owned residency slots, as on the draw
+ * path: the kernel image is loaded onto the device by the first dispatch that
+ * finds them NULL and reused by every dispatch after, so repeating a dispatch
+ * costs no module reload. The caller owns the release, and must evict before
+ * another shader takes the same device address -- compute and fragment shaders
+ * both start at VP_STARTUP_FS, so only one of them can be resident.
+ *
  * Returns true on success.
  */
-bool vp_launch(vx_device_h dev,
+bool vp_launch(struct pipe_screen *screen, vx_device_h dev,
                const void *vxbin, size_t vxbin_size,
+               vx_module_h *module_io, vx_kernel_h *kernel_io,
                const void *desc_host, uint32_t desc_bytes,
                const struct vp_desc *descs, uint32_t num_descs,
                const struct vp_ssbo *ssbos, uint32_t num_ssbos,
                const uint32_t grid[3], const uint32_t block[3],
+               const uint32_t grid_base[3],
                uint32_t lmem_size, bool has_rtu);
 
-/* The vertex-buffer geometry feeding a VS kernel: a single interleaved
- * host vertex buffer plus the per-attribute layout. The VS kernel
- * fetches attribute `loc` of vertex `vid` at
- *   data + base_offset + attr_offset[loc] + vid*attr_stride[loc].
- * NULL passed to vp_launch_vs means a self-contained VS (the corner
- * arrays are baked in -- gl_VertexIndex only, no vertex buffer). */
+/* The vertex-buffer geometry feeding a VS kernel: the distinct vertex-buffer
+ * resources the draw binds, plus the per-attribute layout. Each attribute may
+ * come from its own buffer (an app that binds one buffer per attribute), so the
+ * VS kernel fetches attribute `loc` of vertex `vid` at
+ *   buf_data[attr_buf[loc]] + attr_offset[loc] + vid*attr_stride[loc].
+ * NULL passed to vp_launch_vs means a self-contained VS (the corner arrays are
+ * baked in -- gl_VertexIndex only, no vertex buffer). */
 struct vp_vertex_input {
-   const void *data;          /* host vertex-buffer bytes */
-   uint32_t    size;          /* data length in bytes */
-   uint32_t    base_offset;   /* pipe_vertex_buffer.buffer_offset */
+   uint32_t    num_bufs;         /* distinct bound vertex-buffer resources */
+   const void *buf_data[8];      /* host bytes of each distinct buffer */
+   uint32_t    buf_size[8];      /* length of each buffer in bytes */
    uint32_t    num_attrs;
    uint32_t    attr_loc[8];      /* VS input driver_location */
-   uint32_t    attr_offset[8];   /* byte offset of the attribute in a vertex */
+   uint32_t    attr_buf[8];      /* which buf_data[] this attribute fetches from */
+   uint32_t    attr_offset[8];   /* byte offset of the attribute in its buffer */
    uint32_t    attr_stride[8];   /* bytes between consecutive vertices */
+   /* 0 = per-vertex; otherwise the attribute advances once every `divisor`
+    * instances (VK_EXT_vertex_attribute_divisor). */
+   uint32_t    attr_divisor[8];
 };
 
 /* Run a compiled Vortex vertex-shader kernel (.vxbin) on `dev`. One
@@ -87,7 +103,7 @@ struct vp_vertex_input {
  * must vx_buffer_release. The on-device front end (vp_raster_draw's expand_k)
  * consumes them directly; only the llvmpipe-raster fallback reads them back to
  * host (vp_buffer_readback). `out_bytes` is the logical count*stride size. */
-bool vp_launch_vs(vx_device_h dev,
+bool vp_launch_vs(struct pipe_screen *screen, vx_device_h dev,
                   const void *vxbin, size_t vxbin_size,
                   uint32_t vertex_count, uint32_t out_bytes,
                   const struct vp_vertex_input *vin,

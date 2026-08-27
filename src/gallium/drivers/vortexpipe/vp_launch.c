@@ -16,6 +16,8 @@
 
 #define _GNU_SOURCE
 #include "vp_launch.h"
+#include "vp_private.h"        /* vp_screen_resident_addr */
+#include "gfx_fs_desc_abi.h"     /* GFX_FS_DESC_SLOTS (VS constant-buffer table) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,7 +182,26 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
 #define LVP_NODE_INVALID      0xFFFFFFFFu
 #define LVP_BOX_CHILDREN_OFF  48   /* vk_aabb bounds[2] precede children[2] */
 #define LVP_TRI_GEOMFLAGS_OFF 44   /* coords[3][3]+padding+primitive_id      */
+#define LVP_INST_SBTFLAGS_OFF 12   /* bvh_ptr + custom_instance_and_mask      */
 #define LVP_INST_OTW_OFF      72   /* otw_matrix (object→world, mat3x4)       */
+
+/* Opacity lives in the top bits of two words: the geometry's own flag in a
+ * triangle node's geometry_id_and_flags, and the instance's overrides in
+ * sbt_offset_and_flags. A hit is opaque when the geometry (or the instance's
+ * force) says so AND the instance does not force it non-opaque. Geometry-opaque
+ * and instance-force-opaque deliberately occupy the same bit, so ORing the two
+ * words and testing both bits is the whole rule -- the form
+ * lvp_build_hit_is_opaque uses, kept identical here so the device and the CPU
+ * traversal never disagree about which triangles need an any-hit decision. */
+#define LVP_GEOMETRY_OPAQUE              (1u << 31)
+#define LVP_INSTANCE_FORCE_OPAQUE        (1u << 31)
+#define LVP_INSTANCE_NO_FORCE_NOT_OPAQUE (1u << 30)
+#define LVP_OPAQUE_BITS \
+   (LVP_GEOMETRY_OPAQUE | LVP_INSTANCE_FORCE_OPAQUE | LVP_INSTANCE_NO_FORCE_NOT_OPAQUE)
+
+/* A BLAS walked without an enclosing instance takes the flags a default
+ * instance would carry, so geometry opacity alone decides. */
+#define LVP_INSTANCE_FLAGS_DEFAULT       LVP_INSTANCE_NO_FORCE_NOT_OPAQUE
 
 /* RTU scene constants (rtu_types.h / rtu_bvh.h). */
 #define RTU_SCENE_HDR_BYTES   16
@@ -234,7 +255,7 @@ vp_xform_compose(const float A[12], const float B[12], float C[12])
 
 static void
 vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
-            const float v2[3], uint32_t prim_id, uint32_t geom_id)
+            const float v2[3], uint32_t prim_id, uint32_t geom_id, bool opaque)
 {
    if (tl->count == tl->cap) {
       uint32_t ncap = tl->cap ? tl->cap * 2 : 64;
@@ -252,7 +273,7 @@ vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
    t[0]=v0[0]; t[1]=v0[1]; t[2]=v0[2];
    t[3]=v1[0]; t[4]=v1[1]; t[5]=v1[2];
    t[6]=v2[0]; t[7]=v2[1]; t[8]=v2[2];
-   uint32_t flags = RTU_TRI_FLAG_OPAQUE;
+   uint32_t flags = opaque ? RTU_TRI_FLAG_OPAQUE : 0u;
    memcpy(&t[9], &flags, 4);
    tl->prim[idx] = prim_id;
    tl->geom[idx] = geom_id;
@@ -262,7 +283,7 @@ vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
  * transform M, appending world-space triangles to tl. */
 static void
 vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
-             struct vp_tri_list *tl, int depth)
+             uint32_t inst_flags, struct vp_tri_list *tl, int depth)
 {
    if (node_ptr == LVP_NODE_INVALID || depth > 64 || !tl->ok)
       return;
@@ -273,8 +294,8 @@ vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
       uint32_t c0, c1;
       memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
       memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
-      vp_walk_node(bvh, c0, M, tl, depth + 1);
-      vp_walk_node(bvh, c1, M, tl, depth + 1);
+      vp_walk_node(bvh, c0, M, inst_flags, tl, depth + 1);
+      vp_walk_node(bvh, c1, M, inst_flags, tl, depth + 1);
       break;
    }
    case LVP_NODE_TRIANGLE: {
@@ -291,20 +312,26 @@ vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
       vp_xform_point(M, &coords[0], w0);
       vp_xform_point(M, &coords[3], w1);
       vp_xform_point(M, &coords[6], w2);
-      vp_tri_push(tl, w0, w1, w2, prim_id, geom_flags & 0x0fffffffu);
+      /* A non-opaque triangle is one the RTU must return as a candidate so the
+       * shader's any-hit decision runs; marking it opaque would commit it
+       * unconditionally. */
+      bool opaque = ((geom_flags | inst_flags) & LVP_OPAQUE_BITS) == LVP_OPAQUE_BITS;
+      vp_tri_push(tl, w0, w1, w2, prim_id, geom_flags & 0x0fffffffu, opaque);
       break;
    }
    case LVP_NODE_INSTANCE: {
       uint64_t blas_host = 0;
+      uint32_t sbt_flags = 0;
       float otw[12];
       memcpy(&blas_host, node, 8);
+      memcpy(&sbt_flags, node + LVP_INST_SBTFLAGS_OFF, 4);
       memcpy(otw, node + LVP_INST_OTW_OFF, 48);
       if (blas_host) {
          float Mc[12];
          vp_xform_compose(M, otw, Mc);     /* world = M ∘ otw */
          const uint8_t *blas = (const uint8_t *)(uintptr_t)blas_host;
          uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
-         vp_walk_node(blas, root, Mc, tl, depth + 1);
+         vp_walk_node(blas, root, Mc, sbt_flags, tl, depth + 1);
       }
       break;
    }
@@ -476,8 +503,9 @@ vp_bvh_serialize(struct vp_bvh *b, int root, const float (*tris)[10],
          lh[3] = prim[n->tri];         /* prim_base = source gl_PrimitiveID */
          const float *t = tris[n->tri];
          memcpy(p + RTU_BVH_LEAF_HDR_BYTES, t, 36);   /* 9 coords */
-         uint32_t flags = RTU_TRI_FLAG_OPAQUE;
-         memcpy(p + RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_FLAGS_OFFSET, &flags, 4);
+         /* t[9] carries the flags the walk computed from the source geometry
+          * and instance; re-deriving them here would let the two disagree. */
+         memcpy(p + RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_FLAGS_OFFSET, &t[9], 4);
       } else {
          uint32_t *kind = (uint32_t *)p;
          *kind = RTU_BVH_KIND_INTERNAL |
@@ -558,7 +586,8 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    struct vp_tri_list tl = { .ok = true };
    static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
    uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
-   vp_walk_node((const uint8_t *)tlas_host, root, kIdentity, &tl, 0);
+   vp_walk_node((const uint8_t *)tlas_host, root, kIdentity,
+                LVP_INSTANCE_FLAGS_DEFAULT, &tl, 0);
    if (!tl.ok) {
       free(tl.tris); free(tl.prim); free(tl.geom);
       c->ok = false;
@@ -589,13 +618,73 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    return dev_addr;
 }
 
+/* A draw reaches its descriptors through its own loops and tears them down at
+ * its own point, but the relocation itself is the same work as a dispatch's.
+ * The context stays opaque to the draw: every device buffer and staging blob
+ * the copy allocates has to outlive vx_queue_finish, and handing out the struct
+ * would make that lifetime the caller's to reconstruct rather than to observe. */
+struct vp_as_ctx *
+vp_as_begin(vx_device_h dev, vx_queue_h q, bool has_rtu)
+{
+   struct vp_as_ctx *c = calloc(1, sizeof *c);
+   if (!c) {
+      return NULL;
+   }
+   c->dev     = dev;
+   c->q       = q;
+   c->has_rtu = has_rtu;
+   c->ok      = true;
+   return c;
+}
+
+/* Device address of the acceleration structure whose host root is `tlas_host`,
+ * transcoded to the RTU's scene format where the device has one and copied
+ * verbatim otherwise. Returns 0 without recording a failure for a null handle,
+ * which is a descriptor the shader never binds rather than an error. */
+uint64_t
+vp_as_relocate(struct vp_as_ctx *c, uint64_t tlas_host)
+{
+   if (!c || !c->ok || !tlas_host) {
+      return 0;
+   }
+   return c->has_rtu ? vp_transcode_as(c, (const void *)(uintptr_t)tlas_host)
+                     : vp_copy_as(c, (const void *)(uintptr_t)tlas_host);
+}
+
 bool
-vp_launch(vx_device_h dev,
+vp_as_ok(const struct vp_as_ctx *c)
+{
+   return c && c->ok;
+}
+
+/* Release everything the relocations allocated. Called after vx_queue_finish,
+ * never before: the uploads are asynchronous and read the staging blobs. */
+void
+vp_as_end(struct vp_as_ctx *c)
+{
+   if (!c) {
+      return;
+   }
+   for (unsigned i = 0; i < c->n_bufs; i++) {
+      if (c->bufs[i]) {
+         vx_buffer_release(c->bufs[i]);
+      }
+   }
+   for (unsigned i = 0; i < c->n_stages; i++) {
+      free(c->stages[i]);
+   }
+   free(c);
+}
+
+bool
+vp_launch(struct pipe_screen *screen, vx_device_h dev,
           const void *vxbin, size_t vxbin_size,
+          vx_module_h *module_io, vx_kernel_h *kernel_io,
           const void *desc_host, uint32_t desc_bytes,
           const struct vp_desc *descs, uint32_t num_descs,
           const struct vp_ssbo *ssbos, uint32_t num_ssbos,
           const uint32_t grid[3], const uint32_t block[3],
+          const uint32_t grid_base[3],
           uint32_t lmem_size, bool has_rtu)
 {
    bool ok = false;
@@ -603,7 +692,11 @@ vp_launch(vx_device_h dev,
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
    vx_buffer_h dbuf = NULL;
-   vx_buffer_h res[VP_MAX_DESCS]      = { 0 };  /* per-descriptor device buffer */
+   /* Resident device buffers are owned by the screen and outlive the dispatch,
+    * so these are borrowed handles -- released here they would be freed out
+    * from under the next dispatch that resolves to the same host range. */
+   vx_buffer_h res[VP_MAX_DESCS]      = { 0 };  /* borrowed resident buffer    */
+   uint32_t    res_off[VP_MAX_DESCS]  = { 0 };  /* range's offset within it    */
    void       *res_host[VP_MAX_DESCS] = { 0 };  /* its host backing            */
    uint32_t    res_bytes[VP_MAX_DESCS]= { 0 };
    vx_buffer_h sres[VP_MAX_SSBO]      = { 0 };  /* per-slot raw-SSBO device buffer */
@@ -632,15 +725,18 @@ vp_launch(vx_device_h dev,
    asc.q   = q;
    asc.has_rtu = has_rtu;
 
-   /* Load the kernel image straight from memory — no /tmp round-trip (mirrors
-    * the gfx draw path's vx_module_load_bytes; the §6.6 module-residency cache
-    * is the next increment). */
-   VP_CHECK(vx_module_load_bytes(dev, vxbin, vxbin_size, &kmod),
-            "vx_module_load_bytes");
-   /* "main" is the public name vxbin.py assigns the single conventional
-    * kernel (the C entry is "kernel_main"); match the native runtime. */
-   VP_CHECK(vx_module_get_kernel(kmod, "main", &kbuf),
-            "vx_module_get_kernel");
+   /* Load the kernel image straight from memory — no /tmp round-trip — and
+    * leave it resident in the caller's slot, so a repeated dispatch of the same
+    * pipeline reuses it. "main" is the public name vxbin.py assigns the single
+    * conventional kernel (the C entry is "kernel_main"); match the native
+    * runtime. */
+   if (*module_io == NULL) {
+      VP_CHECK(vx_module_load_bytes(dev, vxbin, vxbin_size, module_io),
+               "vx_module_load_bytes");
+      VP_CHECK(vx_module_get_kernel(*module_io, "main", kernel_io),
+               "vx_module_get_kernel");
+   }
+   kbuf = *kernel_io;
 
    /* Relocate each descriptor into the staged descriptor blob:
     *  - VP_DESC_BUFFER: copy the resource into device memory, rewrite
@@ -673,10 +769,10 @@ vp_launch(vx_device_h dev,
 
       if (descs[i].kind == VP_DESC_IMAGE) {
          /* Storage image: copy the host backing to device memory and rewrite
-          * lp_jit_image.base, mirroring the buffer path. Registered in res[]
-          * so it is read back (the shader writes it) and released. Upload +
-          * readback is the correct full-duplex treatment for an accumulation
-          * image, which is both read and written each frame. */
+          * lp_jit_image.base, mirroring the buffer path. Upload + readback is
+          * the correct full-duplex treatment for an accumulation image, which
+          * is both read and written each frame; an image the shader only loads
+          * is uploaded and released without the readback. */
          uint64_t host_base = 0;
          uint16_t height    = 0;
          uint32_t row       = 0;
@@ -688,17 +784,25 @@ vp_launch(vx_device_h dev,
          if (!host_base || !height || !row)
             continue;
          uint32_t isize = base_off + (uint32_t)height * row;
-         VP_CHECK(vx_buffer_create(dev, isize, 0, &res[i]),
-                  "vx_buffer_create(image)");
-         uint64_t dev_addr = 0;
-         VP_CHECK(vx_buffer_address(res[i], &dev_addr), "vx_buffer_address(image)");
          void *img_upload = (void *)(uintptr_t)host_base;
-         VP_CHECK(vx_enqueue_write(q, res[i], 0, img_upload,
-                                   isize, 0, NULL, NULL),
-                  "vx_enqueue_write(image)");
+         bool dirty = true;
+         uint64_t dev_addr = vp_screen_resident_addr(screen, img_upload, isize,
+                                                     &res[i], &res_off[i], &dirty);
+         if (!dev_addr) {
+            mesa_loge("vortexpipe: launch: no device memory for image");
+            goto done;
+         }
+         if (dirty) {
+            VP_CHECK(vx_enqueue_write(q, res[i], res_off[i], img_upload,
+                                      isize, 0, NULL, NULL),
+                     "vx_enqueue_write(image)");
+            vp_screen_resident_clean(screen, img_upload, isize);
+         }
          memcpy(slot + VP_JIT_IMG_BASE, &dev_addr, sizeof dev_addr);
-         res_host[i]  = (void *)(uintptr_t)host_base;
-         res_bytes[i] = isize;
+         if (descs[i].writable) {
+            res_host[i]  = (void *)(uintptr_t)host_base;
+            res_bytes[i] = isize;
+         }
          continue;
       }
 
@@ -712,16 +816,34 @@ vp_launch(vx_device_h dev,
       /* lp_jit_buffer.num_elements is a COUNT: bytes for an SSBO (elem_bytes 1),
        * dwords for a UBO (elem_bytes 4, DIV_ROUND_UP(size, sizeof(float))). */
       uint32_t size = nelem * (descs[i].elem_bytes ? descs[i].elem_bytes : 1);
-      VP_CHECK(vx_buffer_create(dev, size, 0, &res[i]),
-               "vx_buffer_create(resource)");
-      uint64_t dev_addr = 0;
-      VP_CHECK(vx_buffer_address(res[i], &dev_addr), "vx_buffer_address");
-      VP_CHECK(vx_enqueue_write(q, res[i], 0, (void *)(uintptr_t)host_ptr,
-                                size, 0, NULL, NULL),
-               "vx_enqueue_write(resource)");
+      bool dirty = true;
+      uint64_t dev_addr = vp_screen_resident_addr(screen,
+                                                  (const void *)(uintptr_t)host_ptr,
+                                                  size, &res[i], &res_off[i], &dirty);
+      if (!dev_addr) {
+         mesa_loge("vortexpipe: launch: no device memory for resource");
+         goto done;
+      }
+      if (dirty) {
+         VP_CHECK(vx_enqueue_write(q, res[i], res_off[i], (void *)(uintptr_t)host_ptr,
+                                   size, 0, NULL, NULL),
+                  "vx_enqueue_write(resource)");
+         vp_screen_resident_clean(screen, (const void *)(uintptr_t)host_ptr, size);
+      } else {
+         /* Reported, not silent: an upload skip that cannot be observed cannot
+          * be shown to work, and two residency changes in this driver have
+          * already measured zero because nothing said whether they fired. */
+         vp_dbg("vortexpipe: launch: resource upload skipped, %u bytes already "
+                "resident and clean", size);
+      }
       memcpy(slot + VP_JIT_BUF_PTR, &dev_addr, sizeof dev_addr);
-      res_host[i]  = (void *)(uintptr_t)host_ptr;
-      res_bytes[i] = size;
+      /* Only a descriptor the shader stores to needs its device copy brought
+       * back. A UBO cannot be written at all, and an SSBO this shader only
+       * loads returns exactly the bytes that were just uploaded. */
+      if (descs[i].writable) {
+         res_host[i]  = (void *)(uintptr_t)host_ptr;
+         res_bytes[i] = size;
+      }
    }
 
    /* upload the relocated descriptor buffer */
@@ -738,6 +860,12 @@ vp_launch(vx_device_h dev,
     * instead of allocating an args buffer. */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
    argblk[1] = desc_dev;
+   /* vkCmdDispatchBase base offset -> gl_WorkGroupID (added in-shader). */
+   if (grid_base) {
+      argblk[VP_ARG_GRID_BASE_XY] = (uint64_t)grid_base[0]
+                                  | ((uint64_t)grid_base[1] << 32);
+      argblk[VP_ARG_GRID_BASE_Z]  = (uint64_t)grid_base[2];
+   }
 
    /* Relocate each raw shader-buffer slot into the device and record its data
     * address in arg[VP_ARG_SSBO_BASE + slot]. Upload-only (input buffers). */
@@ -809,11 +937,11 @@ vp_launch(vx_device_h dev,
    };
    VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
 
-   /* copy every buffer back into its host backing */
+   /* copy every written buffer back into its host backing */
    for (uint32_t i = 0; i < num_descs; i++) {
-      if (!res[i])
+      if (!res[i] || !res_host[i])
          continue;
-      VP_CHECK(vx_enqueue_read(q, res_host[i], res[i], 0, res_bytes[i],
+      VP_CHECK(vx_enqueue_read(q, res_host[i], res[i], res_off[i], res_bytes[i],
                                0, NULL, NULL), "vx_enqueue_read(resource)");
    }
    VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish");
@@ -827,27 +955,23 @@ done:
       if (sbt_res[i]) vx_buffer_release(sbt_res[i]);
    for (uint32_t i = 0; i < VP_MAX_SSBO; i++)
       free(cmd_copy[i]);
-   for (uint32_t i = 0; i < VP_MAX_DESCS; i++)
-      if (res[i]) vx_buffer_release(res[i]);
    for (unsigned i = 0; i < asc.n_bufs; i++)
       if (asc.bufs[i]) vx_buffer_release(asc.bufs[i]);
    for (unsigned i = 0; i < asc.n_stages; i++)
       free(asc.stages[i]);
    if (dbuf) vx_buffer_release(dbuf);
-   if (kbuf) vx_kernel_release(kbuf);
-   if (kmod) vx_module_release(kmod);
+   /* kbuf aliases *kernel_io and stays resident; the caller releases it. */
    if (q)    vx_queue_release(q);
    free(stage);
    return ok;
 }
 
-/* attribute-table entry the VS kernel reads: { device base, stride }.
- * The table is indexed by VS input driver_location. */
-#define VP_ATTR_ENTRY_BYTES 8
+/* How many VS input driver_locations the attribute table covers. The entry
+ * layout itself is VP_ATTR_ENTRY_WORDS, shared with the fetch lowering. */
 #define VP_ATTR_TABLE_LOCS  8
 
 bool
-vp_launch_vs(vx_device_h dev,
+vp_launch_vs(struct pipe_screen *screen, vx_device_h dev,
              const void *vxbin, size_t vxbin_size,
              uint32_t vertex_count, uint32_t out_bytes,
              const struct vp_vertex_input *vin,
@@ -857,8 +981,15 @@ vp_launch_vs(vx_device_h dev,
    vx_queue_h  q    = NULL;
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
-   vx_buffer_h obuf = NULL, vbuf = NULL, tbuf = NULL;
-   char vxpath[] = "/tmp/vortexpipe-vs.XXXXXX";
+   vx_buffer_h obuf = NULL, tbuf = NULL, dtbuf = NULL;
+   /* Borrowed from the screen's residency table -- one per distinct vertex
+    * buffer, resident for the resource's life rather than the draw's. */
+   vx_buffer_h vbufs_dev[8] = { NULL };
+   char vxpath[512];
+   const char *vs_tmpdir = getenv("TMPDIR");
+   if (!vs_tmpdir || !*vs_tmpdir)
+      vs_tmpdir = "/tmp";
+   snprintf(vxpath, sizeof vxpath, "%s/vortexpipe-vs.XXXXXX", vs_tmpdir);
    int  vxfd = -1;
 
    *out_buf  = NULL;
@@ -936,35 +1067,73 @@ vp_launch_vs(vx_device_h dev,
    VP_CHECK(vx_buffer_address(obuf, &out_dev), "vx_buffer_address");
 
    /* arg block: slot 0 -> output buffer device address,
-    *            slot 1 -> vertex attribute table (0 if self-contained) */
+    *            slot 1 -> vertex attribute table (0 if self-contained),
+    *            VP_ARG_VS_COUNT -> vertex invocations the draw really has,
+    *            VP_ARG_VS_DESC -> VS constant-buffer table (see below) */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
    argblk[0] = out_dev;
+   /* The block above is rounded up to fill its warps, so the VS prologue stops
+    * every thread whose vertex id is past the draw. It reads the real count
+    * from here, and a zero here stops all of them -- the launch appears to
+    * succeed and the output buffer comes back exactly as allocated. */
+   argblk[VP_ARG_VS_COUNT] = vertex_count;
+
+   /* This standalone path (the llvmpipe raster fallback) has no descriptor
+    * state, but the VS prologue always dereferences VP_ARG_VS_DESC to reach
+    * its constant buffers, so the slot must hold a real table rather than 0.
+    * Upload a zero-filled one: a VS that reads a UBO here still gets wrong
+    * data -- this path never supported descriptors -- but it does not fault.
+    * Wiring real constant buffers through here is tracked separately. */
+   uint64_t vs_desc_table[GFX_FS_DESC_SLOTS] = { 0 };
+   VP_CHECK(vx_buffer_create(dev, sizeof(vs_desc_table), 0, &dtbuf),
+            "vx_buffer_create(vs_desc)");
+   uint64_t vs_desc_dev = 0;
+   VP_CHECK(vx_buffer_address(dtbuf, &vs_desc_dev), "vx_buffer_address(vs_desc)");
+   VP_CHECK(vx_enqueue_write(q, dtbuf, 0, vs_desc_table, sizeof(vs_desc_table),
+                             0, NULL, NULL), "vx_enqueue_write(vs_desc)");
+   argblk[VP_ARG_VS_DESC] = vs_desc_dev;
 
    /* Vertex buffer + attribute table: upload the interleaved vertex
     * buffer, then a table indexed by driver_location holding the
     * device base address + stride of each attribute. The VS kernel
-    * fetches input `loc` of vertex `vid` at table[loc].base +
-    * vid*table[loc].stride.
+    * fetches input `loc` at table[loc].base + index*table[loc].stride, the
+    * index taken from the vertex or, for a non-zero divisor, from
+    * instance/divisor.
     *
     * `table` is declared at function scope: vx_enqueue_write is
     * asynchronous (the source is read at vx_queue_finish), so it must
     * outlive the `if` block -- the same lifetime rule as argblk. */
-   uint32_t table[VP_ATTR_TABLE_LOCS * 2] = { 0 };
+   uint32_t table[VP_ATTR_TABLE_LOCS * VP_ATTR_ENTRY_WORDS] = { 0 };
    if (vin && vin->num_attrs) {
-      VP_CHECK(vx_buffer_create(dev, vin->size, 0, &vbuf),
-               "vx_buffer_create(vbuf)");
-      uint64_t vbuf_dev = 0;
-      VP_CHECK(vx_buffer_address(vbuf, &vbuf_dev), "vx_buffer_address(vbuf)");
-      VP_CHECK(vx_enqueue_write(q, vbuf, 0, vin->data, vin->size,
-                                0, NULL, NULL), "vx_enqueue_write(vbuf)");
+      /* Upload each distinct vertex-buffer resource once; an attribute points at
+       * its own buffer's device base + its byte offset. */
+      uint64_t buf_dev[8] = { 0 };
+      uint32_t buf_off[8] = { 0 };
+      for (uint32_t j = 0; j < vin->num_bufs; j++) {
+         bool vdirty = true;
+         buf_dev[j] = vp_screen_resident_addr(screen, vin->buf_data[j],
+                                              vin->buf_size[j],
+                                              &vbufs_dev[j], &buf_off[j], &vdirty);
+         if (!buf_dev[j]) {
+            mesa_loge("vortexpipe: launch_vs: no device memory for vertex buffer");
+            goto done;
+         }
+         if (vdirty) {
+            VP_CHECK(vx_enqueue_write(q, vbufs_dev[j], buf_off[j], vin->buf_data[j],
+                                      vin->buf_size[j], 0, NULL, NULL),
+                     "vx_enqueue_write(vbuf)");
+            vp_screen_resident_clean(screen, vin->buf_data[j], vin->buf_size[j]);
+         }
+      }
 
       for (uint32_t i = 0; i < vin->num_attrs; i++) {
          uint32_t loc = vin->attr_loc[i];
          if (loc >= VP_ATTR_TABLE_LOCS)
             continue;
-         table[loc * 2 + 0] = (uint32_t)vbuf_dev + vin->base_offset
-                            + vin->attr_offset[i];
-         table[loc * 2 + 1] = vin->attr_stride[i];
+         uint32_t *e = &table[loc * VP_ATTR_ENTRY_WORDS];
+         e[0] = (uint32_t)buf_dev[vin->attr_buf[i]] + vin->attr_offset[i];
+         e[1] = vin->attr_stride[i];
+         e[2] = vin->attr_divisor[i];
       }
       VP_CHECK(vx_buffer_create(dev, sizeof(table), 0, &tbuf),
                "vx_buffer_create(attrtab)");
@@ -1000,7 +1169,7 @@ vp_launch_vs(vx_device_h dev,
 
 done:
    if (tbuf) vx_buffer_release(tbuf);
-   if (vbuf) vx_buffer_release(vbuf);
+   if (dtbuf) vx_buffer_release(dtbuf);
    if (!ok && obuf) vx_buffer_release(obuf);   /* on success the caller owns obuf */
    if (kbuf) vx_kernel_release(kbuf);
    if (kmod) vx_module_release(kmod);

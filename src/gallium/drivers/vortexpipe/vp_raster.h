@@ -19,6 +19,9 @@
 #include <stdbool.h>
 
 #include "vortex2.h"
+
+struct pipe_screen;
+#include "VX_types.h"            /* VX_TEX_LOD_MAX */
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
 #include "gfx_fs_desc_abi.h"     /* GFX_FS_DESC_SLOTS */
 
@@ -47,6 +50,14 @@ struct vp_fs_consts {
 /* The vertex-buffer geometry feeding the VS stage (defined in vp_launch.h). */
 struct vp_vertex_input;
 
+/* The app's scissor rect, in window space, already intersected with nothing:
+ * vp_raster_draw intersects it with the viewport's screen rect. A draw that
+ * binds no scissor passes NULL and keeps the viewport rect alone. minx==maxx
+ * or miny==maxy is an empty rect and paints nothing. */
+struct vp_scissor_rect {
+   unsigned minx, miny, maxx, maxy;
+};
+
 /* Persistent front-end working set: the binning pipeline's resident
  * buffer set, laid out once over VX_MEM_PHYS and reused across the frame's
  * draws (grown on demand) instead of allocated per draw. Owned by the
@@ -58,12 +69,34 @@ void                   vp_raster_pool_destroy(struct vp_raster_pool *pool);
 /* Output-merger state for a draw -- the Gallium depth-stencil + blend
  * state, translated to the Vortex OM encoding (see vp_context.c). */
 struct vp_om_params {
+   /* Samples per pixel for the pass. 1 keeps every multisample path out of the
+    * way; above 1 the resident colour and depth planes carry that many samples
+    * per pixel and the merger addresses them contiguously within a row. */
+   uint32_t samples;
    bool     depth_test;
    uint32_t depth_func;     /* VX_OM_DEPTH_FUNC_* */
    bool     depth_write;
    uint32_t blend_mode;     /* VX_DCR_OM_BLEND_MODE packed word */
    uint32_t blend_func;     /* VX_DCR_OM_BLEND_FUNC packed word */
    uint32_t colormask;      /* VX_DCR_OM_CBUF_WRITEMASK */
+   /* Two-sided stencil and the blend constant, already packed as the DCRs
+    * encode them: front in bits 15:0, back in bits 31:16. */
+   uint32_t stencil_func;
+   uint32_t stencil_fail;
+   uint32_t stencil_zfail;
+   uint32_t stencil_zpass;
+   uint32_t stencil_ref;
+   uint32_t stencil_mask;
+   uint32_t stencil_writemask;
+   uint32_t blend_const;    /* ARGB8888 constant-colour blend operand */
+   uint32_t logic_op;       /* VX_OM_LOGIC_OP_* */
+   /* Colour attachment storage, for the software merger: how a texel is encoded
+    * and how wide it is. The fixed-function merger has no format register and
+    * writes A8R8G8B8 at four bytes, so anything else must have been routed to
+    * software before it gets here. */
+   uint32_t color_format;   /* VX_OM_COLOR_FORMAT_* */
+   uint32_t color_bpp;      /* bytes per colour texel */
+   bool     earlyz_safe;    /* the rasterizer may cull provably-occluded quads */
 };
 
 /* Per-attachment output-merger state for a draw targeting >1 colour
@@ -79,6 +112,14 @@ struct vp_mrt_params {
    uint32_t blend_mode[GFX_OM_MAX_RT];       /* VX_DCR_OM_BLEND_MODE packed word */
    uint32_t blend_func[GFX_OM_MAX_RT];       /* VX_DCR_OM_BLEND_FUNC packed word */
    uint32_t colormask[GFX_OM_MAX_RT];        /* VX_DCR_OM_CBUF_WRITEMASK (RGBA) */
+   /* The pipeline-wide blend constant, permuted into each attachment's channel
+    * order. One source value, but the targets need not agree on the order. */
+   uint32_t blend_const[GFX_OM_MAX_RT];      /* ARGB8888 constant-colour operand */
+   /* Per-attachment storage format: every render target carries its own merger
+    * state, so a set may mix formats, texel widths and channel orders. The
+    * texel width is not carried -- the merger derives it from the format, and
+    * the row stride it needs is already in pitch[]. */
+   uint32_t color_format[GFX_OM_MAX_RT];     /* VX_OM_COLOR_FORMAT_* */
 };
 
 /* The texture bound for a draw -- mip 0 dims + the sampler's filter/wrap.
@@ -90,9 +131,23 @@ struct vp_mrt_params {
 struct vp_tex_params {
    uint32_t    width;
    uint32_t    height;
-   uint32_t    filter;      /* VX_TEX_FILTER_* */
+   uint32_t    filter;      /* VX_TEX_FILTER_* -- the mag tap */
+   uint32_t    min_filter;  /* VX_TEX_FILTER_* -- the min (minification) tap */
    uint32_t    wrap_u;      /* VX_TEX_WRAP_* */
    uint32_t    wrap_v;
+   bool        mip_enable;  /* sampler has a mip chain (else FS forces LOD 0) */
+   bool        mip_linear;  /* mip mode LINEAR (trilinear) rather than nearest */
+   uint32_t    mip_off[VX_TEX_LOD_MAX + 1];  /* per-LOD byte offset from base */
+   uint32_t    compare_func;  /* shadow compare op (VX_OM_DEPTH_FUNC_*); 0 => none */
+   uint32_t    format;      /* VX_TEX_FORMAT_* (depth formats for shadow); 0 => A8R8G8B8 */
+   uint32_t    swizzle;     /* view component map: r|g<<3|b<<6|a<<9 (0..3=RGBA, 4=0, 5=1) */
+   uint32_t    layer_stride; /* bytes per array layer (sampler2DArray); 0 => single 2D */
+   uint32_t    min_lod;     /* sampler LOD clamp lower bound, Q(VX_TEX_LOD_FRAC_BITS) */
+   uint32_t    max_lod;     /* sampler LOD clamp upper bound, Q(VX_TEX_LOD_FRAC_BITS) */
+   int32_t     lod_bias;    /* sampler LOD bias, signed Q(VX_TEX_LOD_FRAC_BITS) */
+   uint32_t    depth;       /* mip-0 depth-slice count (sampler3D); 0 => not 3D */
+   uint32_t    wrap_w;      /* VX_TEX_WRAP_* for the 3D depth (r) axis */
+   uint32_t    border;      /* CLAMP_TO_BORDER colour, ARGB8888 */
 };
 
 /* Run the WHOLE draw as one device-orchestrated command: the vertex shader
@@ -134,12 +189,13 @@ struct vp_tex_params {
  * straight into them — no per-draw colour upload / readback, no per-draw depth
  * clear (the caller clears/initialises them once per pass). tex_dev is the
  * resident texture buffer (0 = untextured). */
-bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
+bool vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
+                    struct vp_raster_pool *pool,
                     const void *vs_vxbin, size_t vs_vxbin_size,
                     vx_module_h *vs_module_io, vx_kernel_h *vs_kernel_io,
                     const void *fs_vxbin, size_t fs_vxbin_size,
                     vx_module_h *fs_module_io, vx_kernel_h *fs_kernel_io,
-                    uint32_t vertex_count,
+                    uint32_t vertex_count, uint32_t first_vertex,
                     uint32_t instance_count, uint32_t first_instance,
                     const struct vp_vs_layout *layout,
                     const struct vp_vertex_input *vin,
@@ -151,8 +207,18 @@ bool vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                     uint32_t cull_mode,
                     bool sw_tex, bool sw_om, bool sw_raster,
                     float vp_sx, float vp_tx, float vp_sy, float vp_ty,
+                    float vp_min_z, float vp_max_z,
+                    const struct vp_scissor_rect *scissor,
                     const struct vp_fs_consts *fs_consts,
+                    const struct vp_fs_consts *vs_consts,
                     const struct vp_mrt_params *mrt);
+
+/* Fold a multisample pass's sample-interleaved colour plane into a dense
+ * single-sample one, on the device. Runs at pass end, after the last draw. */
+bool vp_raster_resolve_msaa(vx_device_h dev, struct vp_raster_pool *pool,
+                            vx_buffer_h src, vx_buffer_h dst,
+                            uint32_t width, uint32_t height,
+                            uint32_t samples, uint32_t color_format);
 
 #ifdef __cplusplus
 }

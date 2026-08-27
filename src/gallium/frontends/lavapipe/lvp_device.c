@@ -805,11 +805,44 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
          /* No on-device transform feedback / geometry streams. */
          features->transformFeedback           = false;
          features->geometryStreams             = false;
+         /* A non-zero vertex stream is produced only by a geometry shader or
+          * transform feedback, neither of which the device has, so the query
+          * can never be asked about one. The stream-0 query still works. */
+         features->primitivesGeneratedQueryWithNonZeroStreams = false;
+         /* Multisampling is not plumbed on the device path: the fixed-function
+          * output merger is single-sample and the rasterizer tests coverage at
+          * pixel centers only, so a multisample framebuffer would render wrong
+          * pixels rather than fail. Report it unsupported until the device
+          * gains per-sample coverage and merge. */
+         features->sampleRateShading             = false;
+         features->shaderStorageImageMultisample = false;
+         /* The output merger programs one source blend factor per channel
+          * pair; dual-source blending has no encoding. */
+         features->dualSrcBlend                  = false;
+         /* Atomics: the device A-extension has only 32-bit integer AMOs.
+          * 64-bit atomics have no RV32 encoding at all; float atomics would
+          * lower to an integer compare-exchange loop but the float-atomic
+          * buffer path currently reads uninitialized memory. Advertise the
+          * honest set — 32-bit integer atomics only (int32 atomics pass CTS).
+          * float16/float64 are already reported unsupported above. */
+         features->shaderBufferInt64Atomics      = false;
+         features->shaderSharedInt64Atomics      = false;
+         features->shaderBufferFloat32Atomics    = false;
+         features->shaderBufferFloat32AtomicAdd  = false;
+         features->shaderSharedFloat32Atomics    = false;
+         features->shaderSharedFloat32AtomicAdd  = false;
+         features->shaderImageFloat32Atomics     = false;
+         features->shaderImageFloat32AtomicAdd   = false;
+         features->sparseImageFloat32Atomics     = false;
+         features->sparseImageFloat32AtomicAdd   = false;
+         features->shaderBufferFloat32AtomicMinMax = false;
+         features->shaderSharedFloat32AtomicMinMax = false;
+         features->shaderImageFloat32AtomicMinMax  = false;
+         features->sparseImageFloat32AtomicMinMax  = false;
       }
    }
 }
 
-extern unsigned lp_native_vector_width;
 
 static VkImageLayout lvp_host_copy_image_layouts[] = {
    VK_IMAGE_LAYOUT_GENERAL,
@@ -974,7 +1007,7 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .deviceLUIDValid = false,
       .deviceNodeMask = 0,
 
-      .subgroupSize = lp_native_vector_width / 32,
+      .subgroupSize = device->pscreen->compute_caps.subgroup_sizes,
       .subgroupSupportedStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT,
       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT,
       .subgroupQuadOperationsInAllStages = true,
@@ -1052,8 +1085,8 @@ lvp_get_properties(const struct lvp_physical_device *device, struct vk_propertie
       .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
 
       /* Vulkan 1.3 */
-      .minSubgroupSize = lp_native_vector_width / 32,
-      .maxSubgroupSize = lp_native_vector_width / 32,
+      .minSubgroupSize = device->pscreen->compute_caps.subgroup_sizes,
+      .maxSubgroupSize = device->pscreen->compute_caps.subgroup_sizes,
       .maxComputeWorkgroupSubgroups = 32,
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
       .maxInlineUniformTotalSize = MAX_DESCRIPTOR_UNIFORM_BLOCK_SIZE * MAX_PER_STAGE_DESCRIPTOR_UNIFORM_BLOCKS * MAX_SETS,
@@ -1354,6 +1387,38 @@ lvp_physical_device_init(struct lvp_physical_device *device,
 
    /* SNORM blending on llvmpipe fails CTS - disable by default */
    device->snorm_blend = debug_get_bool_option("LVP_SNORM_BLEND", false);
+
+   /*
+    * Extension-list honesty (vortexpipe / Vortex device path only).
+    *
+    * lvp_get_features() below reports every feature of the extensions listed
+    * here as unsupported on Vortex. An extension whose entire feature set is
+    * false still appears in vkEnumerateDeviceExtensionProperties, so an
+    * application can enable it, query its features, and get nothing usable --
+    * the declaration and the capability disagree. Withdraw the extension so
+    * the two say the same thing.
+    *
+    * Only extensions with no remaining usable feature are withdrawn. Line
+    * rasterization stays: wide lines are a core feature and are reported
+    * unsupported, but the rasterization modes the extension adds are reached
+    * through the software fallback. multiview stays for the reason
+    * lvp_get_features() gives -- only its geometry and tessellation variants
+    * are withheld.
+    */
+   {
+      const char *dev_name = device->pscreen->get_name(device->pscreen);
+      if (dev_name && !strncmp(dev_name, "vortexpipe", 10)) {
+         /* No mesh or task pipeline on device. */
+         device->vk.supported_extensions.EXT_mesh_shader = false;
+         /* No transform feedback or geometry streams on device. */
+         device->vk.supported_extensions.EXT_transform_feedback = false;
+         /* The device A extension has 32-bit integer AMOs only: no 64-bit
+          * integer atomics, and no float atomics of any width. */
+         device->vk.supported_extensions.KHR_shader_atomic_int64 = false;
+         device->vk.supported_extensions.EXT_shader_atomic_float = false;
+         device->vk.supported_extensions.EXT_shader_atomic_float2 = false;
+      }
+   }
 
    lvp_get_features(device, &device->vk.supported_features);
    lvp_get_properties(device, &device->vk.properties);

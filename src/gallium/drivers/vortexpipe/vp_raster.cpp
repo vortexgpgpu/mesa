@@ -18,6 +18,7 @@
  */
 
 #include "vp_raster.h"
+#include "vp_private.h"        /* vp_screen_resident_addr */
 #include "vp_launch.h"           /* struct vp_vertex_input (folded-in VS stage) */
 #include "vp_compile.h"          /* VP_STARTUP_VS link base */
 
@@ -59,13 +60,11 @@ namespace graphics = vortex::graphics;
 #define RASTER_BIN_LOGSIZE 7
 #endif
 
-/* sizeof(graphics::rast_prim_t): vec3e_t edges[3] (36B) + rast_attribs_t
- * {z,r,g,b,a,u,v,rhw} (8 planes x 12B = 96B) = 132B. The trailing rhw plane
- * (perspective 1/w) grew the record from 120B; this stride programs the RASTER
- * PBUF_STRIDE DCR, so it must match the device rast_prim_t exactly or the unit
- * reads primitive N>0 from the wrong offset (its edges alias the prior prim's
- * attribute planes). Keep in sync with VP_RAST_PRIM_STRIDE in vp_nir_to_llvm.c. */
-#define VP_RAST_PRIM_STRIDE 132
+/* The stride the RASTER PBUF_STRIDE DCR and the fragment kernel both index
+ * primitives by (vp_nir_to_llvm.h). It is the record pitch, so it has to track
+ * every field of the ABI struct, not only the planes RASTER itself fetches. */
+static_assert(VP_RAST_PRIM_STRIDE == sizeof(vortex::graphics::rast_prim_t),
+              "RASTER primitive stride must be the whole rast_prim_t record");
 
 /* Folded-in VS stage arg layout (mirrors vp_launch.c): arg slot 0 = VS output
  * buffer device address, slot 1 = attribute table indexed by VS input
@@ -86,24 +85,31 @@ namespace graphics = vortex::graphics;
       }                                                                 \
    } while (0)
 
-/* exact log2 of a power-of-two texture dimension */
+/* exact log2 of a power-of-two texture dimension; the bound keeps the shift
+ * count in range, since a dimension above 2^31 would otherwise shift by 32 and
+ * spin here forever */
 static inline uint32_t
 vp_log2u(uint32_t n)
 {
    uint32_t l = 0;
-   while ((1u << l) < n)
+   while (l < 32 && (1u << l) < n)
       l++;
    return l;
 }
 
 /* ---- persistent front-end working set -------------------------- *
- * The 17 binning buffers laid out once and reused across the frame's draws
+ * The front-end buffers laid out once and reused across the frame's draws
  * instead of allocated per draw. prim + tilebuf (the RASTER AXI master's
  * inputs) are pinned over VX_MEM_PHYS; the rest is device-resident scratch.
  * The pool grows monotonically when a draw needs more capacity. addr caches
  * the device addresses (its count fields are unused — set per draw). */
+/* One entry per row of the layout table in vp_raster_pool_ensure. Named because
+ * the table and the array have to agree and a bare literal in two places is one
+ * edit away from silently truncating the pool. */
+#define VP_RASTER_POOL_BUFS 18
+
 struct vp_raster_pool {
-   vx_buffer_h bufs[17];
+   vx_buffer_h bufs[VP_RASTER_POOL_BUFS];
    pipe_arg_t  addr;
    uint32_t    cap_tris;
    uint32_t    cap_bins;
@@ -113,7 +119,7 @@ struct vp_raster_pool {
     * the device once and reused across every draw (it never changes), instead
     * of reloaded per draw. */
    vx_module_h fe_module;
-   vx_kernel_h k_expand, k_setup, k_binning;
+   vx_kernel_h k_expand, k_setup, k_binning, k_resolve;
    /* SW sampler / output-merger: small resident descriptors the FS reads
     * (tex via arg[1], om via arg[2]) when the unit is routed to software;
     * created once, rewritten per draw. */
@@ -138,11 +144,42 @@ vp_raster_pool_destroy(struct vp_raster_pool *pool)
       if (b) vx_buffer_release(b);
    if (pool->texstate_buf) vx_buffer_release(pool->texstate_buf);
    if (pool->omstate_buf)  vx_buffer_release(pool->omstate_buf);
+   if (pool->k_resolve) vx_kernel_release(pool->k_resolve);
    if (pool->k_binning) vx_kernel_release(pool->k_binning);
    if (pool->k_setup)   vx_kernel_release(pool->k_setup);
    if (pool->k_expand)  vx_kernel_release(pool->k_expand);
    if (pool->fe_module) vx_module_release(pool->fe_module);
    delete pool;
+}
+
+/* Load the embedded front-end module onto the device once per context and cache
+ * its kernel handles. Both the draw and the pass-end resolve reach for it, and
+ * a multisample pass that clears without drawing still has samples to fold, so
+ * the resolve cannot assume a draw already loaded it. */
+static bool
+vp_pool_module(vx_device_h dev, struct vp_raster_pool *pool)
+{
+   if (pool->fe_module != NULL)
+      return true;
+   size_t fe_size = 0;
+   const void *fe_bytes = vp_gfx_frontend_vxbin(vp_xlen_is_64(), &fe_size);
+   if (vx_module_load_bytes(dev, fe_bytes, fe_size, &pool->fe_module) != VX_SUCCESS) {
+      mesa_loge("vortexpipe: raster: front-end module load failed");
+      pool->fe_module = NULL;
+      return false;
+   }
+   if (vx_module_get_kernel(pool->fe_module, "expand_k", &pool->k_expand) != VX_SUCCESS ||
+       vx_module_get_kernel(pool->fe_module, "setup_k", &pool->k_setup) != VX_SUCCESS ||
+       vx_module_get_kernel(pool->fe_module, "binning_k", &pool->k_binning) != VX_SUCCESS ||
+       vx_module_get_kernel(pool->fe_module, "msaa_resolve_k", &pool->k_resolve) != VX_SUCCESS) {
+      /* Drop the module rather than leave it cached: a later call would find
+       * fe_module set, return success, and launch through a null kernel. */
+      mesa_loge("vortexpipe: raster: front-end module is missing a kernel entry");
+      vx_module_release(pool->fe_module);
+      pool->fe_module = NULL;
+      return false;
+   }
+   return true;
 }
 
 /* Ensure the pool is sized for this draw (grow-only); (re)allocates and
@@ -191,8 +228,12 @@ vp_pool_ensure(vx_device_h dev, struct vp_raster_pool *pool,
       { (uint64_t)B * 4,                           &a.binbase_addr,   W   },
       { (uint64_t)TILEBUF_SZ,                      &a.tilebuf_addr,   RWP },
       { (uint64_t)3 * 4,                           &a.meta_addr,      W   },
+      /* Flat varyings: the provoking vertex's words per emitted primitive.
+       * RASTER never fetches it -- only the fragment kernel does -- so it needs
+       * no physical mapping, unlike the primitive buffer it parallels. */
+      { (uint64_t)P_max * GFX_FS_FLAT_WORDS * 4,   &a.flat_addr,      W   },
    };
-   for (uint32_t i = 0; i < 17; i++) {
+   for (uint32_t i = 0; i < VP_RASTER_POOL_BUFS; i++) {
       if (vx_buffer_create(dev, spec[i].bytes ? spec[i].bytes : 1,
                            spec[i].flags, &pool->bufs[i]) != VX_SUCCESS) {
          mesa_loge("vortexpipe: raster: front-end pool alloc failed");
@@ -207,13 +248,77 @@ vp_pool_ensure(vx_device_h dev, struct vp_raster_pool *pool,
    return true;
 }
 
+/* Fold a multisample pass's colour plane down to one texel per pixel, on the
+ * device. `src` is the sample-interleaved plane every draw of the pass merged
+ * into; `dst` receives the dense single-sample result the host copy reads.
+ *
+ * Launched as its own submission rather than folded into a draw: it has to run
+ * after the last draw of the pass, and a pass may end without one. */
 extern "C" bool
-vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
+vp_raster_resolve_msaa(vx_device_h dev, struct vp_raster_pool *pool,
+                       vx_buffer_h src, vx_buffer_h dst,
+                       uint32_t width, uint32_t height,
+                       uint32_t samples, uint32_t color_format)
+{
+   if (!pool || !src || !dst || samples <= 1 || !width || !height)
+      return false;
+   if (!vp_pool_module(dev, pool))
+      return false;
+
+   vx_queue_h q = NULL;
+   bool ok = false;
+   uint64_t src_dev = 0, dst_dev = 0;
+
+   VP_CHECK(vx_queue_create(dev, 0, &q), "vx_queue_create(resolve)");
+   VP_CHECK(vx_buffer_address(src, &src_dev), "vx_buffer_address(resolve src)");
+   VP_CHECK(vx_buffer_address(dst, &dst_dev), "vx_buffer_address(resolve dst)");
+
+   {
+      resolve_arg_t rarg{};
+      rarg.src_addr     = src_dev;
+      rarg.dst_addr     = dst_dev;
+      rarg.width        = width;
+      rarg.height       = height;
+      rarg.samples      = samples;
+      rarg.color_format = color_format;
+
+      /* One thread per pixel, spread over whatever the device offers; the
+       * kernel is grid-strided, so the geometry only has to be non-empty. */
+      uint32_t n = width * height, gdim[1] = { 1 }, bdim[1] = { 1 };
+      VP_CHECK(vx_device_max_occupancy_grid(dev, 1, &n, gdim, bdim),
+               "vx_device_max_occupancy_grid(resolve)");
+
+      vx_launch_info_t li{};
+      li.struct_size = sizeof(li);
+      li.kernel      = pool->k_resolve;
+      li.args_host   = &rarg;
+      li.args_size   = sizeof(rarg);
+      li.ndim        = 1;
+      li.grid_dim[0]  = gdim[0];
+      li.block_dim[0] = bdim[0];
+
+      vx_command_t cmd{};
+      cmd.type = VX_COMMAND_LAUNCH;
+      cmd.data.launch = &li;
+      VP_CHECK(vx_enqueue_draw(q, &cmd, 1, 0, NULL, NULL), "vx_enqueue_draw(resolve)");
+      VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish(resolve)");
+      ok = true;
+   }
+
+done:
+   if (q) vx_queue_release(q);
+   return ok;
+}
+
+extern "C" bool
+vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
+               struct vp_raster_pool *pool,
                const void *vs_vxbin, size_t vs_vxbin_size,
                vx_module_h *vs_module_io, vx_kernel_h *vs_kernel_io,
                const void *fs_vxbin, size_t fs_vxbin_size,
                vx_module_h *fs_module_io, vx_kernel_h *fs_kernel_io,
                uint32_t vertex_count,
+               uint32_t first_vertex,
                uint32_t instance_count, uint32_t first_instance,
                const struct vp_vs_layout *layout,
                const struct vp_vertex_input *vin,
@@ -225,15 +330,18 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                uint32_t cull_mode,
                bool sw_tex, bool sw_om, bool sw_raster,
                float vp_sx, float vp_tx, float vp_sy, float vp_ty,
+               float vp_min_z, float vp_max_z,
+               const struct vp_scissor_rect *scissor,
                const struct vp_fs_consts *fs_consts,
+               const struct vp_fs_consts *vs_consts,
                const struct vp_mrt_params *mrt)
 {
-   /* A draw targeting >1 colour attachment merges in software (the FF
-    * OM unit is single-attachment), so force the SW-OM path when MRT is active.
-    * The FS was compiled for sw_om (vp_create_fs_state) to match. */
+   /* A draw targeting >1 colour attachment exports once per attachment, and the
+    * merger carries per-attachment state selected by the attachment index the
+    * export address carries. Whether that is legal depends on depth/stencil
+    * WRITE state, which this function cannot see -- the caller decides and says
+    * so through sw_om, because the FS had to be translated for the same answer. */
    const bool mrt_active = mrt && mrt->num_color > 1;
-   if (mrt_active)
-      sw_om = true;
    /* Instancing: the draw runs the whole VS -> expand -> setup -> bin -> raster
     * pipeline over instance_count × verts_per_instance vertices (each instance is
     * just more primitives — the true-GPU shape). verts_per_instance is the
@@ -287,14 +395,41 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
    /* The front-end working set + colour/depth/texture buffers are resident
     * (pool- / context-owned); only the per-draw VS-output + vertex-input
     * buffers are owned here. */
-   vx_buffer_h vsbuf = NULL, vbuf = NULL, tbuf = NULL, fabuf = NULL;
+   vx_buffer_h vsbuf = NULL, tbuf = NULL, fabuf = NULL;
+   /* Borrowed from the screen's residency table -- one per distinct vertex
+    * buffer, resident for the resource's life rather than the draw's. */
+   vx_buffer_h vbufs_dev[8] = { NULL };
    /* Per-draw FS descriptor table + one device buffer per bound fragment
     * constant buffer (push constants / UBOs / descriptor blob). */
    vx_buffer_h fs_desc_buf = NULL;
    vx_buffer_h fs_cbuf_bufs[GFX_FS_DESC_SLOTS] = { NULL };
    vx_buffer_h fs_res_bufs[VP_MAX_DESCS] = { NULL };   /* UBO/SSBO resources */
    uint8_t    *fs_desc_stage[GFX_FS_DESC_SLOTS] = { NULL }; /* per-set relocated blob */
+   /* The same set for the vertex stage. The VS overlays its own meanings on
+    * arg-block slots 0-4, so it reaches its constant buffers only through its
+    * own table, handed to it in VP_ARG_VS_DESC. */
+   vx_buffer_h vs_desc_buf = NULL;
+   vx_buffer_h vs_cbuf_bufs[GFX_FS_DESC_SLOTS] = { NULL };
+   vx_buffer_h vs_res_bufs[VP_MAX_DESCS] = { NULL };
+   uint8_t    *vs_desc_stage[GFX_FS_DESC_SLOTS] = { NULL };
    vx_buffer_h mrtbuf = NULL;                          /* gfx_sw_omcolor_t[] */
+
+   /* Descriptors the shaders write. A store executes against the device copy of
+    * the resource, so without a copy back into the host backing the write is
+    * real on device and invisible to the application. Both stages can carry
+    * one, hence room for both stages' descriptor sets. */
+   struct {
+      vx_buffer_h buf;
+      uint64_t    host;
+      uint32_t    off;
+      uint32_t    size;
+   } wb[2 * VP_MAX_DESCS];
+   uint32_t n_wb = 0;
+
+   /* Acceleration structures the shaders reach, brought across on first use and
+    * released once the queue has drained. Both stages share the one context, so
+    * a structure bound to both is copied once. */
+   struct vp_as_ctx *asc = NULL;
 
    /* kernels resolved from the residency caches below (the modules persist
     * across draws — caller-owned VS/FS slots + the pool's front end). */
@@ -328,18 +463,8 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       }
       k_vs = *vs_kernel_io;
 
-      if (pool->fe_module == NULL) {
-         size_t fe_size = 0;
-         const void *fe_bytes = vp_gfx_frontend_vxbin(vp_xlen_is_64(), &fe_size);
-         VP_CHECK(vx_module_load_bytes(dev, fe_bytes, fe_size, &pool->fe_module),
-                  "vx_module_load_bytes(frontend)");
-         VP_CHECK(vx_module_get_kernel(pool->fe_module, "expand_k", &pool->k_expand),
-                  "vx_module_get_kernel(expand_k)");
-         VP_CHECK(vx_module_get_kernel(pool->fe_module, "setup_k", &pool->k_setup),
-                  "vx_module_get_kernel(setup_k)");
-         VP_CHECK(vx_module_get_kernel(pool->fe_module, "binning_k", &pool->k_binning),
-                  "vx_module_get_kernel(binning_k)");
-      }
+      if (!vp_pool_module(dev, pool))
+         goto done;
       k_expand  = pool->k_expand;
       k_setup   = pool->k_setup;
       k_binning = pool->k_binning;
@@ -392,6 +517,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       arg.cull_mode  = cull_mode;                /* SETUP_CULL_* from the rasterizer state */
       arg.vp_sx = vp_sx; arg.vp_tx = vp_tx;      /* app viewport transform (screen = ndc*scale+bias) */
       arg.vp_sy = vp_sy; arg.vp_ty = vp_ty;      /* negative vp_sy = Vulkan y-flip */
+      arg.vp_minz = vp_min_z; arg.vp_maxz = vp_max_z;
+      /* Vulkan clip z spans [0,w], so the front end must use the Vulkan near
+       * plane and depth map rather than the GL ones the native path feeds it. */
+      arg.vp_halfz = 1u;
 
       /* expand_k arg: on-device vertex assembly expands the resident VS
        * records into the setup_vertex_t[] the front end consumes
@@ -419,8 +548,12 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
        * texstate/omstate descriptors (arg[1]/[2]); SW raster adds the tile-walk
        * counts (arg[3..8]); and the resident FS descriptor table
        * (arg[GFX_FS_ARG_DESC]). The HW path reaches colour/depth via the OM DCRs. */
-      uint64_t argblk[GFX_FS_ARG_APERTURE + 1] = { 0 };
+      uint64_t argblk[GFX_FS_ARG_FLAT + 1] = { 0 };
       argblk[0] = prim_dev;
+      /* Flat varyings ride beside the primitive buffer, indexed by the same
+       * primitive id. The fragment kernel reads it only for a shader that
+       * declares a flat input; every other kernel leaves the slot untouched. */
+      argblk[GFX_FS_ARG_FLAT] = arg.flat_addr;
 
       /* OM aperture geometry: pad the render target to a power of two on each axis
        * so a fragment export's address is a shift, not a multiply. record_shift 3 =
@@ -446,6 +579,11 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
        * pinned by the static_assert above so a llvmpipe layout change fails the
        * build instead of silently corrupting every UBO/SSBO base. */
       const uint32_t VP_JIT_BUF_PTR = 0u, VP_JIT_BUF_SIZE = 8u;
+      /* A storage image's lp_jit_image shares the slot: base pointer at +0
+       * (aliasing lp_jit_buffer.ptr), height at +12, row stride at +24, base
+       * offset at +40. Same layout the compute path reads. */
+      const uint32_t VP_JIT_IMG_BASE = 0u, VP_JIT_IMG_HEIGHT = 12u,
+                     VP_JIT_IMG_ROW_STRIDE = 24u, VP_JIT_IMG_BASE_OFFSET = 40u;
       uint64_t fs_desc_table[GFX_FS_DESC_SLOTS] = { 0 };
       for (uint32_t i = 0; fs_consts && i < GFX_FS_DESC_SLOTS; i++) {
          if (!fs_consts->data[i] || !fs_consts->size[i])
@@ -456,19 +594,105 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
           * resource to device memory + rewrite its lp_jit_buffer.ptr host->device
           * so the FS's load_ubo/load_ssbo dereference resolves on device. Done on
           * a per-set private copy (fs_desc_stage[i]) that outlives vx_queue_finish.
-          * AS descriptors are left untouched (ray-query-in-FS is deferred). */
+          * Every descriptor kind a fragment shader can reach is relocated here;
+          * one left behind keeps the host pointer llvmpipe put in it. */
          bool has_desc = false;
          for (uint32_t d = 0; d < fs_consts->num_descs && d < VP_MAX_DESCS; d++)
-            if (fs_consts->descs[d].kind == VP_DESC_BUFFER &&
+            if ((fs_consts->descs[d].kind == VP_DESC_BUFFER ||
+                 fs_consts->descs[d].kind == VP_DESC_IMAGE ||
+                 fs_consts->descs[d].kind == VP_DESC_AS) &&
                 fs_consts->descs[d].cbuf_index == i) { has_desc = true; break; }
          if (has_desc) {
             fs_desc_stage[i] = (uint8_t *)malloc(fs_consts->size[i]);
             if (!fs_desc_stage[i]) { mesa_loge("vortexpipe: raster: fs desc OOM"); goto done; }
             memcpy(fs_desc_stage[i], fs_consts->data[i], fs_consts->size[i]);
             for (uint32_t d = 0; d < fs_consts->num_descs && d < VP_MAX_DESCS; d++) {
-               if (fs_consts->descs[d].kind != VP_DESC_BUFFER ||
-                   fs_consts->descs[d].cbuf_index != i)
+               if (fs_consts->descs[d].cbuf_index != i)
                   continue;
+               if (fs_consts->descs[d].kind == VP_DESC_AS) {
+                  /* Acceleration structure: lp_descriptor.accel_struct holds the
+                   * host root at +0. Its links to the structures beneath it are
+                   * absolute addresses, so each is brought across and the link
+                   * rewritten -- a byte copy would leave the device a tree whose
+                   * branches still point into host memory. */
+                  const uint32_t aoff = fs_consts->descs[d].offset;
+                  if (aoff + 8u > fs_consts->size[i]) {
+                     continue;
+                  }
+                  uint8_t *slot = fs_desc_stage[i] + aoff;
+                  uint64_t tlas_host = 0;
+                  memcpy(&tlas_host, slot, sizeof tlas_host);
+                  if (!tlas_host) {
+                     continue;
+                  }
+                  if (!asc) {
+                     asc = vp_as_begin(dev, q, vp_screen_has_rtu(screen));
+                     if (!asc) {
+                        mesa_loge("vortexpipe: raster: no acceleration-structure context");
+                        goto done;
+                     }
+                  }
+                  const uint64_t tlas_dev = vp_as_relocate(asc, tlas_host);
+                  if (!vp_as_ok(asc)) {
+                     mesa_loge("vortexpipe: raster: FS acceleration-structure copy failed");
+                     goto done;
+                  }
+                  memcpy(slot, &tlas_dev, sizeof tlas_dev);
+                  continue;
+               }
+               if (fs_consts->descs[d].kind == VP_DESC_IMAGE) {
+                  /* Storage image: the same treatment as a buffer, over the
+                   * image's own layout. Its extent is height x row stride from
+                   * the base offset, the fields llvmpipe filled in. */
+                  const uint32_t ioff = fs_consts->descs[d].offset;
+                  if (ioff + VP_JIT_IMG_BASE_OFFSET + 4u > fs_consts->size[i]) {
+                     continue;
+                  }
+                  uint8_t *slot = fs_desc_stage[i] + ioff;
+                  uint64_t img_host = 0; uint16_t img_h = 0;
+                  uint32_t img_row = 0, img_base_off = 0;
+                  memcpy(&img_host,     slot + VP_JIT_IMG_BASE,        sizeof img_host);
+                  memcpy(&img_h,        slot + VP_JIT_IMG_HEIGHT,      sizeof img_h);
+                  memcpy(&img_row,      slot + VP_JIT_IMG_ROW_STRIDE,  sizeof img_row);
+                  memcpy(&img_base_off, slot + VP_JIT_IMG_BASE_OFFSET, sizeof img_base_off);
+                  if (!img_host || !img_h || !img_row) {
+                     continue;
+                  }
+                  const uint32_t isize = img_base_off + (uint32_t)img_h * img_row;
+                  uint32_t ires_off = 0;
+                  bool ires_dirty = true;
+                  uint64_t idev = vp_screen_resident_addr(screen,
+                                                          (const void *)(uintptr_t)img_host,
+                                                          isize, &fs_res_bufs[d],
+                                                          &ires_off, &ires_dirty);
+                  if (!idev) {
+                     mesa_loge("vortexpipe: raster: no device memory for FS image");
+                     goto done;
+                  }
+                  /* Uploaded even when only written: a shader may store to part
+                   * of an image and leave the rest, and the untouched part has
+                   * to come back as it went in. */
+                  if (ires_dirty) {
+                     VP_CHECK(vx_enqueue_write(q, fs_res_bufs[d], ires_off,
+                                               (void *)(uintptr_t)img_host, isize,
+                                               0, NULL, NULL),
+                              "vx_enqueue_write(fs_image)");
+                     vp_screen_resident_clean(screen,
+                                              (const void *)(uintptr_t)img_host, isize);
+                  }
+                  memcpy(slot + VP_JIT_IMG_BASE, &idev, sizeof idev);
+                  if (fs_consts->descs[d].writable && n_wb < ARRAY_SIZE(wb)) {
+                     wb[n_wb].buf  = fs_res_bufs[d];
+                     wb[n_wb].host = img_host;
+                     wb[n_wb].off  = ires_off;
+                     wb[n_wb].size = isize;
+                     n_wb++;
+                  }
+                  continue;
+               }
+               if (fs_consts->descs[d].kind != VP_DESC_BUFFER) {
+                  continue;
+               }
                uint32_t off = fs_consts->descs[d].offset;
                if (off + VP_JIT_BUF_SIZE + 4u > fs_consts->size[i])
                   continue;
@@ -480,15 +704,36 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                                            ? fs_consts->descs[d].elem_bytes : 1u);
                if (!host_ptr || !rsz)
                   continue;
-               VP_CHECK(vx_buffer_create(dev, rsz, 0, &fs_res_bufs[d]),
-                        "vx_buffer_create(fs_res)");
-               uint64_t res_dev = 0;
-               VP_CHECK(vx_buffer_address(fs_res_bufs[d], &res_dev),
-                        "vx_buffer_address(fs_res)");
-               VP_CHECK(vx_enqueue_write(q, fs_res_bufs[d], 0,
-                                         (void *)(uintptr_t)host_ptr, rsz, 0, NULL, NULL),
-                        "vx_enqueue_write(fs_res)");
+               /* Resident: this is a host resource addressed by pointer, the
+                * same shape as the compute descriptor path, and the draw only
+                * uploads it -- nothing is read back, so reusing the device
+                * buffer across draws costs nothing and saves an allocation per
+                * draw. The handle is borrowed from the screen and must not be
+                * released with the draw. */
+               uint32_t res_off = 0;
+               bool res_dirty = true;
+               uint64_t res_dev = vp_screen_resident_addr(screen,
+                                                          (const void *)(uintptr_t)host_ptr,
+                                                          rsz, &fs_res_bufs[d], &res_off,
+                                                          &res_dirty);
+               if (!res_dev) {
+                  mesa_loge("vortexpipe: raster: no device memory for FS resource");
+                  goto done;
+               }
+               if (res_dirty) {
+                  VP_CHECK(vx_enqueue_write(q, fs_res_bufs[d], res_off,
+                                            (void *)(uintptr_t)host_ptr, rsz, 0, NULL, NULL),
+                           "vx_enqueue_write(fs_res)");
+                  vp_screen_resident_clean(screen, (const void *)(uintptr_t)host_ptr, rsz);
+               }
                memcpy(fs_desc_stage[i] + off + VP_JIT_BUF_PTR, &res_dev, sizeof res_dev);
+               if (fs_consts->descs[d].writable && n_wb < ARRAY_SIZE(wb)) {
+                  wb[n_wb].buf  = fs_res_bufs[d];
+                  wb[n_wb].host = host_ptr;
+                  wb[n_wb].off  = res_off;
+                  wb[n_wb].size = rsz;
+                  n_wb++;
+               }
             }
             upload = fs_desc_stage[i];
          }
@@ -516,15 +761,45 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
        * device address (arg[1]). The FS (compiled with sw_tex) then samples via
        * gfx_tex_sample_sw over the LSU instead of the FF TEX unit. The descriptor
        * outlives vx_enqueue_draw / vx_queue_finish (declared in this scope). */
+      /* Build the resident descriptor whenever a texture is bound, not only for
+       * sw_tex: the HW-tex FS reads logdim from it to compute the mip LOD
+       * (vx_tex_auto_lod), since the TEX DCRs are host-write-only. The SW sampler
+       * additionally consumes format/filter/wrap/mip_off/base from it. */
       gfx_sw_texstate_t texstate{};
-      if (sw_tex && tex_dev && tex) {
+      if (tex_dev && tex) {
          texstate.base   = tex_dev;
          for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i)
-            texstate.mip_off[i] = 0;   /* single mip (gfx-v1 textures) */
+            texstate.mip_off[i] = tex->mip_off[i];
          texstate.logdim = (vp_log2u(tex->height) << 16) | vp_log2u(tex->width);
-         texstate.format = VX_TEX_FORMAT_A8R8G8B8;
-         texstate.filter = tex->filter;
+         /* Depth formats (sampler2DShadow) carry the real VX format so the SW
+          * sampler reads/compares raw depth; colour textures stay A8R8G8B8. */
+         texstate.format = tex->format ? tex->format : VX_TEX_FORMAT_A8R8G8B8;
+         texstate.compare_func = tex->compare_func;
+         texstate.swizzle = tex->swizzle;
+         texstate.layer_stride = tex->layer_stride;
+         texstate.min_lod  = tex->min_lod;
+         texstate.max_lod  = tex->max_lod;
+         texstate.lod_bias = tex->lod_bias;
+         texstate.depth    = tex->depth;
+         texstate.wrap_w   = tex->wrap_w;
+         /* Descriptor-only filter bits (the FS reads them; they never reach the HW
+          * TEX_FILTER DCR below): mag tap (bit0, from tex->filter), min tap (bit3),
+          * mip-linear (bit1), mip-enable (bit2), NPOT (bit4) and extended format
+          * (bit5). A mipmapped, non-power-of-two OR extended-format sampler routes
+          * to the SW sampler, which resolves min-vs-mag per fragment from these,
+          * addresses NPOT by width/height, and decodes the extended formats the FF
+          * unit has neither a decoder nor a texel stride for. */
+         const bool tex_pot = tex->width && tex->height
+            && !(tex->width & (tex->width - 1u)) && !(tex->height & (tex->height - 1u));
+         texstate.filter = tex->filter
+            | (tex->min_filter == VX_TEX_FILTER_BILINEAR ? GFX_SW_TEX_FILTER_MIN_BILINEAR : 0u)
+            | (tex->mip_linear ? VX_TEX_FILTER_MIP_LINEAR : 0u)
+            | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u)
+            | (tex_pot ? 0u : GFX_SW_TEX_FILTER_NPOT)
+            | (texstate.format > (uint32_t)VX_TEX_FORMAT_FF_MAX
+                  ? GFX_SW_TEX_FILTER_EXT_FORMAT : 0u);
          texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
+         texstate.border = tex->border;
          /* Carry the mip-0 integer dims so the SW sampler can address NPOT
           * textures (multiply addressing). POT textures leave width==1<<logdim
           * so the sampler keeps the bit-exact shift path. */
@@ -553,13 +828,16 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
                                                   : (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS;
          omstate.depth_writemask = om->depth_write ? 1u : 0u;
          for (int f = 0; f < 2; ++f) {
-            omstate.stencil_func[f]      = VX_OM_DEPTH_FUNC_ALWAYS;
-            omstate.stencil_zpass[f]     = VX_OM_STENCIL_OP_KEEP;
-            omstate.stencil_zfail[f]     = VX_OM_STENCIL_OP_KEEP;
-            omstate.stencil_fail[f]      = VX_OM_STENCIL_OP_KEEP;
-            omstate.stencil_ref[f]       = 0;
-            omstate.stencil_mask[f]      = OM_STENCIL_MASK;
-            omstate.stencil_writemask[f] = 0;
+            /* Unpack the same front/back halves the FF DCRs carry, so a draw
+             * that routes to the software merger produces identical pixels. */
+            const int sh = f * 16;
+            omstate.stencil_func[f]      = (om->stencil_func      >> sh) & 0xffff;
+            omstate.stencil_zpass[f]     = (om->stencil_zpass     >> sh) & 0xffff;
+            omstate.stencil_zfail[f]     = (om->stencil_zfail     >> sh) & 0xffff;
+            omstate.stencil_fail[f]      = (om->stencil_fail      >> sh) & 0xffff;
+            omstate.stencil_ref[f]       = (om->stencil_ref       >> sh) & 0xffff;
+            omstate.stencil_mask[f]      = (om->stencil_mask      >> sh) & 0xffff;
+            omstate.stencil_writemask[f] = (om->stencil_writemask >> sh) & 0xffff;
          }
          omstate.blend_mode_rgb = om->blend_mode & 0xffff;
          omstate.blend_mode_a   = om->blend_mode >> 16;
@@ -567,17 +845,26 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          omstate.blend_src_a    = (om->blend_func >> 8)  & 0xff;
          omstate.blend_dst_rgb  = (om->blend_func >> 16) & 0xff;
          omstate.blend_dst_a    = (om->blend_func >> 24) & 0xff;
-         omstate.blend_const    = 0;
-         omstate.logic_op       = 0;
+         omstate.blend_const    = om->blend_const;
+         omstate.logic_op       = om->logic_op;
          omstate.zbuf_base      = depth_dev;
          omstate.cbuf_base      = color_dev;
-         omstate.zbuf_pitch     = width * 4;
-         omstate.cbuf_pitch     = width * 4;
+         /* The merger addresses a pixel's samples contiguously within its row,
+          * so the pitch it reads is the multisample row stride, not the pixel
+          * row width. At one sample the two are the same. */
+         omstate.zbuf_pitch     = width * 4 * om->samples;
+         omstate.cbuf_pitch     = width * om->color_bpp * om->samples;
+         omstate.color_format   = om->color_format;
          omstate.cbuf_writemask4 = om->colormask;
          /* resolve_om_state (host-side derivation, mirrors gfx_sw.h) */
          omstate.depth_enabled = !((omstate.depth_func == (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS)
                                 && !(omstate.depth_writemask & 1u));
-         omstate.stencil_enabled[0] = omstate.stencil_enabled[1] = 0;  /* ALWAYS/KEEP */
+         for (int f = 0; f < 2; ++f) {
+            omstate.stencil_enabled[f] =
+               !((omstate.stencil_func[f]  == (uint32_t)VX_OM_DEPTH_FUNC_ALWAYS)
+              && (omstate.stencil_zpass[f] == (uint32_t)VX_OM_STENCIL_OP_KEEP)
+              && (omstate.stencil_zfail[f] == (uint32_t)VX_OM_STENCIL_OP_KEEP));
+         }
          omstate.blend_enabled = !((omstate.blend_mode_rgb == (uint32_t)VX_OM_BLEND_MODE_ADD)
                                 && (omstate.blend_mode_a   == (uint32_t)VX_OM_BLEND_MODE_ADD)
                                 && (omstate.blend_src_rgb  == (uint32_t)VX_OM_BLEND_FUNC_ONE)
@@ -622,8 +909,13 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
             rt[k].blend_src_a    = (mrt->blend_func[k] >> 8)  & 0xff;
             rt[k].blend_dst_rgb  = (mrt->blend_func[k] >> 16) & 0xff;
             rt[k].blend_dst_a    = (mrt->blend_func[k] >> 24) & 0xff;
-            rt[k].blend_const    = 0;
-            rt[k].logic_op       = 0;
+            /* The logic op is pipeline-wide in Vulkan, so every attachment
+             * carries the value the scalar path uses. Storage and the blend
+             * constant are the attachment's own -- the constant because its
+             * channel order follows the target it is blended into. */
+            rt[k].logic_op       = om->logic_op;
+            rt[k].blend_const    = mrt->blend_const[k];
+            rt[k].color_format   = mrt->color_format[k];
             rt[k].cbuf_writemask4 = mrt->colormask[k];
             rt[k].blend_enabled  = !((rt[k].blend_mode_rgb == (uint32_t)VX_OM_BLEND_MODE_ADD)
                                   && (rt[k].blend_mode_a   == (uint32_t)VX_OM_BLEND_MODE_ADD)
@@ -650,21 +942,43 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
        * output). The table is indexed by VS input driver_location. Both the
        * table and the VS arg block are declared here so they outlive
        * vx_enqueue_draw (async uploads + submit-time arg copy). */
-      uint32_t vs_attr_table[VP_ATTR_TABLE_LOCS * 2] = { 0 };
+      uint32_t vs_attr_table[VP_ATTR_TABLE_LOCS * VP_ATTR_ENTRY_WORDS] = { 0 };
       uint64_t vs_argblk[VP_ARG_SLOTS] = { 0 };
       vs_argblk[0] = vs_out_dev;
       if (vin && vin->num_attrs) {
-         VP_CHECK(vx_buffer_create(dev, vin->size, 0, &vbuf), "vx_buffer_create(vbuf)");
-         uint64_t vbuf_dev = 0;
-         VP_CHECK(vx_buffer_address(vbuf, &vbuf_dev), "vx_buffer_address(vbuf)");
-         VP_CHECK(vx_enqueue_write(q, vbuf, 0, vin->data, vin->size, 0, NULL, NULL),
-                  "vx_enqueue_write(vbuf)");
+         /* Upload each distinct vertex-buffer resource once; an attribute then
+          * points at its own buffer's device base + its byte offset. */
+         uint64_t buf_dev[8] = { 0 };
+         uint32_t buf_off[8] = { 0 };
+         for (uint32_t j = 0; j < vin->num_bufs; j++) {
+            /* Resident: buf_data[j] is the whole vertex-buffer resource, so the
+             * entry keys on exactly the resource's range and every later draw
+             * from the same geometry resolves to the same device buffer instead
+             * of allocating a new one per draw. */
+            bool vdirty = true;
+            buf_dev[j] = vp_screen_resident_addr(screen, vin->buf_data[j],
+                                                 vin->buf_size[j],
+                                                 &vbufs_dev[j], &buf_off[j], &vdirty);
+            if (!buf_dev[j]) {
+               mesa_loge("vortexpipe: raster: no device memory for vertex buffer");
+               goto done;
+            }
+            if (vdirty) {
+               VP_CHECK(vx_enqueue_write(q, vbufs_dev[j], buf_off[j], vin->buf_data[j],
+                                         vin->buf_size[j], 0, NULL, NULL),
+                        "vx_enqueue_write(vbuf)");
+               vp_screen_resident_clean(screen, vin->buf_data[j], vin->buf_size[j]);
+            } else {
+               vp_dbg("vortexpipe: raster: vbuf upload skipped (clean)");
+            }
+         }
          for (uint32_t i = 0; i < vin->num_attrs; i++) {
             uint32_t loc = vin->attr_loc[i];
             if (loc >= VP_ATTR_TABLE_LOCS) continue;
-            vs_attr_table[loc * 2 + 0] = (uint32_t)vbuf_dev + vin->base_offset
-                                       + vin->attr_offset[i];
-            vs_attr_table[loc * 2 + 1] = vin->attr_stride[i];
+            uint32_t *e = &vs_attr_table[loc * VP_ATTR_ENTRY_WORDS];
+            e[0] = (uint32_t)buf_dev[vin->attr_buf[i]] + vin->attr_offset[i];
+            e[1] = vin->attr_stride[i];
+            e[2] = vin->attr_divisor[i];
          }
          VP_CHECK(vx_buffer_create(dev, sizeof(vs_attr_table), 0, &tbuf),
                   "vx_buffer_create(attrtab)");
@@ -686,6 +1000,163 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       const bool instanced = (inst_count > 1) || (first_instance != 0);
       vs_argblk[3] = instanced ? verts_per_instance : 0;
       vs_argblk[4] = first_instance;
+      /* Slot 5: base vertex. Vulkan defines gl_VertexIndex as firstVertex + i,
+       * but the vid the VS computes is the 0-based draw position because the
+       * host already folded firstVertex into the attribute base addresses. The
+       * shader-visible index therefore needs the base back, and only there --
+       * adding it to the vid would offset the attribute fetch twice. Zero for
+       * an indexed draw, where the vid is already the absolute index value. */
+      vs_argblk[5] = index_dev ? 0u : first_vertex;
+
+      /* slot VP_ARG_VS_DESC: the vertex stage's constant-buffer table, built
+       * exactly like the fragment one above -- upload each bound VS constant
+       * buffer, relocating any UBO/SSBO descriptor's lp_jit_buffer.ptr
+       * host->device so the VS's load_ubo/load_ssbo dereference resolves on
+       * device, then a table of their device base addresses. Always uploaded,
+       * zero-filled when the VS binds nothing, so the VS's table reads never
+       * dereference a null pointer. Slots 0-4 carry vertex meanings, so without
+       * this table a VS UBO read resolves against the attribute table and a
+       * push-constant read against the VS output buffer. */
+      uint64_t vs_desc_table[GFX_FS_DESC_SLOTS] = { 0 };
+      for (uint32_t i = 0; vs_consts && i < GFX_FS_DESC_SLOTS; i++) {
+         if (!vs_consts->data[i] || !vs_consts->size[i])
+            continue;
+         const void *upload = vs_consts->data[i];
+         bool has_desc = false;
+         for (uint32_t d = 0; d < vs_consts->num_descs && d < VP_MAX_DESCS; d++)
+            if ((vs_consts->descs[d].kind == VP_DESC_BUFFER ||
+                 vs_consts->descs[d].kind == VP_DESC_IMAGE ||
+                 vs_consts->descs[d].kind == VP_DESC_AS) &&
+                vs_consts->descs[d].cbuf_index == i) { has_desc = true; break; }
+         if (has_desc) {
+            vs_desc_stage[i] = (uint8_t *)malloc(vs_consts->size[i]);
+            if (!vs_desc_stage[i]) { mesa_loge("vortexpipe: raster: vs desc OOM"); goto done; }
+            memcpy(vs_desc_stage[i], vs_consts->data[i], vs_consts->size[i]);
+            for (uint32_t d = 0; d < vs_consts->num_descs && d < VP_MAX_DESCS; d++) {
+               if (vs_consts->descs[d].cbuf_index != i)
+                  continue;
+               if (vs_consts->descs[d].kind == VP_DESC_AS) {
+                  /* Acceleration structure, as in the fragment loop above: the
+                   * relocation is the structure's own, not the stage's, so both
+                   * stages share the one context and a structure bound to both
+                   * is brought across once. */
+                  const uint32_t aoff = vs_consts->descs[d].offset;
+                  if (aoff + 8u > vs_consts->size[i]) {
+                     continue;
+                  }
+                  uint8_t *slot = vs_desc_stage[i] + aoff;
+                  uint64_t tlas_host = 0;
+                  memcpy(&tlas_host, slot, sizeof tlas_host);
+                  if (!tlas_host) {
+                     continue;
+                  }
+                  if (!asc) {
+                     asc = vp_as_begin(dev, q, vp_screen_has_rtu(screen));
+                     if (!asc) {
+                        mesa_loge("vortexpipe: raster: no acceleration-structure context");
+                        goto done;
+                     }
+                  }
+                  const uint64_t tlas_dev = vp_as_relocate(asc, tlas_host);
+                  if (!vp_as_ok(asc)) {
+                     mesa_loge("vortexpipe: raster: VS acceleration-structure copy failed");
+                     goto done;
+                  }
+                  memcpy(slot, &tlas_dev, sizeof tlas_dev);
+                  continue;
+               }
+               if (vs_consts->descs[d].kind == VP_DESC_IMAGE) {
+                  /* Storage image, over lp_jit_image's layout. This loop gives
+                   * each descriptor its own buffer written at 0, so the image
+                   * follows that rather than the screen's residency table. */
+                  const uint32_t ioff = vs_consts->descs[d].offset;
+                  if (ioff + VP_JIT_IMG_BASE_OFFSET + 4u > vs_consts->size[i]) {
+                     continue;
+                  }
+                  uint8_t *slot = vs_desc_stage[i] + ioff;
+                  uint64_t img_host = 0; uint16_t img_h = 0;
+                  uint32_t img_row = 0, img_base_off = 0;
+                  memcpy(&img_host,     slot + VP_JIT_IMG_BASE,        sizeof img_host);
+                  memcpy(&img_h,        slot + VP_JIT_IMG_HEIGHT,      sizeof img_h);
+                  memcpy(&img_row,      slot + VP_JIT_IMG_ROW_STRIDE,  sizeof img_row);
+                  memcpy(&img_base_off, slot + VP_JIT_IMG_BASE_OFFSET, sizeof img_base_off);
+                  if (!img_host || !img_h || !img_row) {
+                     continue;
+                  }
+                  const uint32_t isize = img_base_off + (uint32_t)img_h * img_row;
+                  VP_CHECK(vx_buffer_create(dev, isize, 0, &vs_res_bufs[d]),
+                           "vx_buffer_create(vs_image)");
+                  uint64_t idev = 0;
+                  VP_CHECK(vx_buffer_address(vs_res_bufs[d], &idev),
+                           "vx_buffer_address(vs_image)");
+                  VP_CHECK(vx_enqueue_write(q, vs_res_bufs[d], 0,
+                                            (void *)(uintptr_t)img_host, isize,
+                                            0, NULL, NULL),
+                           "vx_enqueue_write(vs_image)");
+                  memcpy(slot + VP_JIT_IMG_BASE, &idev, sizeof idev);
+                  if (vs_consts->descs[d].writable && n_wb < ARRAY_SIZE(wb)) {
+                     wb[n_wb].buf  = vs_res_bufs[d];
+                     wb[n_wb].host = img_host;
+                     wb[n_wb].off  = 0;
+                     wb[n_wb].size = isize;
+                     n_wb++;
+                  }
+                  continue;
+               }
+               if (vs_consts->descs[d].kind != VP_DESC_BUFFER) {
+                  continue;
+               }
+               uint32_t off = vs_consts->descs[d].offset;
+               if (off + VP_JIT_BUF_SIZE + 4u > vs_consts->size[i])
+                  continue;
+               uint64_t host_ptr = 0; uint32_t num_elems = 0;
+               memcpy(&host_ptr,  vs_desc_stage[i] + off + VP_JIT_BUF_PTR,  sizeof host_ptr);
+               memcpy(&num_elems, vs_desc_stage[i] + off + VP_JIT_BUF_SIZE, sizeof num_elems);
+               uint32_t rsz = num_elems * (vs_consts->descs[d].elem_bytes
+                                           ? vs_consts->descs[d].elem_bytes : 1u);
+               if (!host_ptr || !rsz)
+                  continue;
+               VP_CHECK(vx_buffer_create(dev, rsz, 0, &vs_res_bufs[d]),
+                        "vx_buffer_create(vs_res)");
+               uint64_t res_dev = 0;
+               VP_CHECK(vx_buffer_address(vs_res_bufs[d], &res_dev),
+                        "vx_buffer_address(vs_res)");
+               VP_CHECK(vx_enqueue_write(q, vs_res_bufs[d], 0,
+                                         (void *)(uintptr_t)host_ptr, rsz, 0, NULL, NULL),
+                        "vx_enqueue_write(vs_res)");
+               memcpy(vs_desc_stage[i] + off + VP_JIT_BUF_PTR, &res_dev, sizeof res_dev);
+               if (vs_consts->descs[d].writable && n_wb < ARRAY_SIZE(wb)) {
+                  /* This path allocates a buffer per descriptor and writes it
+                   * at 0, so the readback starts there too. */
+                  wb[n_wb].buf  = vs_res_bufs[d];
+                  wb[n_wb].host = host_ptr;
+                  wb[n_wb].off  = 0;
+                  wb[n_wb].size = rsz;
+                  n_wb++;
+               }
+            }
+            upload = vs_desc_stage[i];
+         }
+         VP_CHECK(vx_buffer_create(dev, vs_consts->size[i], 0, &vs_cbuf_bufs[i]),
+                  "vx_buffer_create(vs_cbuf)");
+         uint64_t cb_dev = 0;
+         VP_CHECK(vx_buffer_address(vs_cbuf_bufs[i], &cb_dev),
+                  "vx_buffer_address(vs_cbuf)");
+         VP_CHECK(vx_enqueue_write(q, vs_cbuf_bufs[i], 0, upload,
+                                   vs_consts->size[i], 0, NULL, NULL),
+                  "vx_enqueue_write(vs_cbuf)");
+         vs_desc_table[i] = cb_dev;
+      }
+      VP_CHECK(vx_buffer_create(dev, sizeof(vs_desc_table), 0, &vs_desc_buf),
+               "vx_buffer_create(vs_desc)");
+      uint64_t vs_desc_dev = 0;
+      VP_CHECK(vx_buffer_address(vs_desc_buf, &vs_desc_dev),
+               "vx_buffer_address(vs_desc)");
+      VP_CHECK(vx_enqueue_write(q, vs_desc_buf, 0, vs_desc_table,
+                                sizeof(vs_desc_table), 0, NULL, NULL),
+               "vx_enqueue_write(vs_desc)");
+      vs_argblk[VP_ARG_VS_COUNT] = total_verts;
+      vs_argblk[VP_ARG_VS_DESC] = vs_desc_dev;
 
       /* FS launch fills every HW lane: block = threads × warps (one CTA/core),
        * grid = cores. (nt/nw/nc queried above for the VS geometry.)
@@ -810,8 +1281,41 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_RASTER_TILE_COUNT,  num_bins);
       DCRW(VX_DCR_RASTER_PBUF_ADDR,   (uint32_t)(prim_dev / 64));
       DCRW(VX_DCR_RASTER_PBUF_STRIDE, VP_RAST_PRIM_STRIDE);
-      DCRW(VX_DCR_RASTER_SCISSOR_X,   (width  << 16) | 0);
-      DCRW(VX_DCR_RASTER_SCISSOR_Y,   (height << 16) | 0);
+      /* Scissor to the viewport's screen rect so an offset/partial viewport
+       * rasters only within its rectangle (the device applies the vp scale/bias
+       * transform, but the coverage walk must be clamped to the vp rect too). A
+       * full-framebuffer viewport yields [0,W]x[0,H] — identical to the old
+       * hardcoded scissor. rect = bias ± |scale|, clamped to the framebuffer. */
+      float asx = vp_sx < 0 ? -vp_sx : vp_sx, asy = vp_sy < 0 ? -vp_sy : vp_sy;
+      int32_t sxmin = (int32_t)(vp_tx - asx + 0.5f), sxmax = (int32_t)(vp_tx + asx + 0.5f);
+      int32_t symin = (int32_t)(vp_ty - asy + 0.5f), symax = (int32_t)(vp_ty + asy + 0.5f);
+      if (sxmin < 0) {
+         sxmin = 0;
+      }
+      if (sxmax > (int32_t)width) {
+         sxmax = (int32_t)width;
+      }
+      if (symin < 0) {
+         symin = 0;
+      }
+      if (symax > (int32_t)height) {
+         symax = (int32_t)height;
+      }
+      /* Intersect the app's scissor. It is a second, independent rectangle:
+       * a draw may scissor strictly inside its viewport, and every fragment
+       * outside the intersection must be discarded. An empty result collapses
+       * to a zero-area rect rather than going negative, which the coverage
+       * walk reads as "no pixels". */
+      if (scissor) {
+         if ((int32_t)scissor->minx > sxmin) { sxmin = (int32_t)scissor->minx; }
+         if ((int32_t)scissor->maxx < sxmax) { sxmax = (int32_t)scissor->maxx; }
+         if ((int32_t)scissor->miny > symin) { symin = (int32_t)scissor->miny; }
+         if ((int32_t)scissor->maxy < symax) { symax = (int32_t)scissor->maxy; }
+         if (sxmax < sxmin) { sxmax = sxmin; }
+         if (symax < symin) { symax = symin; }
+      }
+      DCRW(VX_DCR_RASTER_SCISSOR_X,   ((uint32_t)sxmax << 16) | (uint32_t)sxmin);
+      DCRW(VX_DCR_RASTER_SCISSOR_Y,   ((uint32_t)symax << 16) | (uint32_t)symin);
       /* Arm the fragment work distributor: FS entry PC + device args pointer.
        * The RASTER unit injects a fragment warp per covered quad only
        * when FRAG_ENTRY is non-zero — without this the grid-less FS never runs. */
@@ -824,24 +1328,42 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       /* FF OM config — skipped when OM is routed to software (the FS merges via
        * gfx_om_fragment_sw from the resident om descriptor instead). */
       if (!sw_om) {
-      DCRW(VX_DCR_OM_CBUF_ADDR,        (uint32_t)(color_dev / 64));
-      DCRW(VX_DCR_OM_CBUF_PITCH,       width * 4);
-      DCRW(VX_DCR_OM_CBUF_WRITEMASK,   om->colormask);
+      /* Per-attachment merger state. VX_DCR_OM_RT_SELECT latches which
+       * attachment the colour/blend registers below land in, so each one is
+       * programmed under its own select. Written even for a single attachment:
+       * the select is sticky, and a stale one from a previous MRT draw would
+       * silently retarget this draw's colour writes. */
+      for (uint32_t k = 0; k < (mrt_active ? mrt->num_color : 1u); k++) {
+         DCRW(VX_DCR_OM_RT_SELECT,     k);
+         DCRW(VX_DCR_OM_CBUF_ADDR,     (uint32_t)((mrt_active ? mrt->color_dev[k]
+                                                              : color_dev) / 64));
+         DCRW(VX_DCR_OM_CBUF_PITCH,    mrt_active ? mrt->pitch[k] : width * 4);
+         DCRW(VX_DCR_OM_CBUF_WRITEMASK, mrt_active ? mrt->colormask[k]
+                                                   : om->colormask);
+         DCRW(VX_DCR_OM_BLEND_MODE,    mrt_active ? mrt->blend_mode[k]
+                                                  : om->blend_mode);
+         DCRW(VX_DCR_OM_BLEND_FUNC,    mrt_active ? mrt->blend_func[k]
+                                                  : om->blend_func);
+         DCRW(VX_DCR_OM_BLEND_CONST,   mrt_active ? mrt->blend_const[k]
+                                                  : om->blend_const);
+         /* The logic op is pipeline-wide in Vulkan, so every attachment gets
+          * the same one -- it is written per attachment only because the
+          * register lives behind the select. */
+         DCRW(VX_DCR_OM_LOGIC_OP,      om->logic_op);
+      }
+      DCRW(VX_DCR_OM_RT_SELECT,        0);
       DCRW(VX_DCR_OM_ZBUF_ADDR,        (uint32_t)(depth_dev / 64));
       DCRW(VX_DCR_OM_ZBUF_PITCH,       width * 4);
       DCRW(VX_DCR_OM_DEPTH_FUNC,       om->depth_test ? om->depth_func : VX_OM_DEPTH_FUNC_ALWAYS);
       DCRW(VX_DCR_OM_DEPTH_WRITEMASK,  (om->depth_test && om->depth_write) ? 1u : 0u);
-      DCRW(VX_DCR_OM_STENCIL_FUNC,      VX_OM_DEPTH_FUNC_ALWAYS);
-      DCRW(VX_DCR_OM_STENCIL_ZPASS,     VX_OM_STENCIL_OP_KEEP);
-      DCRW(VX_DCR_OM_STENCIL_ZFAIL,     VX_OM_STENCIL_OP_KEEP);
-      DCRW(VX_DCR_OM_STENCIL_FAIL,      VX_OM_STENCIL_OP_KEEP);
-      DCRW(VX_DCR_OM_STENCIL_REF,       0);
-      DCRW(VX_DCR_OM_STENCIL_MASK,      0xFF);
-      DCRW(VX_DCR_OM_STENCIL_WRITEMASK, 0);
-      DCRW(VX_DCR_OM_BLEND_MODE,        om->blend_mode);
-      DCRW(VX_DCR_OM_BLEND_FUNC,        om->blend_func);
-      DCRW(VX_DCR_OM_BLEND_CONST,       0);
-      DCRW(VX_DCR_OM_LOGIC_OP,          0);
+      DCRW(VX_DCR_OM_STENCIL_FUNC,      om->stencil_func);
+      DCRW(VX_DCR_OM_STENCIL_ZPASS,     om->stencil_zpass);
+      DCRW(VX_DCR_OM_STENCIL_ZFAIL,     om->stencil_zfail);
+      DCRW(VX_DCR_OM_STENCIL_FAIL,      om->stencil_fail);
+      DCRW(VX_DCR_OM_STENCIL_REF,       om->stencil_ref);
+      DCRW(VX_DCR_OM_STENCIL_MASK,      om->stencil_mask);
+      DCRW(VX_DCR_OM_STENCIL_WRITEMASK, om->stencil_writemask);
+      DCRW(VX_DCR_OM_EARLYZ_SAFE,       om->earlyz_safe ? 1u : 0u);
 
       /* OM aperture: a fragment export is a store into a virtual address range
        * that the cluster's OM ingress peels off the L1->L2 trunk. The address is
@@ -854,9 +1376,10 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       DCRW(VX_DCR_OM_APERTURE_DEPTH_ONLY,   0);
       }
 
-      /* TEX unit (stage 0): the texels are residency-cached at tex_dev
-       * (A8R8G8B8); program the sampler. Untextured draws (tex_dev==0) leave
-       * TEX state alone. SW-textured draws (sw_tex) skip the FF TEX config —
+      /* TEX unit (stage 0): the texels are residency-cached at tex_dev (A8R8G8B8
+       * for the FF formats this path serves); program the sampler. Untextured
+       * draws (tex_dev==0) leave TEX state alone. SW-textured draws (sw_tex)
+       * skip the FF TEX config —
        * the FS samples in software from the resident descriptor (argblk[1]). */
       if (tex_dev && tex && !sw_tex) {
          uint32_t logw = vp_log2u(tex->width);
@@ -866,8 +1389,17 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
          DCRW(VX_DCR_TEX_FORMAT,       VX_TEX_FORMAT_A8R8G8B8);
          DCRW(VX_DCR_TEX_FILTER,       tex->filter);
          DCRW(VX_DCR_TEX_WRAP,         (tex->wrap_v << 16) | tex->wrap_u);
+         /* The colour a tap outside [0,1) resolves to under WRAP_BORDER. The
+          * unit substitutes it after the format decode, so it is already in the
+          * decoded ARGB8888 the blend works in. Written unconditionally: it is
+          * read only for a border wrap, and a stale value under any other wrap
+          * would be a state leak between draws. */
+         DCRW(VX_DCR_TEX_BORDER,       tex->border);
          DCRW(VX_DCR_TEX_ADDR,         (uint32_t)(tex_dev / 64));
-         DCRW(VX_DCR_TEX_MIPOFF_BASE,  0);
+         /* Per-LOD mip byte offsets: the TEX unit indexes mipoff[selected lod]
+          * (VX_tex_core) to reach that level's texels within the resident base. */
+         for (uint32_t j = 0; j <= (uint32_t)VX_TEX_LOD_MAX; ++j)
+            DCRW(VX_DCR_TEX_MIPOFF_BASE + j, tex->mip_off[j]);
       }
 
       LAUNCH(&fli);
@@ -878,6 +1410,15 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
       VP_CHECK(vx_enqueue_draw(q, cmds.data(), (uint32_t)cmds.size(),
                                0, NULL, NULL), "vx_enqueue_draw");
 
+      /* Bring every written descriptor home. Enqueued after the draw and before
+       * the finish so the copy rides the same submission, and so a later draw
+       * uploading the same resource starts from the bytes this one produced. */
+      for (uint32_t i = 0; i < n_wb; i++) {
+         VP_CHECK(vx_enqueue_read(q, (void *)(uintptr_t)wb[i].host, wb[i].buf,
+                                  wb[i].off, wb[i].size, 0, NULL, NULL),
+                  "vx_enqueue_read(desc)");
+      }
+
       /* The render lands in the resident colour buffer (color_dev); the caller
        * syncs it back to the framebuffer resource at present / pass end. No
        * per-draw colour readback. */
@@ -887,18 +1428,27 @@ vp_raster_draw(vx_device_h dev, struct vp_raster_pool *pool,
 
 done:
    /* the front-end working set, code modules and colour/depth/texture buffers
-    * are resident (pool- / context-cached) and persist across draws; only the
-    * per-draw VS-output + vertex-input buffers are released here. */
+    * are resident (pool- / context-cached) and persist across draws; the
+    * vertex-input and FS-resource buffers are now resident too (borrowed from
+    * the screen), so only the per-draw VS-output and staging buffers are
+    * released here. */
+   /* After the finish above, never before: the BVH uploads are asynchronous and
+    * read the staging blobs this frees. */
+   vp_as_end(asc);
    if (tbuf) vx_buffer_release(tbuf);
-   if (vbuf) vx_buffer_release(vbuf);
    if (vsbuf) vx_buffer_release(vsbuf);
    if (fabuf) vx_buffer_release(fabuf);
    if (fs_desc_buf) vx_buffer_release(fs_desc_buf);
    for (vx_buffer_h b : fs_cbuf_bufs)
       if (b) vx_buffer_release(b);
-   for (vx_buffer_h b : fs_res_bufs)
-      if (b) vx_buffer_release(b);
    for (uint8_t *s : fs_desc_stage)
+      if (s) free(s);
+   if (vs_desc_buf) vx_buffer_release(vs_desc_buf);
+   for (vx_buffer_h b : vs_cbuf_bufs)
+      if (b) vx_buffer_release(b);
+   for (vx_buffer_h b : vs_res_bufs)
+      if (b) vx_buffer_release(b);
+   for (uint8_t *s : vs_desc_stage)
       if (s) free(s);
    if (mrtbuf) vx_buffer_release(mrtbuf);
    if (q)         vx_queue_release(q);

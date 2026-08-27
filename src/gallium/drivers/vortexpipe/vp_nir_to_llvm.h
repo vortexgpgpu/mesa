@@ -9,6 +9,7 @@
 #define VP_NIR_TO_LLVM_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,10 +47,16 @@ struct vp_sw_routing {
  * allocated LLVM-IR text string in *out_ir (release with
  * vp_free_ir). For a vertex shader, *out_vs (when non-NULL) is
  * filled with the output-record layout. `routing` (may be NULL) selects the
- * per-unit HW/SW path for a fragment shader; ignored for VS/compute. */
+ * per-unit HW/SW path for a fragment shader, `samples` its sample count
+ * (0 or 1 = single-sample), and `bgra_mask` the channel order of each colour
+ * attachment, one bit per render target (clear = red in the low byte, set =
+ * blue); all three are ignored for VS/compute. Two fragment shaders differing
+ * only in these are different kernels, which is why they are translation inputs
+ * rather than draw-time arguments. */
 bool vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
                     struct vp_vs_layout *out_vs,
-                    const struct vp_sw_routing *routing);
+                    const struct vp_sw_routing *routing,
+                    unsigned samples, uint8_t bgra_mask);
 
 /* Release a string returned via vp_nir_to_llvm()'s out_ir. */
 void vp_free_ir(char *ir);
@@ -59,6 +66,10 @@ void vp_free_ir(char *ir);
  * reads) and vp_launch (fills argblk[i]):
  *   arg[0]                       -- push constants
  *   arg[1]                       -- set-0 descriptor blob (constant-buffer 1)
+ *   arg[2]                       -- compute dispatch base: base_group_x in the
+ *                                   low 32 bits, base_group_y in the high 32
+ *                                   (vkCmdDispatchBase). 0 for a plain dispatch.
+ *   arg[3]                       -- compute dispatch base: base_group_z (low 32).
  *   arg[VP_ARG_SSBO_BASE + slot] -- data address of a raw compute shader
  *                                   buffer bound at set_shader_buffers slot
  *                                   `slot`. Distinct from the descriptor-set
@@ -66,9 +77,54 @@ void vp_free_ir(char *ir);
  *                                   this is for internal buffers lavapipe binds
  *                                   directly, e.g. the RT trace-ray command
  *                                   buffer read as load_ssbo(imm slot, off). */
+#define VP_ARG_GRID_BASE_XY 2   /* base_group_x | (base_group_y << 32) */
+#define VP_ARG_GRID_BASE_Z  3   /* base_group_z                        */
 #define VP_ARG_SSBO_BASE 4
 #define VP_MAX_SSBO      4
-#define VP_ARG_SLOTS     (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
+
+/* The VERTEX stage overlays its own meanings on slots 0-5 (output record
+ * buffer, attribute table, index buffer, verts-per-instance, base instance,
+ * base vertex -- see vp_raster_draw's vs_argblk), so the slots above describe
+ * COMPUTE only.
+ * A vertex shader therefore cannot reach its constant buffers through slot 0/1
+ * the way compute does; it gets its own descriptor table here, at a slot no
+ * other stage assigns a meaning to. Its contents are the same
+ * i64[GFX_FS_DESC_SLOTS] of constant-buffer device base addresses the fragment
+ * stage receives, and the VS prologue routes it through t->arg so the shared
+ * load_ubo / load_ssbo / load_push_constant lowering indexes the table rather
+ * than the arg block. 0 for a VS that binds no constant buffers. */
+#define VP_ARG_VS_DESC   (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
+#define VP_ARG_SLOTS     (VP_ARG_VS_DESC + 1)
+
+/* Vertex-attribute table (VS arg slot 1): one entry per VS input
+ * driver_location, holding { device base, stride, divisor, - }. The attribute
+ * for a draw lives at base + index*stride, where a zero divisor indexes by
+ * vertex and a non-zero one by instance/divisor -- an instance-rate attribute
+ * advances once every `divisor` instances, not once per instance. The unused
+ * fourth word keeps the entry a power of two wide so the address is a shift.
+ * Both table builders (vp_raster_draw, vp_launch_vs) and the fetch lowering
+ * (emit_vs_attr_addr) share this layout. */
+#define VP_ATTR_ENTRY_WORDS 4
+#define VP_ATTR_ENTRY_BYTES (VP_ATTR_ENTRY_WORDS * 4)
+
+/* Vertex stage: how many vertex invocations the draw actually has. Warps and
+ * CTAs are filled, so more threads launch than that, and a thread past the end
+ * has no vertex to shade. It sits in the first slot the vertex meanings above
+ * leave free; the compute SSBO slots it overlaps are never read by a VS. */
+#define VP_ARG_VS_COUNT  6
+
+/* Byte pitch of one vortex::graphics::rast_prim_t record in the front end's
+ * primitive buffer: vec3e_t edges[3] (36B) + rast_attribs_t {z,r,g,b,a,u,v,rhw,
+ * w0..w5} (14 planes x 12B = 168B) + facing (4B) + rhw_scale (4B).
+ *
+ * Three consumers index primitive N by it -- the RASTER unit through the
+ * PBUF_STRIDE DCR, and the fragment kernel's hardware- and software-raster
+ * paths -- so it must be the record's whole size, trailing scalars included,
+ * not just the part RASTER reads. A stride short of sizeof() leaves primitive 0
+ * correct and makes every later primitive's edges alias the previous record's
+ * tail, which drops it from the render with no diagnostic. vp_raster.cpp
+ * static_asserts this against the ABI struct. */
+#define VP_RAST_PRIM_STRIDE 212
 
 /* A descriptor a compute kernel reaches through set-0's descriptor
  * buffer (constant-buffer index 1):
@@ -91,15 +147,48 @@ struct vp_desc {
     * lp_jit_buffer_from_pipe_const's DIV_ROUND_UP(size, sizeof(float))). Used
     * by the descriptor relocation to size the device upload; 0 for AS/image. */
    unsigned          elem_bytes;
+   /* True when this shader writes the descriptor: store_ssbo, an SSBO atomic,
+    * an image store, or an image atomic. Only then does the device copy need
+    * reading back into the host backing after the launch — a descriptor that is
+    * only ever loaded holds the bytes it was uploaded with, and copying those
+    * back is pure work. */
+   bool              writable;
 };
 #define VP_MAX_DESCS 16
 
-/* Scan a compute NIR for the set-0 descriptors it accesses (load_ssbo
- * / store_ssbo / load_ubo against constant-buffer index 1). Fills
- * out[0..*num_out) with the distinct descriptors found, capped at
- * VP_MAX_DESCS. */
+/* The constant-buffer index of descriptor set 0's blob, per the +1 offset
+ * described above. The compute argument block carries this one blob and no
+ * other, so it is also the only set a dispatch can reach. */
+#define VP_CBUF_SET0 1
+
+/* Scan a NIR shader of any stage for the descriptors it accesses (load_ssbo /
+ * store_ssbo / load_ubo / image access). Fills out[0..*num_out) with the
+ * distinct ones found, capped at VP_MAX_DESCS. Each carries the constant-buffer
+ * index it lives in, which the draw path uses to relocate blob by blob -- a
+ * descriptor's offset means nothing without it, since two sets number their
+ * bindings from zero independently. */
 void vp_scan_descriptors(struct nir_shader *nir,
                          struct vp_desc *out, unsigned *num_out);
+
+/* True when the shader touches more distinct descriptors than vp_scan_descriptors
+ * can record. The ones past the limit are simply absent from its output, so the
+ * relocation never sees them and the device is left holding host addresses --
+ * translation refuses such a shader rather than running it on those. */
+bool vp_descriptors_overflow(struct nir_shader *nir);
+
+/* The highest constant-buffer index the shader reaches a descriptor through, or
+ * 0 if it reaches none. Reaching past set 0 is ordinary for a vertex or fragment
+ * shader, which receives a table of per-blob base addresses, and impossible for
+ * compute, which does not -- so this reports the fact and the caller applies the
+ * bound its stage actually has. */
+unsigned vp_descriptors_max_cbuf(struct nir_shader *nir);
+
+/* Locate the FS's TEX-stage-0 sampled-image descriptor (cbuf_index, byte offset)
+ * from its nir_tex_src_texture_handle, so a draw can read lp_jit_texture.base and
+ * select the actually-sampled texture. Returns false if the FS has no bindless
+ * texture handle (single-texture / non-bindless path uses the captured cur_tex). */
+bool vp_scan_tex_descriptor(struct nir_shader *nir,
+                            unsigned *cbuf_index, unsigned *offset);
 
 /* Bitmask of set_shader_buffers slots read via constant-index load_ssbo/
  * store_ssbo (the RT trace-ray command buffer). See the definition. */

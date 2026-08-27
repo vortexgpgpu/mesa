@@ -20,9 +20,219 @@
 #include "vp_public.h"
 #include "vp_private.h"
 #include "llvmpipe/lp_public.h"
+#include "llvmpipe/lp_texture.h"   /* struct llvmpipe_resource: a resource's host base */
 #include "nir.h"
+#include "gallivm/lp_bld_nir.h"
 #include "util/u_memory.h"
 #include "util/log.h"
+
+/* ---- resource residency -------------------------------------------------- *
+ * A device buffer per host allocation, living as long as the resource does
+ * rather than as long as one dispatch. See struct vp_screen for why eviction,
+ * not lookup, is the load-bearing half. */
+
+/* The host bytes a resource owns, whatever its shape. Both kinds reach the
+ * residency table -- a buffer through its descriptor's pointer, a texture
+ * through the base an image descriptor carries -- so a hook that understood
+ * only buffers would leave every resident image un-evicted and un-invalidated.
+ * llvmpipe stores the two in different members and asserts on the wrong one,
+ * which is why this cannot be a single accessor. Returns false when the range
+ * is unknown, and the caller must then treat the resource as not resident. */
+bool
+vp_resource_host_range(struct pipe_resource *pres, const uint8_t **out_base,
+                       uint32_t *out_size)
+{
+   const struct llvmpipe_resource *lpr = llvmpipe_resource_const(pres);
+
+   if (llvmpipe_resource_is_texture(pres)) {
+      *out_base = lpr->tex_data;
+      /* size_required, not total_alloc_size: the latter is left at zero for a
+       * texture allocated through the backing-memory path, which is how an
+       * ordinary storage image arrives, and a zero size reads as "no range" and
+       * silently skips the invalidation this exists to perform. */
+      *out_size = (uint32_t)lpr->size_required;
+   } else {
+      *out_base = lpr->data;
+      *out_size = pres->width0;
+   }
+   return *out_base && *out_size;
+}
+
+/* Drop every entry whose host range overlaps [base, base+size). A descriptor
+ * may point partway into a resource, so an entry's host_base is the range that
+ * was first asked for and need not equal the resource's own base -- overlap is
+ * the test that catches all of them, equality would not. */
+static void
+vp_resident_evict_range(struct vp_screen *vps, const uint8_t *base, uint32_t size)
+{
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_resident; ) {
+      struct vp_resident *e = &vps->resident[i];
+      if (e->host_base < base + size && base < e->host_base + e->size) {
+         vx_buffer_release(e->buf);
+         vps->resident[i] = vps->resident[--vps->n_resident];
+      } else {
+         i++;
+      }
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+}
+
+/* Every entry overlapping [base, base+size) is marked as the caller asks. A
+ * range shared by two entries after a merge is reported for both, which is why
+ * this walks the whole table rather than stopping at the first hit. */
+static void
+vp_resident_set_dirty(struct vp_screen *vps, const uint8_t *base, uint32_t size,
+                      bool dirty)
+{
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_resident; i++) {
+      struct vp_resident *e = &vps->resident[i];
+      if (e->host_base < base + size && base < e->host_base + e->size) {
+         e->dirty = dirty;
+      }
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+}
+
+void
+vp_screen_resident_clean(struct pipe_screen *screen, const void *host,
+                         uint32_t bytes)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (vps) {
+      vp_resident_set_dirty(vps, host, bytes, false);
+   }
+}
+
+void
+vp_screen_resident_dirty(struct pipe_screen *screen, const void *host,
+                         uint32_t bytes)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (vps) {
+      vp_resident_set_dirty(vps, host, bytes, true);
+   }
+}
+
+bool
+vp_screen_has_rtu(struct pipe_screen *screen)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   return vps && vps->has_rtu;
+}
+
+void
+vp_screen_resident_dirty_all(struct pipe_screen *screen)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (!vps) {
+      return;
+   }
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_resident; i++) {
+      vps->resident[i].dirty = true;
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+}
+
+uint64_t
+vp_screen_resident_addr(struct pipe_screen *screen, const void *host,
+                        uint32_t bytes, vx_buffer_h *out_buf, uint32_t *out_off,
+                        bool *out_dirty)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   const uint8_t *p = host;
+
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_resident; i++) {
+      struct vp_resident *e = &vps->resident[i];
+      if (p >= e->host_base && p + bytes <= e->host_base + e->size) {
+         uint32_t off = (uint32_t)(p - e->host_base);
+         *out_buf = e->buf;
+         *out_off = off;
+         *out_dirty = e->dirty;
+         uint64_t addr = e->dev_addr + off;
+         simple_mtx_unlock(&vps->resident_lock);
+         return addr;
+      }
+   }
+
+   /* No entry contains the range. Any entry that merely *overlaps* it must be
+    * absorbed rather than left alongside a second buffer for the same host
+    * bytes: each dispatch uploads and reads back through whichever entry its
+    * descriptor resolved to, so two device copies of one host byte would make
+    * the last readback win and silently drop the other's write. Widen to the
+    * union of the request and every overlapping entry, and keep exactly one
+    * buffer for it. Uploads happen per dispatch regardless, so nothing is lost
+    * by dropping the old buffers' contents here. */
+   const uint8_t *lo = p;
+   const uint8_t *hi = p + bytes;
+   for (unsigned i = 0; i < vps->n_resident; ) {
+      struct vp_resident *e = &vps->resident[i];
+      if (e->host_base < hi && lo < e->host_base + e->size) {
+         if (e->host_base < lo) {
+            lo = e->host_base;
+         }
+         if (e->host_base + e->size > hi) {
+            hi = e->host_base + e->size;
+         }
+         vx_buffer_release(e->buf);
+         vps->resident[i] = vps->resident[--vps->n_resident];
+      } else {
+         i++;
+      }
+   }
+
+   if (vps->n_resident == vps->resident_cap) {
+      unsigned cap = vps->resident_cap ? vps->resident_cap * 2 : 16;
+      struct vp_resident *t = realloc(vps->resident, cap * sizeof *t);
+      if (!t) {
+         simple_mtx_unlock(&vps->resident_lock);
+         return 0;
+      }
+      vps->resident     = t;
+      vps->resident_cap = cap;
+   }
+
+   uint32_t span = (uint32_t)(hi - lo);
+   vx_buffer_h buf = NULL;
+   uint64_t addr = 0;
+   if (vx_buffer_create(vps->dev, span, 0, &buf) != VX_SUCCESS ||
+       vx_buffer_address(buf, &addr) != VX_SUCCESS) {
+      if (buf) {
+         vx_buffer_release(buf);
+      }
+      simple_mtx_unlock(&vps->resident_lock);
+      return 0;
+   }
+
+   vps->resident[vps->n_resident++] = (struct vp_resident){
+      .host_base = lo, .size = span, .buf = buf, .dev_addr = addr,
+      .dirty = true,   /* a buffer that has never been written holds nothing */
+   };
+   vp_dbg("vortexpipe: resident alloc %u bytes (%u live)", span, vps->n_resident);
+   simple_mtx_unlock(&vps->resident_lock);
+   *out_buf = buf;
+   *out_off = (uint32_t)(p - lo);
+   *out_dirty = true;
+   return addr + (uint32_t)(p - lo);
+}
+
+/* A destroyed resource's device mirror must go with it: the allocator is free
+ * to hand the same host address to the next resource, and a surviving entry
+ * would then serve that resource the previous one's device buffer. */
+static void
+vp_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pres)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   const uint8_t *base = NULL;
+   uint32_t size = 0;
+   if (vps->dev && vp_resource_host_range(pres, &base, &size)) {
+      vp_resident_evict_range(vps, base, size);
+   }
+   vps->lp_resource_destroy(screen, pres);
+}
 
 static void
 vp_screen_destroy(struct pipe_screen *screen)
@@ -30,12 +240,29 @@ vp_screen_destroy(struct pipe_screen *screen)
    struct vp_screen *vps = vp_reg_get(screen);
    void (*lp_destroy)(struct pipe_screen *) = vps->lp_screen_destroy;
 
+   /* Hand resource_destroy back to llvmpipe before the state it needs goes
+    * away: llvmpipe's own teardown below destroys whatever resources are still
+    * alive, and each of those would otherwise re-enter vp_resource_destroy
+    * after vps has been freed. */
+   screen->resource_destroy = vps->lp_resource_destroy;
+   for (unsigned i = 0; i < vps->n_resident; i++) {
+      vx_buffer_release(vps->resident[i].buf);
+   }
+   free(vps->resident);
+   simple_mtx_destroy(&vps->resident_lock);
+
    if (vps->dev) {
       /* Dump GPU perf counters at device teardown, matching pocl_vortex's
        * pocl-vortex.c:373 pattern. Output is gated by $VORTEX_PROFILING
        * inside the runtime; a no-op when unset. */
       vx_device_dump_perf(vps->dev, stdout);
       vx_device_release(vps->dev);
+   }
+   if (vps->dev_nir) {
+      hash_table_foreach(vps->dev_nir, e)
+         ralloc_free((struct nir_shader *)e->data);
+      _mesa_hash_table_destroy(vps->dev_nir, NULL);
+      simple_mtx_destroy(&vps->dev_nir_lock);
    }
    vp_reg_del(screen);
    FREE(vps);
@@ -98,7 +325,212 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
     * inlining, so callee scratch is covered) to keep the shader on device. */
    NIR_PASS(_, nir, nir_lower_scratch_to_var);
 
-   return vps->lp_finalize_nir(screen, nir);
+   /* Subgroup lowering constant-folds gl_SubgroupSize and sizes ballot and
+    * shuffle lowering, so the width is baked into the shader. llvmpipe
+    * finalizes for the width it executes at; the device needs its warp width.
+    * One shader object cannot carry both, and it has two consumers here --
+    * llvmpipe runs every dispatch that falls back. Keep a device copy lowered
+    * for the warp and let llvmpipe finalize the original for itself.
+    *
+    * The fragment stage needs this as much as the other two -- the driver
+    * advertises subgroup operations in it -- but its copy is not finished here:
+    * llvmpipe lowers FRAG_RESULT_COLOR when the state is created, after this
+    * runs, so vp_create_fs_state applies that one pass to the clone before
+    * using it. Taking the clone later instead would be too late for the
+    * subgroup width, which is constant-folded in and cannot be re-lowered. */
+   struct nir_shader *dev = NULL;
+   if (vps->dev_nir && vps->hw_num_threads &&
+       (nir->info.stage == MESA_SHADER_COMPUTE ||
+        nir->info.stage == MESA_SHADER_VERTEX ||
+        nir->info.stage == MESA_SHADER_FRAGMENT)) {
+      dev = nir_shader_clone(NULL, nir);
+      lp_build_opt_nir(dev, vps->hw_num_threads);
+   }
+
+   char *err = vps->lp_finalize_nir(screen, nir);
+
+   if (dev) {
+      simple_mtx_lock(&vps->dev_nir_lock);
+      _mesa_hash_table_insert(vps->dev_nir, nir, dev);
+      simple_mtx_unlock(&vps->dev_nir_lock);
+   }
+   return err;
+}
+
+struct nir_shader *
+vp_screen_take_dev_nir(struct pipe_screen *screen, struct nir_shader *finalized)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (!vps || !vps->dev_nir)
+      return NULL;
+   simple_mtx_lock(&vps->dev_nir_lock);
+   struct hash_entry *e = _mesa_hash_table_search(vps->dev_nir, finalized);
+   struct nir_shader *dev = e ? e->data : NULL;
+   if (e)
+      _mesa_hash_table_remove(vps->dev_nir, e);
+   simple_mtx_unlock(&vps->dev_nir_lock);
+   return dev;
+}
+
+/* What the device can carry, per usage. A format outside a set would be
+ * reinterpreted rather than converted -- wrong pixels with no error, or worse --
+ * so it is reported unsupported and Vulkan skips it.
+ *
+ * The four sets differ, and answering one list for every bind flag is what let
+ * a 16-bit colour attachment through while refusing a float texture that works.
+ * They are kept apart deliberately. */
+
+/* Textures the sampler path carries: the fixed-function formats, everything the
+ * host decodes to A8R8G8B8 on upload, the float formats that upload verbatim and
+ * sample through the float texel path, and the depth formats.
+ *
+ * sRGB is absent on purpose: the host decode converts sRGB to linear at 8-bit
+ * output precision, where Vulkan wants the conversion at higher precision ahead
+ * of filtering. It belongs on the device's native SRGB8A8 decode, not here. */
+static bool
+vp_format_sampled(enum pipe_format format)
+{
+   switch (format) {
+   /* 32-bit colour, decoded to the sampler's A8R8G8B8 source format */
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   /* packed and narrow colour, likewise host-decoded */
+   case PIPE_FORMAT_B5G6R5_UNORM:
+   case PIPE_FORMAT_B5G5R5A1_UNORM:
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   /* 8-bit integer carriers, packed from their bytes (vp_is_int8_rgba) */
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R8G8B8A8_SINT:
+   /* float, uploaded verbatim and sampled as floats (vp_vx_tex_format) */
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R16G16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   /* depth, including the combined formats whose depth aspect converts to D32F */
+   case PIPE_FORMAT_Z16_UNORM:
+   case PIPE_FORMAT_Z32_FLOAT:
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Colour attachments. The output merger packs A8R8G8B8 and the pass-end transfer
+ * moves four bytes per texel, so a narrower attachment is not merely converted
+ * wrongly -- the transfer walks past the end of each row. 32-bit only.
+ *
+ * The BGRA orders stay advertised even though the device fragment path cannot
+ * produce them: vp_set_framebuffer_state routes a pass that uses one to
+ * llvmpipe, which renders it correctly, so the support is real. Withdrawing
+ * them here would remove a working capability rather than an untruthful
+ * claim. */
+static bool
+vp_format_render_target(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   /* Narrower and sRGB attachments merge in software: the fixed-function
+    * merger has no colour-format register, so it can only write A8R8G8B8.
+    * The software merger addresses a texel at its own width and applies the
+    * transfer function on both sides of the blend. */
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Depth/stencil attachments the output merger tests and writes. */
+static bool
+vp_format_depth_stencil(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+   case PIPE_FORMAT_Z16_UNORM:
+   case PIPE_FORMAT_Z32_FLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Storage images: the layouts the fragment translator emits image_load and
+ * image_store for. Anything else fails the translation loudly rather than
+ * reading wrong texels, but advertising it would still be a promise the driver
+ * cannot keep. */
+static bool
+vp_format_shader_image(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_UINT:
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Every requested bind must be one the device can honour for this format. */
+static bool
+vp_device_format_supported(enum pipe_format format, unsigned usage)
+{
+   if ((usage & PIPE_BIND_SAMPLER_VIEW) && !vp_format_sampled(format))
+      return false;
+   if ((usage & PIPE_BIND_RENDER_TARGET) && !vp_format_render_target(format))
+      return false;
+   if ((usage & PIPE_BIND_DEPTH_STENCIL) && !vp_format_depth_stencil(format))
+      return false;
+   if ((usage & PIPE_BIND_SHADER_IMAGE) && !vp_format_shader_image(format))
+      return false;
+   return true;   /* buffer / vertex / transfer use is format-agnostic here */
+}
+
+static bool
+vp_screen_is_format_supported(struct pipe_screen *screen,
+                              enum pipe_format format,
+                              enum pipe_texture_target target,
+                              unsigned sample_count,
+                              unsigned storage_sample_count,
+                              unsigned usage)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   if (!vps->lp_is_format_supported(screen, format, target, sample_count,
+                                    storage_sample_count, usage))
+      return false;
+   /* Without a Vortex device this screen is plain llvmpipe; keep its answer. */
+   if (!vps->dev)
+      return true;
+   /* The device path is single-sample (see the multisample features reported
+    * off in lvp_device.c). */
+   if (sample_count > 1 || storage_sample_count > 1)
+      return false;
+   return vp_device_format_supported(format, usage);
 }
 
 struct pipe_screen *
@@ -113,6 +545,13 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
       mesa_loge("vortexpipe: out of memory; running as plain llvmpipe");
       return screen;
    }
+
+   /* A miss here is not fatal: the device simply falls back to the shader
+    * llvmpipe finalized, which is what it used before this table existed. */
+   vps->dev_nir = _mesa_pointer_hash_table_create(NULL);
+   simple_mtx_init(&vps->dev_nir_lock, mtx_plain);
+
+   simple_mtx_init(&vps->resident_lock, mtx_plain);
 
    /* Open the Vortex device once, held for the screen's lifetime. */
    uint32_t ndev = 0;
@@ -149,16 +588,20 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    }
 
    /* Patch the entry points vortexpipe intercepts; record originals. */
-   vps->lp_context_create  = screen->context_create;
-   vps->lp_screen_destroy  = screen->destroy;
-   vps->lp_screen_get_name = screen->get_name;
-   vps->lp_finalize_nir    = screen->finalize_nir;
+   vps->lp_context_create      = screen->context_create;
+   vps->lp_screen_destroy      = screen->destroy;
+   vps->lp_screen_get_name     = screen->get_name;
+   vps->lp_finalize_nir        = screen->finalize_nir;
+   vps->lp_is_format_supported = screen->is_format_supported;
+   vps->lp_resource_destroy    = screen->resource_destroy;
    vp_reg_put(screen, vps);
 
-   screen->context_create = vp_context_create;
-   screen->destroy        = vp_screen_destroy;
-   screen->get_name       = vp_screen_get_name;
-   screen->finalize_nir   = vp_finalize_nir;
+   screen->context_create      = vp_context_create;
+   screen->destroy             = vp_screen_destroy;
+   screen->get_name            = vp_screen_get_name;
+   screen->finalize_nir        = vp_finalize_nir;
+   screen->is_format_supported = vp_screen_is_format_supported;
+   screen->resource_destroy    = vp_resource_destroy;
 
    /* Clamp llvmpipe's compute caps to the Vortex hardware cap so well-
     * behaved Vulkan apps that read maxComputeWorkGroupSize /
@@ -193,6 +636,15 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
     * vortexpipe to lower (vp_nir_lower_ray_tracing_to_rtu) instead of
     * expanding them to a software BVH walk. */
    ((struct pipe_caps *)&screen->caps)->driver_ray_queries = vps->has_rtu;
+
+   /* shaderFloat64 must match the device (lvp derives it from caps.doubles).
+    * Only advertise doubles when the Vortex FPU has the RISC-V D extension; an
+    * F-only (FLEN=32) build would otherwise inherit llvmpipe's doubles=1 and
+    * run fp64 shaders on a device that cannot execute them (silent wrong
+    * results, e.g. zero_initialize_workgroup_memory.types.f64* returning
+    * garbage). Without D, honestly report no fp64 so such tests are skipped. */
+   if (vps->dev && !(vps->hw_isa_flags & VX_ISA_STD_D))
+      ((struct pipe_caps *)&screen->caps)->doubles = 0;
 
    vp_dbg("vortexpipe: screen ready (llvmpipe base, Vortex hooks armed)");
    return screen;

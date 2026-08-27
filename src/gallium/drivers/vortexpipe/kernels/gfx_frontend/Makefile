@@ -41,6 +41,13 @@ OBJCOPY  := $(VORTEX_TOOLDIR)/llvm-vortex/bin/llvm-objcopy
 
 # -ffp-contract=off keeps the device setup math bit-faithful to the host
 # Binning() oracle the front end was validated against.
+#
+# -vortex-divergence-max-bbs raises the divergence pass's basic-block budget.
+# The fused nine-stage front end exceeds the default, and past it the pass
+# silently skips StructurizeCFG + split/join and miscompiles divergent control
+# flow instead of failing: a per-thread primitive store is dropped, so a draw
+# keeps only the triangle its first thread emitted. The shader path
+# (vp_compile.c) and libgfx_sw raise it for the same reason.
 VX_CFLAGS := --target=$(TARGET) \
   --sysroot=$(VORTEX_TOOLDIR)/$(GNU_DIR)/$(TARGET) \
   --gcc-toolchain=$(VORTEX_TOOLDIR)/$(GNU_DIR) \
@@ -48,12 +55,21 @@ VX_CFLAGS := --target=$(TARGET) \
   -Xclang -target-feature -Xclang +xvortex \
   -Xclang -target-feature -Xclang +zicond \
   -mllvm -disable-loop-idiom-all \
+  -mllvm -vortex-divergence-max-bbs=65536 \
   -Wno-unused-command-line-argument -Wno-override-module \
   -O3 -mcmodel=medany -nostartfiles -nostdlib -fuse-ld=lld \
   -fno-rtti -fno-exceptions -fdata-sections -ffunction-sections -ffp-contract=off \
   -D__VORTEX__ -DNDEBUG \
   -I. -I$(VORTEX_HOME)/sw/gfx -I$(VORTEX_HOME)/sw/kernel/include \
-  -I$(VORTEX_HOME)/sw/common -I$(VORTEX_BUILD)/sw -I$(VORTEX_BUILD)/hw
+  -I$(VORTEX_HOME)/sw/common -I$(VORTEX_BUILD)/sw -I$(VORTEX_BUILD)/hw \
+  -I$(VORTEX_HOME)/third_party
+
+# The pass-end multisample resolve reuses the software merger's box filter, so
+# the kernel pulls in gfx_sw.h. That header refuses to compile without this
+# define, as a reminder that its merge inlines a large divergent CFG and needs a
+# raised divergence-block guard -- which the flags above already carry, at a
+# bound well past what this kernel adds.
+VX_CFLAGS += -DGFX_SW_DIVERGENCE_OK
 
 # gfx_v2 §6.4: link the front end at a distinct base (0x80200000) so it
 # co-resides with the per-draw fragment-shader module (linked at the default
