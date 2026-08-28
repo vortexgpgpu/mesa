@@ -2963,6 +2963,28 @@ vp_gather_topology_u32(struct pipe_context *pipe, struct vp_context *vp,
 }
 
 static void
+vp_render_condition(struct pipe_context *pipe, struct pipe_query *query,
+                    bool condition, enum pipe_render_cond_flag mode)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->render_cond_query = (query != NULL);
+   vp->render_cond_buf   = NULL;
+   vp->lp_render_condition(pipe, query, condition, mode);
+}
+
+static void
+vp_render_condition_mem(struct pipe_context *pipe, struct pipe_resource *buffer,
+                        uint32_t offset, bool condition)
+{
+   struct vp_context *vp = vp_reg_get(pipe);
+   vp->render_cond_buf    = buffer;
+   vp->render_cond_offset = offset;
+   vp->render_cond_cond   = condition;
+   vp->render_cond_query  = false;
+   vp->lp_render_condition_mem(pipe, buffer, offset, condition);
+}
+
+static void
 vp_draw_vbo(struct pipe_context *pipe,
             const struct pipe_draw_info *info,
             unsigned drawid_offset,
@@ -2973,6 +2995,16 @@ vp_draw_vbo(struct pipe_context *pipe,
    struct vp_context *vp = vp_reg_get(pipe);
    struct vp_cso     *vs = vp->cur_vs;
    struct vp_cso     *fs = vp->cur_fs;
+
+   /* A memory predicate gates every path here; the llvmpipe fallback would
+    * re-test it harmlessly. Same polarity as llvmpipe_check_render_cond. */
+   if (vp->render_cond_buf) {
+      uint32_t pred = 0;
+      pipe_buffer_read(pipe, vp->render_cond_buf, vp->render_cond_offset,
+                       sizeof(pred), &pred);
+      if ((pred == 0) != vp->render_cond_cond)
+         return;
+   }
 
    /* An indirect draw carries its vertex count, instance count and first
     * vertex in a buffer rather than in the call. Nothing below reads that
@@ -3042,6 +3074,9 @@ vp_draw_vbo(struct pipe_context *pipe,
     * the divisor travels in the attribute table and the VS indexes by
     * instance/divisor. */
    bool simple =
+      /* a query-based render condition has no host-visible predicate word, and
+       * only llvmpipe's own draw loop can test it */
+      !vp->render_cond_query &&
       vp->dev && vs && vs->vxbin && vs->vs_layout.stride &&
       !indirect && num_draws == 1 &&
       (info->index_size == 0 || indexed) &&
@@ -3945,6 +3980,8 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    vp->lp_delete_vertex_elements_state = pipe->delete_vertex_elements_state;
    vp->lp_set_vertex_buffers   = pipe->set_vertex_buffers;
    vp->lp_flush                = pipe->flush;
+   vp->lp_render_condition     = pipe->render_condition;
+   vp->lp_render_condition_mem = pipe->render_condition_mem;
    vp->lp_context_destroy      = pipe->destroy;
    vp_reg_put(pipe, vp);
 
@@ -3979,6 +4016,8 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    pipe->bind_vs_state        = vp_bind_vs_state;
    pipe->delete_vs_state      = vp_delete_vs_state;
    pipe->draw_vbo             = vp_draw_vbo;
+   pipe->render_condition     = vp_render_condition;
+   pipe->render_condition_mem = vp_render_condition_mem;
    pipe->create_fs_state      = vp_create_fs_state;
    pipe->bind_fs_state        = vp_bind_fs_state;
    pipe->delete_fs_state      = vp_delete_fs_state;

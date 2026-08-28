@@ -640,6 +640,20 @@ struct vp_context {
    void  (*lp_set_vertex_buffers)(struct pipe_context *, unsigned,
                                   const struct pipe_vertex_buffer *);
    void  (*lp_context_destroy)(struct pipe_context *);
+
+   /* Conditional rendering, mirrored from the render_condition hooks: llvmpipe
+    * tests its predicate at the top of its own draw loop, which the device draw
+    * path never reaches. A memory predicate is re-tested in vp_draw_vbo; a
+    * query-based condition has no host-visible word to test, so it forces the
+    * llvmpipe fallback instead. */
+   struct pipe_resource *render_cond_buf;
+   uint32_t              render_cond_offset;
+   bool                  render_cond_cond;
+   bool                  render_cond_query;
+   void (*lp_render_condition)(struct pipe_context *, struct pipe_query *,
+                               bool, enum pipe_render_cond_flag);
+   void (*lp_render_condition_mem)(struct pipe_context *, struct pipe_resource *,
+                                   uint32_t, bool);
 };
 
 /* Pointer-keyed side registry (see file header). */
