@@ -231,7 +231,6 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
        * baremetal link has no __assert_func, so compile assertions out. */
       snprintf(gfx_seg, sizeof gfx_seg,
          "-std=c++17 -DNDEBUG -D__VORTEX__ -DGFX_SW_DIVERGENCE_OK "
-         "-mllvm -vortex-divergence-max-bbs=65536 "
          "-I%s/sw/gfx -I%s/sw/common -I%s/third_party -I%s/sw %s/sw/gfx/gfx_sw_abi.cpp",
          vh, vh, vh, bd, vh);
    }
@@ -246,7 +245,12 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
        * Vortex branch-divergence pass is part of the +xvortex backend
        * and is left at its default (enabled): it is what lowers
        * divergent SIMT control flow into correct masked execution, so
-       * we must never pass -mllvm -vortex-branch-divergence=0. */
+       * we must never pass -mllvm -vortex-branch-divergence=0. Its
+       * size guard skips functions above 100 blocks -- meant for libc
+       * routines no SIMT code calls -- and a generated kernel (the
+       * ray-tracing megashader, a shader with the SW sampler inlined)
+       * is routinely past that, so every kernel raises it: a skipped
+       * kernel runs divergent branches unmasked. */
       if (asprintf(&cmd,
             "%s/llvm-vortex/bin/clang --target=%s "
             "--sysroot=%s/%s/%s "
@@ -255,6 +259,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
             "-Xclang -target-feature -Xclang +xvortex "
             "-Xclang -target-feature -Xclang +zicond "
             "-mllvm -disable-loop-idiom-all "
+            "-mllvm -vortex-divergence-max-bbs=65536 "
             "-Wno-unused-command-line-argument -Wno-override-module "
             "-O3 -mcmodel=medany -nostartfiles -nostdlib "
             "-fdata-sections -ffunction-sections -fuse-ld=lld "

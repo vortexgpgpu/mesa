@@ -97,6 +97,48 @@ vp_log2u(uint32_t n)
    return l;
 }
 
+/* The resident SW-sampler descriptor for one texture view under one sampler.
+ * Descriptor-only filter bits (the shader reads them; they never reach the HW
+ * TEX_FILTER DCR): mag tap (bit0, from tex->filter), min tap (bit3), mip-linear
+ * (bit1), mip-enable (bit2), NPOT (bit4) and extended format (bit5). A mipmapped,
+ * non-power-of-two OR extended-format sampler routes to the SW sampler, which
+ * resolves min-vs-mag per sample from these, addresses NPOT by width/height, and
+ * decodes the extended formats the FF unit has neither a decoder nor a texel
+ * stride for. The mip-0 integer dims are carried so the SW sampler can address
+ * NPOT textures; POT textures leave width==1<<logdim so it keeps the bit-exact
+ * shift path. Depth formats carry the real VX format so the SW sampler reads and
+ * compares raw depth; colour textures stay A8R8G8B8. */
+extern "C" void
+vp_texstate_fill(gfx_sw_texstate_t *ts, uint64_t tex_dev, const struct vp_tex_params *tex)
+{
+   *ts = gfx_sw_texstate_t{};
+   ts->base = tex_dev;
+   for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i)
+      ts->mip_off[i] = tex->mip_off[i];
+   ts->logdim = (vp_log2u(tex->height) << 16) | vp_log2u(tex->width);
+   ts->format = tex->format ? tex->format : VX_TEX_FORMAT_A8R8G8B8;
+   ts->compare_func = tex->compare_func;
+   ts->swizzle = tex->swizzle;
+   ts->layer_stride = tex->layer_stride;
+   ts->min_lod  = tex->min_lod;
+   ts->max_lod  = tex->max_lod;
+   ts->lod_bias = tex->lod_bias;
+   ts->depth    = tex->depth;
+   ts->wrap_w   = tex->wrap_w;
+   const bool tex_pot = tex->width && tex->height
+      && !(tex->width & (tex->width - 1u)) && !(tex->height & (tex->height - 1u));
+   ts->filter = tex->filter
+      | (tex->min_filter == VX_TEX_FILTER_BILINEAR ? GFX_SW_TEX_FILTER_MIN_BILINEAR : 0u)
+      | (tex->mip_linear ? VX_TEX_FILTER_MIP_LINEAR : 0u)
+      | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u)
+      | (tex_pot ? 0u : GFX_SW_TEX_FILTER_NPOT)
+      | (ts->format > (uint32_t)VX_TEX_FORMAT_FF_MAX ? GFX_SW_TEX_FILTER_EXT_FORMAT : 0u);
+   ts->wrap   = (tex->wrap_v << 16) | tex->wrap_u;
+   ts->border = tex->border;
+   ts->width  = tex->width;
+   ts->height = tex->height;
+}
+
 /* ---- persistent front-end working set -------------------------- *
  * The front-end buffers laid out once and reused across the frame's draws
  * instead of allocated per draw. prim + tilebuf (the RASTER AXI master's
@@ -767,44 +809,7 @@ vp_raster_draw(struct pipe_screen *screen, vx_device_h dev,
        * additionally consumes format/filter/wrap/mip_off/base from it. */
       gfx_sw_texstate_t texstate{};
       if (tex_dev && tex) {
-         texstate.base   = tex_dev;
-         for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i)
-            texstate.mip_off[i] = tex->mip_off[i];
-         texstate.logdim = (vp_log2u(tex->height) << 16) | vp_log2u(tex->width);
-         /* Depth formats (sampler2DShadow) carry the real VX format so the SW
-          * sampler reads/compares raw depth; colour textures stay A8R8G8B8. */
-         texstate.format = tex->format ? tex->format : VX_TEX_FORMAT_A8R8G8B8;
-         texstate.compare_func = tex->compare_func;
-         texstate.swizzle = tex->swizzle;
-         texstate.layer_stride = tex->layer_stride;
-         texstate.min_lod  = tex->min_lod;
-         texstate.max_lod  = tex->max_lod;
-         texstate.lod_bias = tex->lod_bias;
-         texstate.depth    = tex->depth;
-         texstate.wrap_w   = tex->wrap_w;
-         /* Descriptor-only filter bits (the FS reads them; they never reach the HW
-          * TEX_FILTER DCR below): mag tap (bit0, from tex->filter), min tap (bit3),
-          * mip-linear (bit1), mip-enable (bit2), NPOT (bit4) and extended format
-          * (bit5). A mipmapped, non-power-of-two OR extended-format sampler routes
-          * to the SW sampler, which resolves min-vs-mag per fragment from these,
-          * addresses NPOT by width/height, and decodes the extended formats the FF
-          * unit has neither a decoder nor a texel stride for. */
-         const bool tex_pot = tex->width && tex->height
-            && !(tex->width & (tex->width - 1u)) && !(tex->height & (tex->height - 1u));
-         texstate.filter = tex->filter
-            | (tex->min_filter == VX_TEX_FILTER_BILINEAR ? GFX_SW_TEX_FILTER_MIN_BILINEAR : 0u)
-            | (tex->mip_linear ? VX_TEX_FILTER_MIP_LINEAR : 0u)
-            | (tex->mip_enable ? GFX_SW_TEX_FILTER_MIP_ENABLE : 0u)
-            | (tex_pot ? 0u : GFX_SW_TEX_FILTER_NPOT)
-            | (texstate.format > (uint32_t)VX_TEX_FORMAT_FF_MAX
-                  ? GFX_SW_TEX_FILTER_EXT_FORMAT : 0u);
-         texstate.wrap   = (tex->wrap_v << 16) | tex->wrap_u;
-         texstate.border = tex->border;
-         /* Carry the mip-0 integer dims so the SW sampler can address NPOT
-          * textures (multiply addressing). POT textures leave width==1<<logdim
-          * so the sampler keeps the bit-exact shift path. */
-         texstate.width  = tex->width;
-         texstate.height = tex->height;
+         vp_texstate_fill(&texstate, tex_dev, tex);
          if (!pool->texstate_buf) {
             VP_CHECK(vx_buffer_create(dev, sizeof(gfx_sw_texstate_t), 0,
                                       &pool->texstate_buf), "vx_buffer_create(texstate)");

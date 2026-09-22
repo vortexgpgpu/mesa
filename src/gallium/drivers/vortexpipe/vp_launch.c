@@ -184,6 +184,14 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
 #define LVP_TRI_GEOMFLAGS_OFF 44   /* coords[3][3]+padding+primitive_id      */
 #define LVP_INST_SBTFLAGS_OFF 12   /* bvh_ptr + custom_instance_and_mask      */
 #define LVP_INST_OTW_OFF      72   /* otw_matrix (object→world, mat3x4)       */
+#define LVP_INST_CUSTOM_OFF   8    /* custom_instance_and_mask                */
+#define LVP_INST_ID_OFF       68   /* instance_id                             */
+#define LVP_INST_NODE_BYTES   120  /* sizeof(struct lvp_bvh_instance_node)    */
+#define LVP_INST_WTO_OFF      16   /* wto_matrix (world→object, mat3x4)       */
+#define LVP_AABB_PRIM_OFF     24   /* lvp_bvh_aabb_node.primitive_id          */
+#define LVP_AABB_GEOMFLAGS_OFF 28  /* lvp_bvh_aabb_node.geometry_id_and_flags */
+#define LVP_INSTANCE_TRIANGLE_FACING_CULL_DISABLE (1u << 29)
+#define LVP_INSTANCE_TRIANGLE_FLIP_FACING         (1u << 28)
 
 /* Opacity lives in the top bits of two words: the geometry's own flag in a
  * triangle node's geometry_id_and_flags, and the instance's overrides in
@@ -224,15 +232,71 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
 #define RTU_BVH_KIND_LEAF_TRI  1u
 #define RTU_BVH_COUNT_SHIFT    8u
 #define RTU_BVH_CHILD_LEAF_FLAG 0x80000000u
+#define RTU_BVH_KIND_LEAF_INST 2u
+#define RTU_BVH_KIND_LEAF_PROC 3u
+#define RTU_PROC_AABB_BYTES    24u
+#define RTU_BVH_FLAG_OPAQUE    0x1u
+#define RTU_BVH_FLAG_PROCEDURAL 0x2u
+#define RTU_BVH_INSTANCE_STRIDE     64u
+#define RTU_BVH_INSTANCE_BLAS_OFF   48u
+#define RTU_BVH_INSTANCE_CUSTOM_OFF 52u
+#define RTU_BVH_INSTANCE_ID_OFF     56u
+#define RTU_BVH_INSTANCE_CULL_OFF   60u
+#define RTU_INST_FLAGS_SHIFT        8u
+#define RTU_INST_FLAG_TRI_CULL_DIS  0x1u
+#define RTU_INST_FLAG_TRI_FLIP      0x2u
+#define RTU_INST_FLAG_FORCE_OPAQUE  0x4u
+#define RTU_INST_FLAG_FORCE_NO_OPQ  0x8u
+/* Scene offsets are 31-bit (bit 31 of a child word flags a leaf). */
+#define VP_RTU_SCENE_MAX_BYTES      0x7fffffffu
 
-struct vp_tri_list {
-   float    (*tris)[10];   /* 9 coords + flags(as float bits) per triangle */
-   uint32_t *prim;         /* per-tri gl_PrimitiveID (from the lvp_bvh node)  */
-   uint32_t *geom;         /* per-tri gl_GeometryIndexEXT                     */
-   uint32_t  count;
-   uint32_t  cap;
-   bool      ok;
+/* One primitive a BLAS contributes, in object space: a triangle (v[0..8] =
+ * v0, v1, v2), or -- RTU_BVH_FLAG_PROCEDURAL set in `flags` -- a procedural
+ * AABB (v[0..2] = min, v[3..5] = max) that yields to the intersection shader. */
+struct vp_prim {
+   float    v[9];
+   uint32_t flags;      /* RTU_BVH_FLAG_OPAQUE | RTU_BVH_FLAG_PROCEDURAL */
+   uint32_t prim_id;    /* gl_PrimitiveID */
+   uint32_t geom_id;    /* lavapipe's geometry_id_and_flags: gl_GeometryIndexEXT
+                         * in bits 0..27, the geometry-opaque flag in bit 31.
+                         * The RTU reports it verbatim; readers mask. */
 };
+
+struct vp_prim_list {
+   struct vp_prim *p;
+   uint32_t count, cap;
+   bool ok;
+};
+
+/* One TLAS instance, as lavapipe laid it out. */
+struct vp_inst {
+   const uint8_t *blas;
+   float          otw[12];    /* object -> world, 3x4 row-major */
+   uint32_t       custom;     /* gl_InstanceCustomIndexEXT */
+   uint32_t       mask;       /* visibility mask */
+   uint32_t       flags;      /* RTU_INST_FLAG_* */
+   uint32_t       id;         /* gl_InstanceID */
+   uint8_t        node[LVP_INST_NODE_BYTES];   /* lavapipe's own record */
+};
+
+struct vp_inst_list {
+   struct vp_inst *p;
+   uint32_t count, cap;
+   bool ok;
+   bool has_geometry;         /* the walked AS is a BLAS, not a TLAS */
+};
+
+#define VP_LIST_PUSH(l, item)                                            \
+   do {                                                                  \
+      if ((l)->count == (l)->cap) {                                      \
+         uint32_t ncap = (l)->cap ? (l)->cap * 2 : 64;                   \
+         void *np = realloc((l)->p, (size_t)ncap * sizeof(*(l)->p));     \
+         if (!np) { (l)->ok = false; break; }                            \
+         (l)->p = np;                                                    \
+         (l)->cap = ncap;                                                \
+      }                                                                  \
+      (l)->p[(l)->count++] = (item);                                     \
+   } while (0)
 
 /* world = M(3x4 row-major) * [obj; 1]. */
 static void
@@ -253,99 +317,113 @@ vp_xform_compose(const float A[12], const float B[12], float C[12])
    }
 }
 
+/* Collect a BLAS's primitives in object space. Opacity here is the geometry's
+ * own: instance overrides travel in the instance record, where the RTU
+ * composes them per instance, so one BLAS serves every instance of it. */
 static void
-vp_tri_push(struct vp_tri_list *tl, const float v0[3], const float v1[3],
-            const float v2[3], uint32_t prim_id, uint32_t geom_id, bool opaque)
+vp_walk_blas(const uint8_t *bvh, uint32_t node_ptr, struct vp_prim_list *l, int depth)
 {
-   if (tl->count == tl->cap) {
-      uint32_t ncap = tl->cap ? tl->cap * 2 : 64;
-      float (*nt)[10] = realloc(tl->tris, (size_t)ncap * sizeof(*nt));
-      uint32_t *np = realloc(tl->prim, (size_t)ncap * sizeof(*np));
-      uint32_t *ng = realloc(tl->geom, (size_t)ncap * sizeof(*ng));
-      if (nt) tl->tris = nt;
-      if (np) tl->prim = np;
-      if (ng) tl->geom = ng;
-      if (!nt || !np || !ng) { tl->ok = false; return; }
-      tl->cap = ncap;
-   }
-   uint32_t idx = tl->count++;
-   float *t = tl->tris[idx];
-   t[0]=v0[0]; t[1]=v0[1]; t[2]=v0[2];
-   t[3]=v1[0]; t[4]=v1[1]; t[5]=v1[2];
-   t[6]=v2[0]; t[7]=v2[1]; t[8]=v2[2];
-   uint32_t flags = opaque ? RTU_TRI_FLAG_OPAQUE : 0u;
-   memcpy(&t[9], &flags, 4);
-   tl->prim[idx] = prim_id;
-   tl->geom[idx] = geom_id;
-}
-
-/* Walk one node (ptr = offset|type) of the lvp_bvh at base `bvh`, applying
- * transform M, appending world-space triangles to tl. */
-static void
-vp_walk_node(const uint8_t *bvh, uint32_t node_ptr, const float M[12],
-             uint32_t inst_flags, struct vp_tri_list *tl, int depth)
-{
-   if (node_ptr == LVP_NODE_INVALID || depth > 64 || !tl->ok)
+   if (node_ptr == LVP_NODE_INVALID || depth > 64 || !l->ok)
       return;
-   uint32_t type = node_ptr & 7u;
    const uint8_t *node = bvh + (node_ptr & ~7u);
-   switch (type) {
+   switch (node_ptr & 7u) {
    case LVP_NODE_INTERNAL: {
       uint32_t c0, c1;
       memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
       memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
-      vp_walk_node(bvh, c0, M, inst_flags, tl, depth + 1);
-      vp_walk_node(bvh, c1, M, inst_flags, tl, depth + 1);
+      vp_walk_blas(bvh, c0, l, depth + 1);
+      vp_walk_blas(bvh, c1, l, depth + 1);
       break;
    }
    case LVP_NODE_TRIANGLE: {
-      float coords[9];
-      memcpy(coords, node, 36);           /* coords[3][3] */
-      /* lvp_bvh_triangle_node: primitive_id @40, geometry_id_and_flags @44
-       * (low 28 bits = gl_GeometryIndexEXT). Preserve both so the RTU leaf
-       * reports the Vulkan gl_PrimitiveID / geometry index the closest-hit
-       * shader indexes its vertex/index/material SSBOs with. */
-      uint32_t prim_id = 0, geom_flags = 0;
-      memcpy(&prim_id,    node + 40, 4);
+      struct vp_prim pr;
+      uint32_t geom_flags = 0;
+      memcpy(pr.v, node, 36);                    /* coords[3][3] */
+      memcpy(&pr.prim_id, node + 40, 4);
       memcpy(&geom_flags, node + LVP_TRI_GEOMFLAGS_OFF, 4);
-      float w0[3], w1[3], w2[3];
-      vp_xform_point(M, &coords[0], w0);
-      vp_xform_point(M, &coords[3], w1);
-      vp_xform_point(M, &coords[6], w2);
-      /* A non-opaque triangle is one the RTU must return as a candidate so the
-       * shader's any-hit decision runs; marking it opaque would commit it
-       * unconditionally. */
-      bool opaque = ((geom_flags | inst_flags) & LVP_OPAQUE_BITS) == LVP_OPAQUE_BITS;
-      vp_tri_push(tl, w0, w1, w2, prim_id, geom_flags & 0x0fffffffu, opaque);
+      pr.geom_id = geom_flags;
+      pr.flags = (geom_flags & LVP_GEOMETRY_OPAQUE) ? RTU_BVH_FLAG_OPAQUE : 0u;
+      VP_LIST_PUSH(l, pr);
       break;
    }
-   case LVP_NODE_INSTANCE: {
-      uint64_t blas_host = 0;
-      uint32_t sbt_flags = 0;
-      float otw[12];
-      memcpy(&blas_host, node, 8);
-      memcpy(&sbt_flags, node + LVP_INST_SBTFLAGS_OFF, 4);
-      memcpy(otw, node + LVP_INST_OTW_OFF, 48);
-      if (blas_host) {
-         float Mc[12];
-         vp_xform_compose(M, otw, Mc);     /* world = M ∘ otw */
-         const uint8_t *blas = (const uint8_t *)(uintptr_t)blas_host;
-         uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
-         vp_walk_node(blas, root, Mc, sbt_flags, tl, depth + 1);
-      }
+   case LVP_NODE_AABB: {
+      struct vp_prim pr;
+      uint32_t geom_flags = 0;
+      memset(&pr, 0, sizeof pr);
+      memcpy(pr.v, node, 24);                    /* vk_aabb {min, max} */
+      memcpy(&pr.prim_id, node + LVP_AABB_PRIM_OFF, 4);
+      memcpy(&geom_flags, node + LVP_AABB_GEOMFLAGS_OFF, 4);
+      pr.geom_id = geom_flags;
+      pr.flags = RTU_BVH_FLAG_PROCEDURAL |
+                 ((geom_flags & LVP_GEOMETRY_OPAQUE) ? RTU_BVH_FLAG_OPAQUE : 0u);
+      VP_LIST_PUSH(l, pr);
       break;
    }
-   case LVP_NODE_AABB:
    default:
-      /* Procedural primitive — not handled on the opaque-triangle path. */
       break;
    }
 }
 
-/* ── CW-BVH4 builder (greedy median split, ≤6 children, 1 tri/leaf) ──
- * Mirrors the host builder in tests/raytracing/rt_raycast, widened to 6.
+/* lavapipe's packed instance flags -> the RTU's (VkGeometryInstanceFlagBits). */
+static uint32_t
+vp_rtu_inst_flags(uint32_t sbt_offset_and_flags)
+{
+   uint32_t f = 0;
+   if (sbt_offset_and_flags & LVP_INSTANCE_TRIANGLE_FACING_CULL_DISABLE)
+      f |= RTU_INST_FLAG_TRI_CULL_DIS;
+   if (sbt_offset_and_flags & LVP_INSTANCE_TRIANGLE_FLIP_FACING)
+      f |= RTU_INST_FLAG_TRI_FLIP;
+   if (sbt_offset_and_flags & LVP_INSTANCE_FORCE_OPAQUE)
+      f |= RTU_INST_FLAG_FORCE_OPAQUE;
+   if (!(sbt_offset_and_flags & LVP_INSTANCE_NO_FORCE_NOT_OPAQUE))
+      f |= RTU_INST_FLAG_FORCE_NO_OPQ;
+   return f;
+}
+
+static void
+vp_walk_tlas(const uint8_t *bvh, uint32_t node_ptr, struct vp_inst_list *il, int depth)
+{
+   if (node_ptr == LVP_NODE_INVALID || depth > 64 || !il->ok)
+      return;
+   const uint8_t *node = bvh + (node_ptr & ~7u);
+   switch (node_ptr & 7u) {
+   case LVP_NODE_INTERNAL: {
+      uint32_t c0, c1;
+      memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
+      memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
+      vp_walk_tlas(bvh, c0, il, depth + 1);
+      vp_walk_tlas(bvh, c1, il, depth + 1);
+      break;
+   }
+   case LVP_NODE_INSTANCE: {
+      struct vp_inst in;
+      uint64_t blas = 0;
+      uint32_t cm = 0, sf = 0;
+      memcpy(&blas, node, 8);
+      memcpy(&cm, node + LVP_INST_CUSTOM_OFF, 4);
+      memcpy(&sf, node + LVP_INST_SBTFLAGS_OFF, 4);
+      memcpy(&in.id, node + LVP_INST_ID_OFF, 4);
+      memcpy(in.otw, node + LVP_INST_OTW_OFF, 48);
+      if (!blas)
+         break;
+      in.blas = (const uint8_t *)(uintptr_t)blas;
+      in.custom = cm & 0xffffffu;
+      in.mask = cm >> 24;
+      in.flags = vp_rtu_inst_flags(sf);
+      memcpy(in.node, node, LVP_INST_NODE_BYTES);
+      VP_LIST_PUSH(il, in);
+      break;
+   }
+   default:
+      il->has_geometry = true;
+      break;
+   }
+}
+
+/* ── CW-BVH4 builder (binned SAH, ≤4 children, 1 tri/leaf) ──
  * `order` is a permutation of triangle indices; a build node is a leaf
- * (one triangle) or an internal node fanning out to up to 6 children. */
+ * (one triangle) or an internal node fanning out to up to 4 children, formed by
+ * splitting its largest range until it has four. */
 struct vp_bnode {
    float    mn[3], mx[3];
    uint32_t tri;                    /* leaf: source triangle index (prim id) */
@@ -355,7 +433,6 @@ struct vp_bnode {
 };
 
 struct vp_bvh {
-   const float (*tris)[10];         /* tl->tris: 9 coords + flags per tri */
    float    (*cmin)[3];             /* per-tri AABB min */
    float    (*cmax)[3];             /* per-tri AABB max */
    float    (*cen)[3];              /* per-tri centroid */
@@ -364,35 +441,106 @@ struct vp_bvh {
    uint32_t  n_nodes;
 };
 
-/* Sort order[start, start+count) by centroid on the longest axis; return
- * the median split offset. Insertion sort — scenes the RTU handles are
- * small, and it avoids qsort's non-portable context passing. */
+#define VP_SAH_BINS 16
+
+static float
+vp_half_area(const float mn[3], const float mx[3])
+{
+   float dx = mx[0] - mn[0], dy = mx[1] - mn[1], dz = mx[2] - mn[2];
+   return dx * dy + dy * dz + dz * dx;
+}
+
+/* Binned-SAH binary split of order[start, start+count): bins the triangle
+ * centroids along each axis, takes the plane of least
+ * area(L)*n(L) + area(R)*n(R), and partitions order[] in place about it.
+ * Returns the left count, 0 < m < count. Linear in `count`, so a whole build is
+ * O(n log n) -- and the tree it yields is the one the RTU walks, so its quality
+ * is paid for in every ray's traversal. */
 static uint32_t
 vp_bvh_split(struct vp_bvh *b, uint32_t start, uint32_t count)
 {
-   float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+   float cmn[3] = { 1e30f, 1e30f, 1e30f }, cmx[3] = { -1e30f, -1e30f, -1e30f };
    for (uint32_t i = 0; i < count; i++) {
       const float *c = b->cen[b->order[start + i]];
       for (int a = 0; a < 3; a++) {
-         if (c[a] < mn[a]) mn[a] = c[a];
-         if (c[a] > mx[a]) mx[a] = c[a];
+         if (c[a] < cmn[a]) cmn[a] = c[a];
+         if (c[a] > cmx[a]) cmx[a] = c[a];
       }
    }
-   int axis = 0;
-   float ext = mx[0] - mn[0];
-   if (mx[1] - mn[1] > ext) { axis = 1; ext = mx[1] - mn[1]; }
-   if (mx[2] - mn[2] > ext) { axis = 2; }
-   for (uint32_t i = start + 1; i < start + count; i++) {
-      uint32_t v = b->order[i];
-      float k = b->cen[v][axis];
-      uint32_t j = i;
-      while (j > start && b->cen[b->order[j - 1]][axis] > k) {
-         b->order[j] = b->order[j - 1];
-         j--;
+
+   float best_cost = 1e38f;
+   int best_axis = -1, best_bin = 0;
+   for (int a = 0; a < 3; a++) {
+      const float ext = cmx[a] - cmn[a];
+      if (!(ext > 0.f))
+         continue;
+      const float scale = (float)VP_SAH_BINS / ext;
+      uint32_t cnt[VP_SAH_BINS] = { 0 };
+      float bmn[VP_SAH_BINS][3], bmx[VP_SAH_BINS][3];
+      for (int k = 0; k < VP_SAH_BINS; k++)
+         for (int d = 0; d < 3; d++) { bmn[k][d] = 1e30f; bmx[k][d] = -1e30f; }
+      for (uint32_t i = 0; i < count; i++) {
+         uint32_t t = b->order[start + i];
+         int k = (int)((b->cen[t][a] - cmn[a]) * scale);
+         if (k >= VP_SAH_BINS) k = VP_SAH_BINS - 1;
+         cnt[k]++;
+         for (int d = 0; d < 3; d++) {
+            if (b->cmin[t][d] < bmn[k][d]) bmn[k][d] = b->cmin[t][d];
+            if (b->cmax[t][d] > bmx[k][d]) bmx[k][d] = b->cmax[t][d];
+         }
       }
-      b->order[j] = v;
+      /* Right-to-left suffix sweep, then a left-to-right sweep that prices each
+       * plane k (bins < k on the left). */
+      float rarea[VP_SAH_BINS];
+      uint32_t rcnt[VP_SAH_BINS];
+      float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+      uint32_t n = 0;
+      for (int k = VP_SAH_BINS - 1; k > 0; k--) {
+         n += cnt[k];
+         for (int d = 0; d < 3; d++) {
+            if (bmn[k][d] < mn[d]) mn[d] = bmn[k][d];
+            if (bmx[k][d] > mx[d]) mx[d] = bmx[k][d];
+         }
+         rarea[k] = n ? vp_half_area(mn, mx) : 0.f;
+         rcnt[k] = n;
+      }
+      for (int d = 0; d < 3; d++) { mn[d] = 1e30f; mx[d] = -1e30f; }
+      n = 0;
+      for (int k = 1; k < VP_SAH_BINS; k++) {
+         n += cnt[k - 1];
+         for (int d = 0; d < 3; d++) {
+            if (bmn[k - 1][d] < mn[d]) mn[d] = bmn[k - 1][d];
+            if (bmx[k - 1][d] > mx[d]) mx[d] = bmx[k - 1][d];
+         }
+         if (!n || !rcnt[k])
+            continue;
+         float cost = vp_half_area(mn, mx) * (float)n + rarea[k] * (float)rcnt[k];
+         if (cost < best_cost) {
+            best_cost = cost;
+            best_axis = a;
+            best_bin  = k;
+         }
+      }
    }
-   return count / 2;
+   /* Coincident centroids leave no plane to price; any balanced cut is as good. */
+   if (best_axis < 0)
+      return count / 2;
+
+   const float scale = (float)VP_SAH_BINS / (cmx[best_axis] - cmn[best_axis]);
+   uint32_t i = start, j = start + count;
+   while (i < j) {
+      uint32_t t = b->order[i];
+      int k = (int)((b->cen[t][best_axis] - cmn[best_axis]) * scale);
+      if (k >= VP_SAH_BINS) k = VP_SAH_BINS - 1;
+      if (k < best_bin) {
+         i++;
+      } else {
+         b->order[i] = b->order[--j];
+         b->order[j] = t;
+      }
+   }
+   uint32_t m = i - start;
+   return (m == 0 || m == count) ? count / 2 : m;
 }
 
 /* Build the subtree over order[start, start+count); returns its node id. */
@@ -409,8 +557,8 @@ vp_bvh_build(struct vp_bvh *b, uint32_t start, uint32_t count)
       memcpy(n->mx, b->cmax[n->tri], sizeof n->mx);
       return id;
    }
-   /* Partition into up to 6 child ranges: repeatedly median-split the
-    * largest range that still holds more than one triangle. */
+   /* Partition into up to RTU_BVH4_WIDTH child ranges: repeatedly SAH-split
+    * the largest range that still holds more than one triangle. */
    uint32_t rs[RTU_BVH4_WIDTH], rc[RTU_BVH4_WIDTH];
    int nr = 1;
    rs[0] = start; rc[0] = count;
@@ -443,6 +591,39 @@ vp_bvh_build(struct vp_bvh *b, uint32_t start, uint32_t count)
    return id;
 }
 
+
+static bool
+vp_bvh_init(struct vp_bvh *b, uint32_t n)
+{
+   memset(b, 0, sizeof *b);
+   b->cmin  = malloc((size_t)n * sizeof(*b->cmin));
+   b->cmax  = malloc((size_t)n * sizeof(*b->cmax));
+   b->cen   = malloc((size_t)n * sizeof(*b->cen));
+   b->order = malloc((size_t)n * sizeof(*b->order));
+   b->nodes = malloc((size_t)(2 * n) * sizeof(*b->nodes));   /* <= 2N-1 nodes */
+   if (!b->cmin || !b->cmax || !b->cen || !b->order || !b->nodes)
+      return false;
+   for (uint32_t i = 0; i < n; i++)
+      b->order[i] = i;
+   return true;
+}
+
+static void
+vp_bvh_fini(struct vp_bvh *b)
+{
+   free(b->cmin); free(b->cmax); free(b->cen); free(b->order); free(b->nodes);
+}
+
+static void
+vp_bvh_set_box(struct vp_bvh *b, uint32_t i, const float mn[3], const float mx[3])
+{
+   for (int a = 0; a < 3; a++) {
+      b->cmin[i][a] = mn[a];
+      b->cmax[i][a] = mx[a];
+      b->cen[i][a]  = 0.5f * (mn[a] + mx[a]);
+   }
+}
+
 /* Per-axis exponent so the node extent maps into the [0,255] uint8 grid:
  * step = 2^exp ≥ ext/255. */
 static void
@@ -468,154 +649,332 @@ vp_quant(float v, float origin, int exp, bool hi)
    return (uint8_t)q;
 }
 
-/* Serialize the build tree into a CW-BVH4 scene buffer (malloc'd; caller
- * frees). Returns NULL on OOM. *out_size receives the byte size. */
-static uint8_t *
-vp_bvh_serialize(struct vp_bvh *b, int root, const float (*tris)[10],
-                 const uint32_t *prim, const uint32_t *geom,
-                 uint32_t *out_size)
+/* The scene under construction: one buffer every BLAS and the TLAS append to,
+ * addressed by byte offset from its base (the RTU's scene-relative offsets). */
+struct vp_sbuf {
+   uint8_t *buf;
+   uint32_t size, cap;
+   bool ok;
+};
+
+static uint32_t
+vp_sbuf_alloc(struct vp_sbuf *sb, uint32_t bytes)
 {
-   const uint32_t leaf_bytes = RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_STRIDE;
-   uint32_t *off = malloc((size_t)b->n_nodes * sizeof(uint32_t));
-   if (!off) return NULL;
-   uint32_t cur = RTU_SCENE_HDR_BYTES;
-   for (uint32_t i = 0; i < b->n_nodes; i++) {
-      off[i] = cur;
-      cur += b->nodes[i].leaf ? leaf_bytes : RTU_BVH4_NODE_BYTES;
+   uint32_t off = sb->size;
+   if (!sb->ok)
+      return 0;
+   if ((uint64_t)off + bytes > VP_RTU_SCENE_MAX_BYTES) {
+      sb->ok = false;
+      return 0;
    }
-   uint8_t *buf = calloc(1, cur);
-   if (!buf) { free(off); return NULL; }
+   if (off + bytes > sb->cap) {
+      uint32_t ncap = sb->cap ? sb->cap : 4096;
+      while (ncap < off + bytes)
+         ncap *= 2;
+      uint8_t *nb = realloc(sb->buf, ncap);
+      if (!nb) { sb->ok = false; return 0; }
+      memset(nb + sb->cap, 0, ncap - sb->cap);
+      sb->buf = nb;
+      sb->cap = ncap;
+   }
+   sb->size = off + bytes;
+   return off;
+}
 
-   uint32_t *sh = (uint32_t *)buf;
-   sh[0] = off[root];                 /* root node offset */
-   sh[1] = RTU_SCENE_KIND_BVH4;
-   sh[2] = cur;                       /* total scene bytes (prefetch sizing) */
-   sh[3] = b->n_nodes;                /* node count */
+/* Leaf encoders for vp_bvh_emit: a BLAS leaf holds one primitive, a TLAS leaf
+ * one instance. */
+struct vp_leaf_ops {
+   uint32_t (*size)(const void *ctx, uint32_t item);
+   void     (*write)(const void *ctx, uint32_t item, uint8_t *dst);
+   const void *ctx;
+};
 
+/* Append a built tree to the scene; returns its root's offset. Offsets are
+ * reserved for every node before any is written, since reserving may move the
+ * buffer. */
+static uint32_t
+vp_bvh_emit(const struct vp_bvh *b, int root, const struct vp_leaf_ops *lo,
+            struct vp_sbuf *sb)
+{
+   uint32_t *off = malloc((size_t)b->n_nodes * sizeof(uint32_t));
+   if (!off) { sb->ok = false; return 0; }
    for (uint32_t i = 0; i < b->n_nodes; i++) {
       const struct vp_bnode *n = &b->nodes[i];
-      uint8_t *p = buf + off[i];
+      off[i] = vp_sbuf_alloc(sb, n->leaf ? lo->size(lo->ctx, n->tri)
+                                         : RTU_BVH4_NODE_BYTES);
+   }
+   if (!sb->ok) { free(off); return 0; }
+   for (uint32_t i = 0; i < b->n_nodes; i++) {
+      const struct vp_bnode *n = &b->nodes[i];
+      uint8_t *p = sb->buf + off[i];
       if (n->leaf) {
-         uint32_t *lh = (uint32_t *)p;
-         lh[0] = RTU_BVH_KIND_LEAF_TRI | (1u << RTU_BVH_COUNT_SHIFT);
-         lh[1] = geom[n->tri];         /* gl_GeometryIndexEXT */
-         lh[2] = 0;
-         lh[3] = prim[n->tri];         /* prim_base = source gl_PrimitiveID */
-         const float *t = tris[n->tri];
-         memcpy(p + RTU_BVH_LEAF_HDR_BYTES, t, 36);   /* 9 coords */
-         /* t[9] carries the flags the walk computed from the source geometry
-          * and instance; re-deriving them here would let the two disagree. */
-         memcpy(p + RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_FLAGS_OFFSET, &t[9], 4);
-      } else {
-         uint32_t *kind = (uint32_t *)p;
-         *kind = RTU_BVH_KIND_INTERNAL |
-                 ((uint32_t)n->nchild << RTU_BVH_COUNT_SHIFT);
-         float *origin = (float *)(p + RTU_BVH4_OFF_ORIGIN);
-         origin[0] = n->mn[0]; origin[1] = n->mn[1]; origin[2] = n->mn[2];
-         int exp[3];
-         vp_bvh_choose_exp(n->mn, n->mx, exp);
-         int8_t *pe = (int8_t *)(p + RTU_BVH4_OFF_EXP);
-         pe[0] = (int8_t)exp[0]; pe[1] = (int8_t)exp[1]; pe[2] = (int8_t)exp[2];
-         uint32_t *child = (uint32_t *)(p + RTU_BVH4_OFF_CHILD);
-         uint8_t  *qmin  = p + RTU_BVH4_OFF_QMIN;
-         uint8_t  *qmax  = p + RTU_BVH4_OFF_QMAX;
-         for (int k = 0; k < n->nchild; k++) {
-            const struct vp_bnode *c = &b->nodes[n->child[k]];
-            uint32_t coff = off[n->child[k]];
-            child[k] = coff | (c->leaf ? RTU_BVH_CHILD_LEAF_FLAG : 0u);
-            for (int a = 0; a < 3; a++) {
-               qmin[k * 3 + a] = vp_quant(c->mn[a], n->mn[a], exp[a], false);
-               qmax[k * 3 + a] = vp_quant(c->mx[a], n->mn[a], exp[a], true);
-            }
+         lo->write(lo->ctx, n->tri, p);
+         continue;
+      }
+      uint32_t kind = RTU_BVH_KIND_INTERNAL | ((uint32_t)n->nchild << RTU_BVH_COUNT_SHIFT);
+      memcpy(p, &kind, 4);
+      memcpy(p + RTU_BVH4_OFF_ORIGIN, n->mn, 12);
+      int exp[3];
+      vp_bvh_choose_exp(n->mn, n->mx, exp);
+      int8_t *pe = (int8_t *)(p + RTU_BVH4_OFF_EXP);
+      pe[0] = (int8_t)exp[0]; pe[1] = (int8_t)exp[1]; pe[2] = (int8_t)exp[2];
+      uint8_t *qmin = p + RTU_BVH4_OFF_QMIN;
+      uint8_t *qmax = p + RTU_BVH4_OFF_QMAX;
+      for (int k = 0; k < n->nchild; k++) {
+         const struct vp_bnode *c = &b->nodes[n->child[k]];
+         uint32_t cw = off[n->child[k]] | (c->leaf ? RTU_BVH_CHILD_LEAF_FLAG : 0u);
+         memcpy(p + RTU_BVH4_OFF_CHILD + 4 * k, &cw, 4);
+         for (int a = 0; a < 3; a++) {
+            qmin[k * 3 + a] = vp_quant(c->mn[a], n->mn[a], exp[a], false);
+            qmax[k * 3 + a] = vp_quant(c->mx[a], n->mn[a], exp[a], true);
          }
       }
    }
+   uint32_t r = off[root];
    free(off);
-   *out_size = cur;
-   return buf;
+   return r;
 }
 
-/* Build a CW-BVH4 scene buffer from the collected world-space triangles.
- * Empty input degenerates to an empty TriList (all-miss). */
-static uint8_t *
-vp_build_bvh4_scene(const struct vp_tri_list *tl, uint32_t *out_size)
+static uint32_t
+vp_prim_leaf_size(const void *ctx, uint32_t i)
 {
-   if (tl->count == 0) {
-      uint8_t *scene = calloc(1, RTU_SCENE_HDR_BYTES);
-      if (!scene) return NULL;
-      *out_size = RTU_SCENE_HDR_BYTES;   /* {count=0, kind=TriList, 0, 0} */
-      return scene;
-   }
-
-   const uint32_t n = tl->count;
-   struct vp_bvh b = { .tris = tl->tris };
-   b.cmin  = malloc((size_t)n * sizeof(*b.cmin));
-   b.cmax  = malloc((size_t)n * sizeof(*b.cmax));
-   b.cen   = malloc((size_t)n * sizeof(*b.cen));
-   b.order = malloc((size_t)n * sizeof(*b.order));
-   b.nodes = malloc((size_t)(2 * n) * sizeof(*b.nodes));   /* ≤ 2N-1 nodes */
-   if (!b.cmin || !b.cmax || !b.cen || !b.order || !b.nodes) {
-      free(b.cmin); free(b.cmax); free(b.cen); free(b.order); free(b.nodes);
-      return NULL;
-   }
-   for (uint32_t i = 0; i < n; i++) {
-      const float *t = tl->tris[i];
-      for (int a = 0; a < 3; a++) {
-         float v0 = t[a], v1 = t[3 + a], v2 = t[6 + a];
-         float lo = v0 < v1 ? v0 : v1; lo = lo < v2 ? lo : v2;
-         float hi = v0 > v1 ? v0 : v1; hi = hi > v2 ? hi : v2;
-         b.cmin[i][a] = lo;
-         b.cmax[i][a] = hi;
-         b.cen[i][a]  = 0.5f * (lo + hi);
-      }
-      b.order[i] = i;
-   }
-   int root = vp_bvh_build(&b, 0, n);
-   uint8_t *scene = vp_bvh_serialize(&b, root, tl->tris, tl->prim, tl->geom,
-                                     out_size);
-
-   free(b.cmin); free(b.cmax); free(b.cen); free(b.order); free(b.nodes);
-   return scene;
+   const struct vp_prim *pr = &((const struct vp_prim *)ctx)[i];
+   return RTU_BVH_LEAF_HDR_BYTES + ((pr->flags & RTU_BVH_FLAG_PROCEDURAL)
+                                    ? RTU_PROC_AABB_BYTES : RTU_TRI_STRIDE);
 }
 
-/* Transcode the lavapipe AS at `tlas_host` into an RTU CW-BVH4 scene in
- * device memory; returns its device address (0 on failure). */
+static void
+vp_prim_leaf_write(const void *ctx, uint32_t i, uint8_t *p)
+{
+   const struct vp_prim *pr = &((const struct vp_prim *)ctx)[i];
+   const bool proc = (pr->flags & RTU_BVH_FLAG_PROCEDURAL) != 0;
+   uint32_t hdr[4] = {
+      (proc ? RTU_BVH_KIND_LEAF_PROC : RTU_BVH_KIND_LEAF_TRI) | (1u << RTU_BVH_COUNT_SHIFT),
+      pr->geom_id,          /* gl_GeometryIndexEXT */
+      proc ? pr->flags : 0u,/* a procedural leaf carries its flags word here */
+      pr->prim_id,          /* prim_base = gl_PrimitiveID */
+   };
+   memcpy(p, hdr, sizeof hdr);
+   if (proc) {
+      memcpy(p + RTU_BVH_LEAF_HDR_BYTES, pr->v, 24);
+   } else {
+      memcpy(p + RTU_BVH_LEAF_HDR_BYTES, pr->v, 36);
+      memcpy(p + RTU_BVH_LEAF_HDR_BYTES + RTU_TRI_FLAGS_OFFSET, &pr->flags, 4);
+   }
+}
+
+/* One distinct BLAS in the scene. */
+struct vp_blas_entry {
+   const uint8_t *host;
+   uint32_t       root;      /* scene offset of its root node */
+   float          mn[3], mx[3];
+   bool           empty;
+};
+
+/* Build one BLAS into the scene. Its primitives are gathered from lavapipe's
+ * BVH and rebuilt with binned SAH into the RTU's CW-BVH4 format. */
+static void
+vp_emit_blas(const uint8_t *host, struct vp_blas_entry *e, struct vp_sbuf *sb)
+{
+   struct vp_prim_list l = { .ok = true };
+   vp_walk_blas(host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &l, 0);
+   e->host = host;
+   e->empty = true;
+   if (!l.ok) { sb->ok = false; free(l.p); return; }
+   if (l.count == 0) { free(l.p); return; }
+
+   struct vp_bvh b;
+   if (!vp_bvh_init(&b, l.count)) { sb->ok = false; vp_bvh_fini(&b); free(l.p); return; }
+   for (uint32_t i = 0; i < l.count; i++) {
+      const float *v = l.p[i].v;
+      float mn[3], mx[3];
+      if (l.p[i].flags & RTU_BVH_FLAG_PROCEDURAL) {
+         memcpy(mn, v, 12);
+         memcpy(mx, v + 3, 12);
+      } else {
+         for (int a = 0; a < 3; a++) {
+            mn[a] = fminf(v[a], fminf(v[3 + a], v[6 + a]));
+            mx[a] = fmaxf(v[a], fmaxf(v[3 + a], v[6 + a]));
+         }
+      }
+      vp_bvh_set_box(&b, i, mn, mx);
+   }
+   int root = vp_bvh_build(&b, 0, l.count);
+   struct vp_leaf_ops lo = { vp_prim_leaf_size, vp_prim_leaf_write, l.p };
+   e->root = vp_bvh_emit(&b, root, &lo, sb);
+   memcpy(e->mn, b.nodes[root].mn, 12);
+   memcpy(e->mx, b.nodes[root].mx, 12);
+   e->empty = false;
+   vp_bvh_fini(&b);
+   free(l.p);
+}
+
+/* A TLAS leaf: one LEAF_INST record naming its BLAS's root. */
+struct vp_tlas_leaf_ctx {
+   const struct vp_inst *inst;
+   const uint32_t       *blas_root;   /* per instance */
+};
+
+static uint32_t
+vp_inst_leaf_size(const void *ctx, uint32_t i)
+{
+   (void)ctx; (void)i;
+   return RTU_BVH_LEAF_HDR_BYTES + RTU_BVH_INSTANCE_STRIDE;
+}
+
+static void
+vp_inst_leaf_write(const void *ctx, uint32_t i, uint8_t *p)
+{
+   const struct vp_tlas_leaf_ctx *c = ctx;
+   const struct vp_inst *in = &c->inst[i];
+   uint32_t kind = RTU_BVH_KIND_LEAF_INST | (1u << RTU_BVH_COUNT_SHIFT);
+   memcpy(p, &kind, 4);
+   uint8_t *rec = p + RTU_BVH_LEAF_HDR_BYTES;
+   memcpy(rec, in->otw, 48);
+   uint32_t cull = (in->mask & 0xffu) | (in->flags << RTU_INST_FLAGS_SHIFT);
+   memcpy(rec + RTU_BVH_INSTANCE_BLAS_OFF, &c->blas_root[i], 4);
+   memcpy(rec + RTU_BVH_INSTANCE_CUSTOM_OFF, &in->custom, 4);
+   memcpy(rec + RTU_BVH_INSTANCE_ID_OFF, &in->id, 4);
+   memcpy(rec + RTU_BVH_INSTANCE_CULL_OFF, &cull, 4);
+}
+
+/* World-space bounds of an instance: its BLAS root box through its transform. */
+static void
+vp_inst_bounds(const float otw[12], const float mn[3], const float mx[3],
+               float wmn[3], float wmx[3])
+{
+   for (int a = 0; a < 3; a++) { wmn[a] = 1e30f; wmx[a] = -1e30f; }
+   for (int k = 0; k < 8; k++) {
+      float p[3] = { (k & 1) ? mx[0] : mn[0], (k & 2) ? mx[1] : mn[1],
+                     (k & 4) ? mx[2] : mn[2] };
+      float w[3];
+      vp_xform_point(otw, p, w);
+      for (int a = 0; a < 3; a++) {
+         wmn[a] = fminf(wmn[a], w[a]);
+         wmx[a] = fmaxf(wmx[a], w[a]);
+      }
+   }
+}
+
+/* Transcode the lavapipe AS at `tlas_host` into a two-level RTU CW-BVH4 scene
+ * in device memory: one SAH BVH per distinct BLAS, shared by all its instances,
+ * under a TLAS of LEAF_INST records the RTU descends with each instance's
+ * transform, custom index, ID, mask and flags -- the instancing model of a
+ * hardware ray tracer.
+ *
+ * The RTU hit record names an instance only by ID, so an instance table sits
+ * just below the scene base: entry k, at base - VP_RTU_INST_TABLE_STRIDE*(k+1),
+ * is a verbatim copy of lavapipe's lvp_bvh_instance_node for gl_InstanceID k.
+ * A shader turns the reported ID into that address and reads the SBT offset,
+ * transforms and IDs exactly as it would from lavapipe's own node.
+ * Returns the scene's device address (0 on failure). */
 static uint64_t
 vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
 {
-   struct vp_tri_list tl = { .ok = true };
-   static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
-   uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
-   vp_walk_node((const uint8_t *)tlas_host, root, kIdentity,
-                LVP_INSTANCE_FLAGS_DEFAULT, &tl, 0);
-   if (!tl.ok) {
-      free(tl.tris); free(tl.prim); free(tl.geom);
-      c->ok = false;
-      return 0;
+   struct vp_inst_list il = { .ok = true };
+   vp_walk_tlas((const uint8_t *)tlas_host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &il, 0);
+   if (il.has_geometry && il.count == 0) {
+      /* The handle names a BLAS: trace it as one identity instance. */
+      static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
+      struct vp_inst in = { .blas = tlas_host, .mask = 0xffu };
+      const uint32_t cm = 0xffu << 24, sf = LVP_INSTANCE_FLAGS_DEFAULT;
+      memcpy(in.otw, kIdentity, sizeof kIdentity);
+      memcpy(in.node + LVP_INST_CUSTOM_OFF, &cm, 4);
+      memcpy(in.node + LVP_INST_SBTFLAGS_OFF, &sf, 4);
+      memcpy(in.node + LVP_INST_WTO_OFF, kIdentity, sizeof kIdentity);
+      memcpy(in.node + LVP_INST_OTW_OFF, kIdentity, sizeof kIdentity);
+      VP_LIST_PUSH(&il, in);
+   }
+   if (!il.ok) { free(il.p); c->ok = false; return 0; }
+
+   struct vp_sbuf sb = { .ok = true };
+   vp_sbuf_alloc(&sb, RTU_SCENE_HDR_BYTES);
+
+   /* Every distinct BLAS once. */
+   struct vp_blas_entry *blas = calloc(il.count ? il.count : 1, sizeof *blas);
+   uint32_t *inst_blas = calloc(il.count ? il.count : 1, sizeof *inst_blas);
+   uint32_t n_blas = 0, max_id = 0;
+   if (!blas || !inst_blas) sb.ok = false;
+   for (uint32_t i = 0; sb.ok && i < il.count; i++) {
+      uint32_t k = 0;
+      while (k < n_blas && blas[k].host != il.p[i].blas)
+         k++;
+      if (k == n_blas)
+         vp_emit_blas(il.p[i].blas, &blas[n_blas++], &sb);
+      inst_blas[i] = k;
+      if (il.p[i].id > max_id) max_id = il.p[i].id;
    }
 
-   uint32_t size = 0;
-   uint8_t *scene = vp_build_bvh4_scene(&tl, &size);
-   free(tl.tris); free(tl.prim); free(tl.geom);
-   if (!scene) { c->ok = false; return 0; }
+   /* The TLAS over the non-empty instances. */
+   uint32_t n_live = 0;
+   for (uint32_t i = 0; sb.ok && i < il.count; i++) {
+      if (blas[inst_blas[i]].empty)
+         continue;
+      il.p[n_live] = il.p[i];
+      inst_blas[n_live] = inst_blas[i];
+      n_live++;
+   }
+   uint32_t hdr[4] = { 0, RTU_SCENE_KIND_TRILIST, 0, 0 };   /* empty: all-miss */
+   if (sb.ok && n_live) {
+      struct vp_bvh b;
+      uint32_t *roots = malloc(n_live * sizeof *roots);
+      if (!roots || !vp_bvh_init(&b, n_live)) {
+         sb.ok = false;
+      } else {
+         for (uint32_t i = 0; i < n_live; i++) {
+            const struct vp_blas_entry *e = &blas[inst_blas[i]];
+            float wmn[3], wmx[3];
+            vp_inst_bounds(il.p[i].otw, e->mn, e->mx, wmn, wmx);
+            vp_bvh_set_box(&b, i, wmn, wmx);
+            roots[i] = e->root;
+         }
+         int root = vp_bvh_build(&b, 0, n_live);
+         struct vp_tlas_leaf_ctx lc = { il.p, roots };
+         struct vp_leaf_ops lo = { vp_inst_leaf_size, vp_inst_leaf_write, &lc };
+         hdr[0] = vp_bvh_emit(&b, root, &lo, &sb);
+         hdr[1] = RTU_SCENE_KIND_BVH4;
+         hdr[3] = b.n_nodes;
+      }
+      vp_bvh_fini(&b);
+      free(roots);
+   }
+   hdr[2] = sb.size;
+   if (sb.ok)
+      memcpy(sb.buf, hdr, sizeof hdr);
+
+   /* Prefix the instance table; its stride keeps the scene 64-B aligned. */
+   const uint32_t n_ids = il.count ? max_id + 1 : 0;
+   const uint32_t tbl = n_ids * VP_RTU_INST_TABLE_STRIDE;
+   uint8_t *img = sb.ok ? calloc(1, (size_t)tbl + sb.size) : NULL;
+   if (img) {
+      for (uint32_t i = 0; i < n_live; i++)
+         memcpy(img + tbl - VP_RTU_INST_TABLE_STRIDE * (il.p[i].id + 1u),
+                il.p[i].node, LVP_INST_NODE_BYTES);
+      memcpy(img + tbl, sb.buf, sb.size);
+   }
+   const uint32_t img_size = tbl + sb.size;
+   vp_dbg("vortexpipe: RTU scene: %u instance(s), %u BLAS, %u bytes",
+          n_live, n_blas, sb.size);
+   free(sb.buf); free(blas); free(inst_blas); free(il.p);
+   if (!img) { c->ok = false; return 0; }
 
    if (c->n_bufs >= VP_MAX_BVH || c->n_stages >= VP_MAX_BVH) {
-      free(scene); c->ok = false; return 0;
+      free(img); c->ok = false; return 0;
    }
-   /* The upload is asynchronous; keep `scene` alive until the queue
+   /* The upload is asynchronous; keep the image alive until the queue
     * finishes (freed by the launch cleanup, like vp_copy_as's stages). */
-   c->stages[c->n_stages++] = scene;
-   vx_buffer_h b = NULL;
+   c->stages[c->n_stages++] = img;
+   vx_buffer_h buf = NULL;
    uint64_t dev_addr = 0;
-   if (vx_buffer_create(c->dev, size, VX_MEM_READ, &b) != VX_SUCCESS) {
+   if (vx_buffer_create(c->dev, img_size, VX_MEM_READ, &buf) != VX_SUCCESS) {
       c->ok = false; return 0;
    }
-   c->bufs[c->n_bufs++] = b;
-   if (vx_buffer_address(b, &dev_addr) != VX_SUCCESS ||
-       vx_enqueue_write(c->q, b, 0, scene, size, 0, NULL, NULL) != VX_SUCCESS) {
+   c->bufs[c->n_bufs++] = buf;
+   if (vx_buffer_address(buf, &dev_addr) != VX_SUCCESS ||
+       vx_enqueue_write(c->q, buf, 0, img, img_size, 0, NULL, NULL) != VX_SUCCESS) {
       c->ok = false; return 0;
    }
-   return dev_addr;
+   return dev_addr + tbl;
 }
 
 /* A draw reaches its descriptors through its own loops and tears them down at
@@ -683,6 +1042,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
           const void *desc_host, uint32_t desc_bytes,
           const struct vp_desc *descs, uint32_t num_descs,
           const struct vp_ssbo *ssbos, uint32_t num_ssbos,
+          const struct vp_tex_heap *tex_heap,
           const uint32_t grid[3], const uint32_t block[3],
           const uint32_t grid_base[3],
           uint32_t lmem_size, bool has_rtu)
@@ -692,6 +1052,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
    vx_buffer_h dbuf = NULL;
+   vx_buffer_h hbuf = NULL;   /* bindless texture heap */
    /* Resident device buffers are owned by the screen and outlive the dispatch,
     * so these are borrowed handles -- released here they would be freed out
     * from under the next dispatch that resolves to the same host range. */
@@ -846,6 +1207,19 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
       }
    }
 
+   if (tex_heap && tex_heap->count) {
+      const uint32_t bytes = tex_heap->count * (uint32_t)sizeof(gfx_sw_texstate_t);
+      uint64_t heap_dev = 0;
+      VP_CHECK(vx_buffer_create(dev, bytes, 0, &hbuf), "vx_buffer_create(tex heap)");
+      VP_CHECK(vx_buffer_address(hbuf, &heap_dev), "vx_buffer_address(tex heap)");
+      VP_CHECK(vx_enqueue_write(q, hbuf, 0, tex_heap->entries, bytes, 0, NULL, NULL),
+               "vx_enqueue_write(tex heap)");
+      for (uint32_t k = 0; k < tex_heap->count; k++) {
+         uint64_t a = heap_dev + (uint64_t)k * sizeof(gfx_sw_texstate_t);
+         memcpy(stage + tex_heap->slot[k], &a, sizeof a);
+      }
+   }
+
    /* upload the relocated descriptor buffer */
    VP_CHECK(vx_buffer_create(dev, desc_bytes, 0, &dbuf),
             "vx_buffer_create(descriptors)");
@@ -960,6 +1334,7 @@ done:
    for (unsigned i = 0; i < asc.n_stages; i++)
       free(asc.stages[i]);
    if (dbuf) vx_buffer_release(dbuf);
+   if (hbuf) vx_buffer_release(hbuf);
    /* kbuf aliases *kernel_io and stays resident; the caller releases it. */
    if (q)    vx_queue_release(q);
    free(stage);

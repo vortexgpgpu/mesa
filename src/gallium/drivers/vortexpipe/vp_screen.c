@@ -75,6 +75,15 @@ vp_resident_evict_range(struct vp_screen *vps, const uint8_t *base, uint32_t siz
          i++;
       }
    }
+   for (unsigned i = 0; i < vps->n_tex_mirror; ) {
+      struct vp_tex_mirror *m = &vps->tex_mirror[i];
+      if (m->host_base < base + size && base < m->host_base + m->size) {
+         vx_buffer_release(m->buf);
+         vps->tex_mirror[i] = vps->tex_mirror[--vps->n_tex_mirror];
+      } else {
+         i++;
+      }
+   }
    simple_mtx_unlock(&vps->resident_lock);
 }
 
@@ -90,6 +99,15 @@ vp_resident_set_dirty(struct vp_screen *vps, const uint8_t *base, uint32_t size,
       struct vp_resident *e = &vps->resident[i];
       if (e->host_base < base + size && base < e->host_base + e->size) {
          e->dirty = dirty;
+      }
+   }
+   /* A mirror is only ever cleaned by vp_screen_tex_mirror_put, never by a
+    * buffer upload that happens to overlap it. */
+   if (dirty) {
+      for (unsigned i = 0; i < vps->n_tex_mirror; i++) {
+         struct vp_tex_mirror *m = &vps->tex_mirror[i];
+         if (m->host_base < base + size && base < m->host_base + m->size)
+            m->dirty = true;
       }
    }
    simple_mtx_unlock(&vps->resident_lock);
@@ -132,6 +150,9 @@ vp_screen_resident_dirty_all(struct pipe_screen *screen)
    simple_mtx_lock(&vps->resident_lock);
    for (unsigned i = 0; i < vps->n_resident; i++) {
       vps->resident[i].dirty = true;
+   }
+   for (unsigned i = 0; i < vps->n_tex_mirror; i++) {
+      vps->tex_mirror[i].dirty = true;
    }
    simple_mtx_unlock(&vps->resident_lock);
 }
@@ -219,6 +240,57 @@ vp_screen_resident_addr(struct pipe_screen *screen, const void *host,
    return addr + (uint32_t)(p - lo);
 }
 
+bool
+vp_screen_tex_mirror_get(struct pipe_screen *screen, struct pipe_resource *res,
+                         uint32_t vx_format, struct vp_tex_mirror *out)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   bool hit = false;
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_tex_mirror; i++) {
+      const struct vp_tex_mirror *m = &vps->tex_mirror[i];
+      if (m->res == res && m->vx_format == vx_format) {
+         if (!m->dirty) {
+            *out = *m;
+            hit = true;
+         }
+         break;
+      }
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+   return hit;
+}
+
+bool
+vp_screen_tex_mirror_put(struct pipe_screen *screen, const struct vp_tex_mirror *m)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   simple_mtx_lock(&vps->resident_lock);
+   for (unsigned i = 0; i < vps->n_tex_mirror; i++) {
+      struct vp_tex_mirror *e = &vps->tex_mirror[i];
+      if (e->res == m->res && e->vx_format == m->vx_format) {
+         if (e->buf != m->buf)
+            vx_buffer_release(e->buf);
+         *e = *m;
+         simple_mtx_unlock(&vps->resident_lock);
+         return true;
+      }
+   }
+   if (vps->n_tex_mirror == vps->tex_mirror_cap) {
+      unsigned cap = vps->tex_mirror_cap ? vps->tex_mirror_cap * 2 : 16;
+      struct vp_tex_mirror *t = realloc(vps->tex_mirror, cap * sizeof *t);
+      if (!t) {
+         simple_mtx_unlock(&vps->resident_lock);
+         return false;
+      }
+      vps->tex_mirror     = t;
+      vps->tex_mirror_cap = cap;
+   }
+   vps->tex_mirror[vps->n_tex_mirror++] = *m;
+   simple_mtx_unlock(&vps->resident_lock);
+   return true;
+}
+
 /* A destroyed resource's device mirror must go with it: the allocator is free
  * to hand the same host address to the next resource, and a surviving entry
  * would then serve that resource the previous one's device buffer. */
@@ -249,6 +321,10 @@ vp_screen_destroy(struct pipe_screen *screen)
       vx_buffer_release(vps->resident[i].buf);
    }
    free(vps->resident);
+   for (unsigned i = 0; i < vps->n_tex_mirror; i++) {
+      vx_buffer_release(vps->tex_mirror[i].buf);
+   }
+   free(vps->tex_mirror);
    simple_mtx_destroy(&vps->resident_lock);
 
    if (vps->dev) {

@@ -19,6 +19,7 @@
 
 #include "vp_private.h"
 #include "llvmpipe/lp_texture.h"   /* llvmpipe_resource_is_texture */
+#include "gallivm/lp_bld_jit_types.h" /* lp_descriptor, lp_texture_handle */
 #include "vp_nir_to_llvm.h"
 #include "vp_compile.h"
 #include "vp_launch.h"
@@ -156,8 +157,10 @@ vp_create_compute_state(struct pipe_context *pipe,
       /* raw const-index shader-buffer slots (RT trace-ray command buffer) ->
        * SBT shader-record pointer relocation at launch. */
       cso->trace_cmd_slots = vp_scan_trace_cmd_slots(cs_nir);
+      cso->bindless_tex = vp_nir_uses_tex(cs_nir);
       if (vp_nir_to_llvm(cs_nir, &ir, NULL, NULL, 1, 0)) {
-         if (vp_compile_vxbin(ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size))
+         if (vp_compile_vxbin(ir, VP_STARTUP_FS, cso->bindless_tex,
+                              &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
                       cso->vxbin_size);
          else
@@ -221,6 +224,10 @@ vp_strict_mode(void)
    }
    return strict;
 }
+
+static bool vp_build_tex_heap(struct pipe_context *pipe, struct vp_context *vp,
+                              const struct vp_cso *cso, const uint8_t *blob,
+                              uint32_t bytes, struct vp_tex_heap *heap);
 
 static void
 vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
@@ -325,6 +332,10 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
          if (end > desc_bytes)
             desc_bytes = end;
       }
+      /* A bindless texture array is indexed at run time, so no static bound
+       * exists: upload the whole blob. */
+      if (cso->bindless_tex && vp->cbuf_sz[1] > desc_bytes)
+         desc_bytes = vp->cbuf_sz[1];
       struct pipe_transfer *xfer = NULL;
       void *desc_host = pipe_buffer_map(pipe, vp->cbuf[1],
                                         PIPE_MAP_READ, &xfer);
@@ -363,14 +374,22 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
          }
          vp->startup_fs_owner = cso;
          vp->startup_fs_is_compute = true;
-         ran_on_vortex = vp_launch(pipe->screen, vp->dev, cso->vxbin, cso->vxbin_size,
+         struct vp_tex_heap heap = { 0 };
+         bool heap_ok = !cso->bindless_tex ||
+            vp_build_tex_heap(pipe, vp, cso,
+                              (const uint8_t *)desc_host + vp->cbuf_off[1],
+                              desc_bytes, &heap);
+         ran_on_vortex = heap_ok &&
+                         vp_launch(pipe->screen, vp->dev, cso->vxbin, cso->vxbin_size,
                                    &cso->vx_module, &cso->vx_kernel,
                                    (uint8_t *)desc_host + vp->cbuf_off[1],
                                    desc_bytes, cso->descs, cso->num_descs,
-                                   ssbos, num_ssbos,
+                                   ssbos, num_ssbos, &heap,
                                    eff_grid, eff_block, info->grid_base,
                                    cso->lmem_size,
                                    vps && vps->has_rtu);
+         free((void *)heap.slot);
+         free((void *)heap.entries);
          for (unsigned s = 0; s < VP_MAX_SSBO; s++)
             if (sxfer[s])
                pipe_buffer_unmap(pipe, sxfer[s]);
@@ -417,6 +436,7 @@ vp_set_constant_buffer(struct pipe_context *pipe, enum pipe_shader_type shader,
    if (shader == PIPE_SHADER_COMPUTE && index < 8) {
       vp->cbuf[index]     = cb ? cb->buffer : NULL;
       vp->cbuf_off[index] = cb ? cb->buffer_offset : 0u;
+      vp->cbuf_sz[index]  = cb ? cb->buffer_size : 0u;
    }
    /* Capture the fragment stage's constant buffers so the draw path can
     * upload them + build the resident FS descriptor table (push constants at
@@ -734,11 +754,12 @@ vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v,
                        v->key.bgra_mask))
       return false;
    /* Co-compile the gfx_sw ABI whenever this variant could call it -- a
-    * routed-to-SW unit, or a HW-TEX shader that samples a texture (a mipmapped
-    * sampler routes to the SW sampler at draw time). Per variant, because it is
-    * derived from the routing the variant was built with. */
+    * routed-to-SW unit, or any shader that samples a texture (a mipmapped
+    * sampler routes to the SW sampler at draw time, whether or not the texture
+    * descriptor sits at a static offset). Per variant, because it is derived
+    * from the routing the variant was built with. */
    const bool uses_sw = v->key.routing.sw_tex || v->key.routing.sw_om ||
-                        cso->has_tex_desc;
+                        cso->has_tex_desc || vp_nir_uses_tex(cso->fs_nir);
    const bool ok = vp_compile_vxbin(ir, VP_STARTUP_FS, uses_sw,
                                     &v->vxbin, &v->vxbin_size);
    vp_free_ir(ir);
@@ -943,11 +964,11 @@ vp_vx_wrap(unsigned w)
  * the standard transparent/opaque black and opaque white are expressible
  * exactly; a custom colour quantizes to eight bits per channel. */
 static uint32_t
-vp_vx_border(const struct pipe_sampler_state *s)
+vp_vx_border_rgba(const float rgba[4])
 {
    float c[4];
    for (unsigned i = 0; i < 4; i++) {
-      float f = s->border_color.f[i];
+      float f = rgba[i];
       c[i] = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
    }
    /* Channel order matches what the fragment shader packs: red in the low
@@ -958,41 +979,80 @@ vp_vx_border(const struct pipe_sampler_state *s)
         |  (uint32_t)(c[0] * 255.0f + 0.5f);
 }
 
-/* Drop the resident texture upload, so the next draw re-uploads. */
-static void
-vp_tex_residency_drop(struct vp_context *vp)
+static uint32_t
+vp_vx_border(const struct pipe_sampler_state *s)
 {
-   if (vp->rtex_buf) {
-      vx_buffer_release(vp->rtex_buf);
-      vp->rtex_buf = NULL;
-   }
-   vp->rtex_res = NULL;
+   return vp_vx_border_rgba(s->border_color.f);
 }
 
-/* Capture the bound texture + sampler for the Vortex TEX unit.
+/* LOD clamp/bias in Q(VX_TEX_LOD_FRAC_BITS). The shader applies
+ * λ = clamp(λ + bias, min_lod, max_lod) before level selection. The bounds are
+ * clamped to the addressable LOD range (Vulkan's default maxLod is ~1000), and a
+ * pathologically large bias is bounded too so the fixed-point conversion cannot
+ * overflow (the in-shader clamp caps it anyway). */
+static void
+vp_sampler_set_lod(struct vp_sampler_cso *s, float min_lod, float max_lod,
+                   float lod_bias)
+{
+   const float lod_q = (float)(1 << VX_TEX_LOD_FRAC_BITS);
+   const float lod_max = (float)VX_TEX_LOD_MAX;
+   float lmax = max_lod < 0.0f ? 0.0f : max_lod;
+   float lmin = min_lod < 0.0f ? 0.0f : min_lod;
+   if (lmax > lod_max)
+      lmax = lod_max;
+   if (lmin > lod_max)
+      lmin = lod_max;
+   float lbias = lod_bias;
+   if (lbias >  lod_max) lbias =  lod_max;
+   if (lbias < -lod_max) lbias = -lod_max;
+   s->max_lod  = (uint32_t)(lmax * lod_q + 0.5f);
+   s->min_lod  = (uint32_t)(lmin * lod_q + 0.5f);
+   s->lod_bias = (int32_t)(lbias * lod_q);
+}
+
+/* Translate a Gallium sampler state to the VX TEX encoding. */
+static void
+vp_sampler_from_pipe(const struct pipe_sampler_state *state, struct vp_sampler_cso *s)
+{
+   s->filter     = vp_vx_filter(state->mag_img_filter);
+   s->min_filter = vp_vx_filter(state->min_img_filter);
+   s->wrap_u = vp_vx_wrap(state->wrap_s);
+   s->wrap_v = vp_vx_wrap(state->wrap_t);
+   s->wrap_w = vp_vx_wrap(state->wrap_r);
+   s->border = vp_vx_border(state);
+   /* Vulkan has no "disable mipmapping" flag; a non-mipmapped NEAREST/LINEAR
+    * sampler is expressed as max_lod == 0.25, which clamps the LOD so only the
+    * base level is ever read. A level >= 1 is reachable only when max_lod > 0.5
+    * (nearest-mip selects ceil(lod + 0.5) - 1), so that is the mipmap-enable
+    * test — min_mip_filter is always NEAREST here and cannot distinguish them. */
+   s->mip_enable = (state->max_lod > 0.5f);
+   s->mip_linear = (state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR);
+   /* sampler2DShadow: capture the depth-compare mode + op (mapped to the VX
+    * compare enum at draw time, where vp_vx_depth_func is in scope). */
+   s->compare_enable = (state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE);
+   s->compare_func = state->compare_func;
+   vp_sampler_set_lod(s, state->min_lod, state->max_lod, state->lod_bias);
+}
+
+/* Capture every sampled view and sampler for the Vortex TEX paths.
  *
  * lavapipe does not bind app textures through set_sampler_views (it
  * keeps descriptors in a buffer the shader dereferences); the one
  * place the underlying pipe_sampler_view / pipe_sampler_state surface
  * is create_texture_handle. lavapipe calls it twice per resource: an
  * image view passes the view (sampler state NULL), a sampler passes
- * the state (view NULL). gfx-v1 drives a single TEX stage, so we
- * capture the latest texture and the latest sampler. */
+ * the state (view NULL). Views are recorded by the host base their
+ * descriptors carry, samplers by the sampler_index llvmpipe hands back,
+ * so any descriptor can be resolved to both. cur_tex / cur_sampler keep
+ * the latest of each for a fragment shader with no bindless handle. */
 static uint64_t
 vp_create_texture_handle(struct pipe_context *pipe,
                          struct pipe_sampler_view *view,
                          const struct pipe_sampler_state *state)
 {
    struct vp_context *vp = vp_reg_get(pipe);
+   uint64_t handle = vp->lp_create_texture_handle(pipe, view, state);
    if (view && view->texture) {
-      /* The resident upload is keyed on the resource pointer, and a destroyed
-       * resource's pointer is handed straight back to the next allocation. A
-       * new texture of the same dimensions would then hit the cache and be
-       * sampled as the old one's texels. A texture cannot be sampled without
-       * surfacing here first, so dropping the cache on every capture is what
-       * makes the key safe -- there is no cheaper signal, since the pointer,
-       * the storage address and the dimensions are all recycled. */
-      vp_tex_residency_drop(vp);
       vp->cur_tex = view->texture;
       vp->cur_tex_first_level = view->u.tex.first_level;
       /* The cube-ness of a cube/cube-array sampler lives on the view, not the
@@ -1010,97 +1070,82 @@ vp_create_texture_handle(struct pipe_context *pipe,
       vp_dbg("vortexpipe: TEX texture captured (%ux%u) base_level=%u swizzle=0x%x",
              vp->cur_tex->width0, vp->cur_tex->height0, vp->cur_tex_first_level,
              vp->cur_tex_swizzle);
-      /* Record this texture's level-0 host base so a draw can match its FS tex
-       * descriptor (lp_jit_texture.base) back to the resource — the per-draw
-       * selection that lets >1 bound texture disambiguate. Dedup by resource. */
       struct pipe_resource *res = view->texture;
       struct pipe_transfer *xfer = NULL;
       const void *base = pipe_texture_map(pipe, res, 0, 0, PIPE_MAP_READ,
                                           0, 0, res->width0, res->height0, &xfer);
       if (base) {
+         pipe_texture_unmap(pipe, xfer);
          /* Drop every entry this capture supersedes before adding it. Both keys
           * are recycled by the allocator: a destroyed texture hands its resource
           * pointer AND its storage address to the next one, so an entry matching
-          * either may describe a texture that no longer exists. Keeping such an
-          * entry lets it win the per-draw match and answer with the wrong
-          * target and layer count -- which is a 2D array reporting one layer to
-          * textureSize once some earlier texture has been destroyed. Matching on
-          * the resource alone and skipping the capture is what let that stand:
-          * the properties below come from the VIEW, and a recycled pointer says
-          * nothing about which view is bound now. */
-         for (unsigned i = 0; i < vp->txh_count; ) {
-            if (vp->txh_res[i] == res || vp->txh_base[i] == base) {
-               vp->txh_count--;
-               vp->txh_base[i]   = vp->txh_base[vp->txh_count];
-               vp->txh_res[i]    = vp->txh_res[vp->txh_count];
-               vp->txh_target[i] = vp->txh_target[vp->txh_count];
-               vp->txh_layers[i] = vp->txh_layers[vp->txh_count];
-            } else {
+          * either may describe a texture that no longer exists, and would answer
+          * with the wrong target and layer count. */
+         for (unsigned i = 0; i < vp->n_views; ) {
+            if (vp->views[i].res == res || vp->views[i].base == base)
+               vp->views[i] = vp->views[--vp->n_views];
+            else
                i++;
+         }
+         if (vp->n_views == vp->views_cap) {
+            unsigned cap = vp->views_cap ? vp->views_cap * 2 : 32;
+            struct vp_tex_view *t = realloc(vp->views, cap * sizeof *t);
+            if (t) {
+               vp->views = t;
+               vp->views_cap = cap;
             }
          }
-         if (vp->txh_count < VP_MAX_TEX_HANDLES) {
-            vp->txh_base[vp->txh_count]   = base;
-            vp->txh_res[vp->txh_count]    = res;
-            vp->txh_target[vp->txh_count] = view->target;
-            vp->txh_layers[vp->txh_count] =
-               view->u.tex.last_layer - view->u.tex.first_layer + 1u;
-            vp->txh_count++;
+         if (vp->n_views < vp->views_cap) {
+            vp->views[vp->n_views++] = (struct vp_tex_view){
+               .base = base, .res = res, .target = view->target,
+               .layers = view->u.tex.last_layer - view->u.tex.first_layer + 1u,
+               .swizzle = vp->cur_tex_swizzle,
+            };
          }
-         pipe_texture_unmap(pipe, xfer);
       }
    }
    if (state) {
-      vp->cur_sampler_store.filter     = vp_vx_filter(state->mag_img_filter);
-      vp->cur_sampler_store.min_filter = vp_vx_filter(state->min_img_filter);
-      vp->cur_sampler_store.wrap_u = vp_vx_wrap(state->wrap_s);
-      vp->cur_sampler_store.wrap_v = vp_vx_wrap(state->wrap_t);
-      vp->cur_sampler_store.wrap_w = vp_vx_wrap(state->wrap_r);
-      vp->cur_sampler_store.border = vp_vx_border(state);
-      /* Vulkan has no "disable mipmapping" flag; a non-mipmapped NEAREST/LINEAR
-       * sampler is expressed as max_lod == 0.25, which clamps the LOD so only the
-       * base level is ever read. A level >= 1 is reachable only when max_lod > 0.5
-       * (nearest-mip selects ceil(lod + 0.5) - 1), so that is the mipmap-enable
-       * test — min_mip_filter is always NEAREST here and cannot distinguish them. */
-      vp->cur_sampler_store.mip_enable = (state->max_lod > 0.5f);
-      vp->cur_sampler_store.mip_linear =
-         (state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR);
-      /* sampler2DShadow: capture the depth-compare mode + op (mapped to the VX
-       * compare enum at draw time, where vp_vx_depth_func is in scope). */
-      vp->cur_sampler_store.compare_enable =
-         (state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE);
-      vp->cur_sampler_store.compare_func = state->compare_func;
-      /* LOD clamp/bias in Q(VX_TEX_LOD_FRAC_BITS). The FS applies
-       * λ = clamp(λ + bias, min_lod, max_lod) before level selection. Clamp the
-       * bounds to the addressable LOD range (Vulkan's default maxLod is ~1000). */
-      {
-         const float lod_q = (float)(1 << VX_TEX_LOD_FRAC_BITS);
-         const float lod_max = (float)VX_TEX_LOD_MAX;
-         float lmax = state->max_lod < 0.0f ? 0.0f : state->max_lod;
-         float lmin = state->min_lod < 0.0f ? 0.0f : state->min_lod;
-         if (lmax > lod_max) {
-            lmax = lod_max;
-         }
-         if (lmin > lod_max) {
-            lmin = lod_max;
-         }
-         /* A pathologically large app bias is bounded to the addressable range so
-          * the fixed-point conversion cannot overflow (the in-shader clamp caps it
-          * anyway). */
-         float lbias = state->lod_bias;
-         if (lbias >  lod_max) { lbias =  lod_max; }
-         if (lbias < -lod_max) { lbias = -lod_max; }
-         vp->cur_sampler_store.max_lod  = (uint32_t)(lmax * lod_q + 0.5f);
-         vp->cur_sampler_store.min_lod  = (uint32_t)(lmin * lod_q + 0.5f);
-         vp->cur_sampler_store.lod_bias = (int32_t)(lbias * lod_q);
-      }
+      vp_sampler_from_pipe(state, &vp->cur_sampler_store);
       vp->cur_sampler = &vp->cur_sampler_store;
+      const struct lp_texture_handle *h =
+         (const struct lp_texture_handle *)(uintptr_t)handle;
+      if (h) {
+         unsigned idx = h->sampler_index;
+         if (idx >= vp->samplers_cap) {
+            unsigned cap = vp->samplers_cap ? vp->samplers_cap : 16;
+            while (cap <= idx)
+               cap *= 2;
+            struct vp_sampler_cso *ns = realloc(vp->samplers, cap * sizeof *ns);
+            bool *nv = ns ? realloc(vp->sampler_valid, cap * sizeof *nv) : NULL;
+            if (ns)
+               vp->samplers = ns;
+            if (nv) {
+               memset(nv + vp->samplers_cap, 0,
+                      (cap - vp->samplers_cap) * sizeof *nv);
+               vp->sampler_valid = nv;
+               vp->samplers_cap = cap;
+            }
+         }
+         if (idx < vp->samplers_cap) {
+            vp->samplers[idx] = vp->cur_sampler_store;
+            vp->sampler_valid[idx] = true;
+         }
+      }
       vp_dbg("vortexpipe: TEX sampler captured mag=%u min=%u wrap=%u,%u mip_enable=%u mip_linear=%u",
              vp->cur_sampler->filter, vp->cur_sampler->min_filter,
              vp->cur_sampler->wrap_u, vp->cur_sampler->wrap_v,
              vp->cur_sampler->mip_enable, vp->cur_sampler->mip_linear);
    }
-   return vp->lp_create_texture_handle(pipe, view, state);
+   return handle;
+}
+
+static const struct vp_tex_view *
+vp_find_view(const struct vp_context *vp, const void *base)
+{
+   for (unsigned i = 0; i < vp->n_views; i++)
+      if (vp->views[i].base == base)
+         return &vp->views[i];
+   return NULL;
 }
 
 /* Pick the texture the FS actually samples this draw. lavapipe keeps sampled
@@ -1109,7 +1154,7 @@ vp_create_texture_handle(struct pipe_context *pipe,
  * resolve to the last handle create_texture_handle captured. Read
  * lp_jit_texture.base (offset 0 of the sampled image's lp_descriptor) from the
  * bound blob at the FS's (cbuf_index, offset) and match it to a recorded
- * resource, overriding cur_tex. On any miss (no bindless handle, unmapped blob,
+ * view, overriding cur_tex. On any miss (no bindless handle, unmapped blob,
  * unrecorded base) cur_tex is left as captured — the single-texture path. */
 static void
 vp_resolve_tex_from_desc(struct pipe_context *pipe, struct vp_context *vp,
@@ -1129,13 +1174,12 @@ vp_resolve_tex_from_desc(struct pipe_context *pipe, struct vp_context *vp,
    const void *base = NULL;
    memcpy(&base, blob + vp->fs_cbuf_off[ci] + fs->tex_desc_offset, sizeof base);
    pipe_buffer_unmap(pipe, xfer);
-   for (unsigned i = 0; i < vp->txh_count; i++)
-      if (vp->txh_base[i] == base) {
-         vp->cur_tex        = vp->txh_res[i];
-         vp->cur_tex_target = vp->txh_target[i];
-         vp->cur_tex_layers = vp->txh_layers[i];
-         break;
-      }
+   const struct vp_tex_view *v = vp_find_view(vp, base);
+   if (v) {
+      vp->cur_tex        = v->res;
+      vp->cur_tex_target = v->target;
+      vp->cur_tex_layers = v->layers;
+   }
 }
 
 /* ---- graphics: vertex input ---------------------------------------- *
@@ -2041,9 +2085,78 @@ vp_decode_slice(uint8_t *dst, const uint8_t *map, unsigned src_stride,
    }
 }
 
-/* Ensure the bound texture is uploaded + resident, keyed by its resource. The
- * mip chain is read back to a tight host buffer and uploaded once; a re-bind of
- * the same resource reuses it. An FF-format colour resource is packed to
+static uint32_t vp_vx_depth_func(unsigned pf);
+
+/* The sampling parameters of one texture view under one sampler: mip-0 dims, the
+ * VX format and the sampler's filter/wrap/LOD state. No sampler => point sampling,
+ * clamped, over the identity LOD range. */
+static void
+vp_tex_params_init(struct vp_tex_params *tex, struct pipe_resource *res,
+                   unsigned view_target, unsigned view_layers, uint32_t swizzle,
+                   const struct vp_sampler_cso *smp)
+{
+   memset(tex, 0, sizeof *tex);
+   tex->width  = res->width0;
+   tex->height = res->height0;
+   tex->filter = smp ? smp->filter : VX_TEX_FILTER_POINT;
+   tex->min_filter = smp ? smp->min_filter : VX_TEX_FILTER_POINT;
+   tex->wrap_u = smp ? smp->wrap_u : VX_TEX_WRAP_CLAMP;
+   tex->wrap_v = smp ? smp->wrap_v : VX_TEX_WRAP_CLAMP;
+   tex->wrap_w = smp ? smp->wrap_w : VX_TEX_WRAP_CLAMP;
+   tex->border = smp ? smp->border : 0u;
+   /* sampler3D: depth-slice count drives the third-coordinate slice selection.
+    * samplerCubeArray: the cube count bounds the array-layer clamp. A 1D/2D array
+    * carries its layer count, which bounds the layer clamp and answers
+    * textureSize's third component. 0 for a plain 2D or cube texture. Cube-ness
+    * rides on the view target, not the resource. */
+   tex->depth = (res->target == PIPE_TEXTURE_3D)
+                   ? res->depth0
+              : (view_target == PIPE_TEXTURE_CUBE_ARRAY)
+                   ? (view_layers / 6u)
+              : (view_target == PIPE_TEXTURE_2D_ARRAY ||
+                 view_target == PIPE_TEXTURE_1D_ARRAY)
+                   ? view_layers
+                   : 0u;
+   tex->mip_enable = smp ? smp->mip_enable : false;
+   tex->mip_linear = smp ? smp->mip_linear : false;
+   tex->min_lod  = smp ? smp->min_lod : 0u;
+   tex->max_lod  = smp ? smp->max_lod
+                       : ((uint32_t)VX_TEX_LOD_MAX << VX_TEX_LOD_FRAC_BITS);
+   tex->lod_bias = smp ? smp->lod_bias : 0;
+   /* sampler2DShadow: resolve the depth format + compare op so the SW sampler
+    * reads real depth and compares against the shader's ref. */
+   tex->format = vp_vx_tex_format(res->format, NULL);
+   tex->compare_func = (smp && smp->compare_enable)
+                          ? vp_vx_depth_func(smp->compare_func) : 0u;
+   tex->swizzle = swizzle;
+}
+
+/* Sampler-view baseMipLevel: re-base the (view-independent) resident chain so the
+ * shader's level 0 is resource level N. Offset the base to level N, make mip_off
+ * relative to it (level i -> resource level N+i), and report the base-level dims.
+ * Both the SW sampler and the HW TEX DCRs read these, so the two stay consistent. */
+static void
+vp_tex_rebase_level(struct vp_tex_params *tex, uint64_t *tex_dev, uint32_t base_lvl)
+{
+   if (base_lvl == 0)
+      return;
+   if (base_lvl > (uint32_t)VX_TEX_LOD_MAX)
+      base_lvl = (uint32_t)VX_TEX_LOD_MAX;
+   uint32_t base_byte = tex->mip_off[base_lvl];
+   *tex_dev += base_byte;
+   for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i) {
+      uint32_t src = (base_lvl + i <= (uint32_t)VX_TEX_LOD_MAX)
+                   ? base_lvl + i : (uint32_t)VX_TEX_LOD_MAX;
+      tex->mip_off[i] = tex->mip_off[src] - base_byte;
+   }
+   tex->width  = (tex->width  >> base_lvl) ? (tex->width  >> base_lvl) : 1u;
+   tex->height = (tex->height >> base_lvl) ? (tex->height >> base_lvl) : 1u;
+}
+
+/* Ensure a sampled texture is uploaded + resident. The mip chain is read back to
+ * a tight host buffer and uploaded once into a screen-owned mirror, which every
+ * write to the resource invalidates and its destruction evicts; a later sample
+ * of an unchanged resource reuses it. An FF-format colour resource is packed to
  * A8R8G8B8; anything the SW sampler decodes itself (depth, float) copies its raw
  * texels. Returns the device address. */
 static bool
@@ -2053,14 +2166,19 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
               uint64_t *tex_dev, uint32_t mip_off[VX_TEX_LOD_MAX + 1],
               uint32_t *layer_stride_out)
 {
-   if (vp->rtex_buf && vp->rtex_res == res &&
-       vp->rtex_w == w && vp->rtex_h == h) {
-      memcpy(mip_off, vp->rtex_mipoff, sizeof(vp->rtex_mipoff));
-      *layer_stride_out = vp->rtex_layer_stride;
-      return vx_buffer_address(vp->rtex_buf, tex_dev) == VX_SUCCESS;
+   struct vp_tex_mirror m;
+   if (vp_screen_tex_mirror_get(pipe->screen, res, vx_format, &m)) {
+      memcpy(mip_off, m.mip_off, sizeof(m.mip_off));
+      *layer_stride_out = m.layer_stride;
+      *tex_dev = m.dev_addr;
+      return true;
    }
-
-   vp_tex_residency_drop(vp);
+   memset(&m, 0, sizeof m);
+   m.res = res;
+   m.vx_format = vx_format;
+   /* No host range means no write can ever invalidate the mirror, so it is
+    * recorded stale and re-uploaded on every use rather than trusted. */
+   m.dirty = !vp_resource_host_range(res, &m.host_base, &m.size);
 
    /* Upload the whole mip chain contiguously so the TEX unit can address any
     * level the shader selects: level l lives at texel offset off_texels[l] and
@@ -2119,15 +2237,18 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
       for (uint32_t l = 0; l <= (uint32_t)VX_TEX_LOD_MAX; l++)
          mip_off[l] = level_off[l <= last ? l : last] * bpp;
       if (ok)
-         ok = vp_dev_upload(vp->dev, texbuf, bytes, &vp->rtex_buf, tex_dev);
+         ok = vp_dev_upload(vp->dev, texbuf, bytes, &m.buf, &m.dev_addr);
       free(texbuf);
       free(rowbuf);
       if (!ok) return false;
-      vp->rtex_res = res;
-      vp->rtex_w = w; vp->rtex_h = h;
-      vp->rtex_layer_stride = 0u;   /* 3D derives per-level slice sizes from dims */
+      m.layer_stride = 0u;   /* 3D derives per-level slice sizes from dims */
+      memcpy(m.mip_off, mip_off, sizeof(m.mip_off));
+      if (!vp_screen_tex_mirror_put(pipe->screen, &m)) {
+         vx_buffer_release(m.buf);
+         return false;
+      }
+      *tex_dev = m.dev_addr;
       *layer_stride_out = 0u;
-      memcpy(vp->rtex_mipoff, mip_off, sizeof(vp->rtex_mipoff));
       return true;
    }
 
@@ -2165,16 +2286,110 @@ vp_tex_ensure(struct pipe_context *pipe, struct vp_context *vp,
 
    if (ok)
       ok = vp_dev_upload(vp->dev, texbuf, (size_t)layer_stride * layers,
-                         &vp->rtex_buf, tex_dev);
+                         &m.buf, &m.dev_addr);
    free(texbuf);
    free(rowbuf);
    if (!ok) return false;
-   vp->rtex_res = res;
-   vp->rtex_w = w; vp->rtex_h = h;
-   vp->rtex_layer_stride = (layers > 1) ? layer_stride : 0u;
-   *layer_stride_out = vp->rtex_layer_stride;
-   memcpy(vp->rtex_mipoff, mip_off, sizeof(vp->rtex_mipoff));
+   m.layer_stride = (layers > 1) ? layer_stride : 0u;
+   memcpy(m.mip_off, mip_off, sizeof(m.mip_off));
+   if (!vp_screen_tex_mirror_put(pipe->screen, &m)) {
+      vx_buffer_release(m.buf);
+      return false;
+   }
+   *tex_dev = m.dev_addr;
+   *layer_stride_out = m.layer_stride;
    return true;
+}
+
+/* Build one dispatch's bindless texture heap from the descriptor blob it will
+ * upload. Each lp_descriptor slot that the launch does not already relocate as a
+ * buffer, storage image or acceleration structure, and whose lp_jit_texture.base
+ * is a registered view, is a sampled image: its texels are made resident (once,
+ * then reused until the resource is written or destroyed) and it gets one heap
+ * entry built from that view, the sampler its descriptor names by sampler_index,
+ * and the LOD clamp/bias and border the descriptor carries. A texture the device
+ * cannot carry fails the whole dispatch over to llvmpipe rather than sampling
+ * garbage. */
+static bool
+vp_build_tex_heap(struct pipe_context *pipe, struct vp_context *vp,
+                  const struct vp_cso *cso, const uint8_t *blob, uint32_t bytes,
+                  struct vp_tex_heap *heap)
+{
+   STATIC_ASSERT(sizeof(struct lp_descriptor) <= VP_DESC_STRIDE);
+   uint32_t *slot = NULL;
+   gfx_sw_texstate_t *ent = NULL;
+   uint32_t n = 0, cap = 0;
+
+   for (uint32_t off = 0; off + sizeof(struct lp_descriptor) <= bytes;
+        off += VP_DESC_STRIDE) {
+      bool relocated = false;
+      for (uint32_t i = 0; i < cso->num_descs && !relocated; i++)
+         relocated = (cso->descs[i].offset == off);
+      if (relocated)
+         continue;
+      struct lp_descriptor d;
+      memcpy(&d, blob + off, sizeof d);
+      const struct vp_tex_view *v = d.texture.base ? vp_find_view(vp, d.texture.base)
+                                                   : NULL;
+      if (!v || !v->res->width0 || !v->res->height0)
+         continue;
+      struct pipe_resource *res = v->res;
+      if (util_format_is_pure_integer(res->format) && !vp_is_int8_rgba(res->format)) {
+         mesa_logw("vortexpipe: bindless texture format %s has no device path",
+                   util_format_name(res->format));
+         goto fail;
+      }
+
+      struct vp_sampler_cso smp;
+      const bool has_smp = d.texture.sampler_index < vp->samplers_cap &&
+                           vp->sampler_valid[d.texture.sampler_index];
+      if (has_smp) {
+         smp = vp->samplers[d.texture.sampler_index];
+         /* llvmpipe dedups samplers on their static state only; the LOD clamp,
+          * bias and border live in the descriptor itself. */
+         vp_sampler_set_lod(&smp, d.sampler.min_lod, d.sampler.max_lod,
+                            d.sampler.lod_bias);
+         smp.mip_enable = (d.sampler.max_lod > 0.5f);
+         smp.border = vp_vx_border_rgba(d.sampler.border_color);
+      }
+      struct vp_tex_params tp;
+      vp_tex_params_init(&tp, res, v->target, v->layers, v->swizzle,
+                         has_smp ? &smp : NULL);
+      uint32_t bpp = 4;
+      (void)vp_vx_tex_format(res->format, &bpp);
+      uint64_t tex_dev = 0;
+      if (!vp_tex_ensure(pipe, vp, res, res->width0, res->height0, tp.format, bpp,
+                         &tex_dev, tp.mip_off, &tp.layer_stride)) {
+         mesa_loge("vortexpipe: bindless texture upload failed");
+         goto fail;
+      }
+      vp_tex_rebase_level(&tp, &tex_dev, d.texture.first_level);
+
+      if (n == cap) {
+         cap = cap ? cap * 2 : 16;
+         uint32_t *ns = realloc(slot, cap * sizeof *ns);
+         if (!ns)
+            goto fail;
+         slot = ns;
+         gfx_sw_texstate_t *ne = realloc(ent, cap * sizeof *ne);
+         if (!ne)
+            goto fail;
+         ent = ne;
+      }
+      vp_texstate_fill(&ent[n], tex_dev, &tp);
+      slot[n] = off;
+      n++;
+   }
+   vp_dbg("vortexpipe: bindless texture heap: %u sampled image(s)", n);
+   heap->count = n;
+   heap->slot = slot;
+   heap->entries = ent;
+   return true;
+
+fail:
+   free(slot);
+   free(ent);
+   return false;
 }
 
 /* ---- graphics: output-merger state ----------------------- */
@@ -3349,49 +3564,9 @@ vp_draw_vbo(struct pipe_context *pipe,
             tw = vp->cur_tex->width0;
             th = vp->cur_tex->height0;
             if (tw && th) {
-               tex.width  = tw;
-               tex.height = th;
-               tex.filter = vp->cur_sampler ? vp->cur_sampler->filter
-                                            : VX_TEX_FILTER_POINT;
-               tex.wrap_u = vp->cur_sampler ? vp->cur_sampler->wrap_u
-                                            : VX_TEX_WRAP_CLAMP;
-               tex.wrap_v = vp->cur_sampler ? vp->cur_sampler->wrap_v
-                                            : VX_TEX_WRAP_CLAMP;
-               tex.wrap_w = vp->cur_sampler ? vp->cur_sampler->wrap_w
-                                            : VX_TEX_WRAP_CLAMP;
-               tex.border = vp->cur_sampler ? vp->cur_sampler->border : 0u;
-               /* sampler3D: depth-slice count drives the third-coordinate slice
-                * selection. samplerCubeArray: the cube count bounds the array-layer
-                * clamp. A 1D/2D array carries its layer count, which bounds the
-                * layer clamp and answers textureSize's third component. 0 for a
-                * plain 2D or cube texture. Cube-ness rides on the view target, not
-                * the resource. */
-               tex.depth = (vp->cur_tex->target == PIPE_TEXTURE_3D)
-                              ? vp->cur_tex->depth0
-                         : (vp->cur_tex_target == PIPE_TEXTURE_CUBE_ARRAY)
-                              ? (vp->cur_tex_layers / 6u)
-                         : (vp->cur_tex_target == PIPE_TEXTURE_2D_ARRAY ||
-                            vp->cur_tex_target == PIPE_TEXTURE_1D_ARRAY)
-                              ? vp->cur_tex_layers
-                              : 0u;
-               tex.min_filter = vp->cur_sampler ? vp->cur_sampler->min_filter
-                                                : VX_TEX_FILTER_POINT;
-               tex.mip_enable = vp->cur_sampler ? vp->cur_sampler->mip_enable
-                                                : false;
-               tex.mip_linear = vp->cur_sampler ? vp->cur_sampler->mip_linear
-                                                : false;
-               /* LOD clamp/bias (Q8). No sampler => identity clamp [0, LOD_MAX]. */
-               tex.min_lod  = vp->cur_sampler ? vp->cur_sampler->min_lod : 0u;
-               tex.max_lod  = vp->cur_sampler ? vp->cur_sampler->max_lod
-                                              : ((uint32_t)VX_TEX_LOD_MAX << VX_TEX_LOD_FRAC_BITS);
-               tex.lod_bias = vp->cur_sampler ? vp->cur_sampler->lod_bias : 0;
-               /* sampler2DShadow: resolve the depth format + compare op so the SW
-                * sampler reads real depth and compares against the shader's ref. */
-               tex.format = vp_vx_tex_format(vp->cur_tex->format, NULL);
-               tex.compare_func =
-                  (vp->cur_sampler && vp->cur_sampler->compare_enable)
-                     ? vp_vx_depth_func(vp->cur_sampler->compare_func) : 0u;
-               tex.swizzle = vp->cur_tex_swizzle;
+               vp_tex_params_init(&tex, vp->cur_tex, vp->cur_tex_target,
+                                  vp->cur_tex_layers, vp->cur_tex_swizzle,
+                                  vp->cur_sampler);
                tex_used = true;
             }
          }
@@ -3423,21 +3598,8 @@ vp_draw_vbo(struct pipe_context *pipe,
              * level N, make mip_off relative to it (level i -> resource level N+i),
              * and report the base-level dims. Both the SW sampler and the HW TEX
              * DCRs read these, so the two paths stay consistent. */
-            uint32_t base_lvl = vp->cur_tex_first_level;
-            if (drew && base_lvl > 0) {
-               if (base_lvl > (uint32_t)VX_TEX_LOD_MAX) {
-                  base_lvl = (uint32_t)VX_TEX_LOD_MAX;
-               }
-               uint32_t base_byte = tex.mip_off[base_lvl];
-               tex_dev += base_byte;
-               for (uint32_t i = 0; i <= (uint32_t)VX_TEX_LOD_MAX; ++i) {
-                  uint32_t src = (base_lvl + i <= (uint32_t)VX_TEX_LOD_MAX)
-                               ? base_lvl + i : (uint32_t)VX_TEX_LOD_MAX;
-                  tex.mip_off[i] = tex.mip_off[src] - base_byte;
-               }
-               tex.width  = (tex.width  >> base_lvl) ? (tex.width  >> base_lvl) : 1u;
-               tex.height = (tex.height >> base_lvl) ? (tex.height >> base_lvl) : 1u;
-            }
+            if (drew)
+               vp_tex_rebase_level(&tex, &tex_dev, vp->cur_tex_first_level);
          }
 
          /* A draw whose FS writes >1 colour output AND targets >1 bound
@@ -3692,7 +3854,9 @@ vp_context_destroy(struct pipe_context *pipe)
 
    /* Residency: flush + release the resident framebuffer + texture. */
    vp_fb_invalidate(pipe, vp);
-   if (vp->rtex_buf) { vx_buffer_release(vp->rtex_buf); vp->rtex_buf = NULL; }
+   free(vp->views);
+   free(vp->samplers);
+   free(vp->sampler_valid);
 
    /* release the persistent front-end pool's device buffers (the screen
     * still holds the device open until its own teardown). */

@@ -24,6 +24,7 @@ struct pipe_screen;
 #include "VX_types.h"            /* VX_TEX_LOD_MAX */
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
 #include "gfx_fs_desc_abi.h"     /* GFX_FS_DESC_SLOTS */
+#include "gfx_sw_abi.h"          /* gfx_sw_texstate_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -149,6 +150,11 @@ struct vp_tex_params {
    uint32_t    wrap_w;      /* VX_TEX_WRAP_* for the 3D depth (r) axis */
    uint32_t    border;      /* CLAMP_TO_BORDER colour, ARGB8888 */
 };
+
+/* Build the resident SW-sampler descriptor for a texture whose (rebased) chain
+ * lives at device address `tex_dev`. */
+void vp_texstate_fill(gfx_sw_texstate_t *ts, uint64_t tex_dev,
+                      const struct vp_tex_params *tex);
 
 /* Run the WHOLE draw as one device-orchestrated command: the vertex shader
  * `vs_vxbin` is stage 0 of the draw program (linked at VP_STARTUP_VS so it

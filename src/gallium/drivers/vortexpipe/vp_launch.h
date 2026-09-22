@@ -17,6 +17,7 @@
 
 struct pipe_screen;
 #include "vp_nir_to_llvm.h"      /* struct vp_desc */
+#include "gfx_sw_abi.h"          /* gfx_sw_texstate_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,12 @@ extern "C" {
 /* struct lp_descriptor stride in lavapipe's set descriptor buffer:
  * binding N's descriptor starts at N * VP_DESC_STRIDE. */
 #define VP_DESC_STRIDE 256
+
+/* Stride of the RTU scene's instance table (see vp_transcode_as), which sits
+ * immediately below the scene base: entry k for gl_InstanceID k starts at
+ * base - VP_RTU_INST_TABLE_STRIDE * (k + 1) and holds lavapipe's
+ * lvp_bvh_instance_node for it. */
+#define VP_RTU_INST_TABLE_STRIDE 128
 
 /* A raw compute shader buffer bound at set_shader_buffers slot `slot`
  * (not a descriptor-set SSBO). vp_launch uploads `host[0,size)` to device
@@ -38,6 +45,18 @@ struct vp_ssbo {
    bool        trace_cmd; /* this slot is an RT VkTraceRaysIndirectCommand2KHR:
                            * its SBT shader-record device-address fields are
                            * host pointers and must be relocated on upload. */
+};
+
+/* One dispatch's bindless texture heap: entry k is the resident SW-sampler
+ * descriptor of the sampled image whose lp_descriptor sits at byte slot[k] of the
+ * descriptor blob. vp_launch uploads the entries as one buffer and rewrites each
+ * such descriptor's first word (lp_jit_texture.base, a host pointer the device has
+ * no use for) to its entry's device address, which is where a bindless texture op
+ * looks. */
+struct vp_tex_heap {
+   uint32_t                 count;
+   const uint32_t          *slot;
+   const gfx_sw_texstate_t *entries;
 };
 
 /* Run a compiled Vortex compute kernel (.vxbin) on `dev`.
@@ -67,6 +86,7 @@ bool vp_launch(struct pipe_screen *screen, vx_device_h dev,
                const void *desc_host, uint32_t desc_bytes,
                const struct vp_desc *descs, uint32_t num_descs,
                const struct vp_ssbo *ssbos, uint32_t num_ssbos,
+               const struct vp_tex_heap *tex_heap,
                const uint32_t grid[3], const uint32_t block[3],
                const uint32_t grid_base[3],
                uint32_t lmem_size, bool has_rtu);

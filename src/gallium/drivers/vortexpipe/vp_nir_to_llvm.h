@@ -183,6 +183,9 @@ bool vp_descriptors_overflow(struct nir_shader *nir);
  * bound its stage actually has. */
 unsigned vp_descriptors_max_cbuf(struct nir_shader *nir);
 
+/* True when the shader has any texture instruction. */
+bool vp_nir_uses_tex(struct nir_shader *nir);
+
 /* Locate the FS's TEX-stage-0 sampled-image descriptor (cbuf_index, byte offset)
  * from its nir_tex_src_texture_handle, so a draw can read lp_jit_texture.base and
  * select the actually-sampled texture. Returns false if the FS has no bindless

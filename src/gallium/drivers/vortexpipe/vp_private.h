@@ -100,6 +100,13 @@ struct vp_screen {
    unsigned            n_resident;
    unsigned            resident_cap;
    simple_mtx_t        resident_lock;
+   /* Sampled textures' device mirrors, under the same lock and the same
+    * invalidation as `resident`: a texture is not a verbatim copy of its host
+    * bytes (the sampler wants a tight, possibly decoded mip chain), so it cannot
+    * share that table, but it goes stale through exactly the same writes. */
+   struct vp_tex_mirror *tex_mirror;
+   unsigned              n_tex_mirror;
+   unsigned              tex_mirror_cap;
    void (*lp_resource_destroy)(struct pipe_screen *, struct pipe_resource *);
 };
 
@@ -117,6 +124,32 @@ struct vp_resident {
     * rather than towards serving stale data. */
    bool           dirty;
 };
+
+/* One sampled texture's device copy: the whole mip chain (and every layer),
+ * converted to the layout the sampler addresses. Keyed on the resource and the
+ * VX format it was converted to; `host_base`/`size` is the resource's host range,
+ * which is what the write hooks invalidate. */
+struct vp_tex_mirror {
+   struct pipe_resource *res;
+   uint32_t              vx_format;
+   const uint8_t        *host_base;
+   uint32_t              size;
+   vx_buffer_h           buf;
+   uint64_t              dev_addr;
+   uint32_t              mip_off[VX_TEX_LOD_MAX + 1];
+   uint32_t              layer_stride;
+   bool                  dirty;
+};
+
+/* Copy out the clean mirror of `res` converted to `vx_format`. False when there
+ * is none or it is stale, and the caller must upload and vp_screen_tex_mirror_put. */
+bool vp_screen_tex_mirror_get(struct pipe_screen *screen, struct pipe_resource *res,
+                              uint32_t vx_format, struct vp_tex_mirror *out);
+
+/* Record a freshly uploaded mirror, taking ownership of its buffer and releasing
+ * the one it replaces. */
+bool vp_screen_tex_mirror_put(struct pipe_screen *screen,
+                              const struct vp_tex_mirror *m);
 
 /* The host bytes `pres` owns, for either a buffer or a texture. False when the
  * range cannot be determined, and the resource must then be treated as holding
@@ -213,6 +246,10 @@ struct vp_cso {
    struct vp_vs_layout vs_layout;  /* vertex shaders: output record layout */
    struct vp_desc descs[VP_MAX_DESCS];  /* set-0 descriptors the kernel uses */
    unsigned        num_descs;
+   /* compute: the kernel samples textures through bindless handles, so every
+    * dispatch builds a texture heap from the whole set-0 blob and the kernel
+    * links the SW sampler. */
+   bool            bindless_tex;
    /* Fragment TEX-stage-0 texture descriptor location: the (cbuf_index, byte
     * offset) of the sampled image's lp_descriptor within its descriptor-set
     * blob, from the tex instruction's nir_tex_src_texture_handle. Lets the draw
@@ -317,6 +354,15 @@ struct vp_sampler_cso {
    uint32_t border;            /* CLAMP_TO_BORDER colour, ARGB8888 */
 };
 
+/* A sampled view, as create_texture_handle saw it. */
+struct vp_tex_view {
+   const void           *base;      /* level-0 host base (lp_jit_texture.base) */
+   struct pipe_resource *res;
+   unsigned              target;    /* PIPE_TEXTURE_* of the view */
+   unsigned              layers;    /* array layers the view spans */
+   uint32_t              swizzle;   /* packed component map r|g<<3|b<<6|a<<9 */
+};
+
 /* Captured vertex-input layout. The VS kernel fetches one thread's
  * vertex attributes from device memory, so vortexpipe needs the
  * per-attribute byte offset + stride; like the depth/blend csos it is
@@ -408,6 +454,7 @@ struct vp_context {
     * descriptor buffer for descriptor set N at index N+1. */
    struct pipe_resource *cbuf[8];
    unsigned              cbuf_off[8];
+   unsigned              cbuf_sz[8];
    /* Fragment-stage constant buffers, by index (0 = push constants,
     * 1 = descriptor set-0 blob, …). The draw path uploads each bound one
     * to device memory + builds the resident FS descriptor table. */
@@ -537,26 +584,17 @@ struct vp_context {
    unsigned              rmrt_bpp[GFX_OM_MAX_RT];
    unsigned              rmrt_nr;
    void (*lp_flush)(struct pipe_context *, struct pipe_fence_handle **, unsigned);
-   /* Texture residency: the converted + uploaded TEX-stage-0 texels kept
-    * device-resident across draws, keyed by the bound sampler resource. */
-   vx_buffer_h           rtex_buf;
-   struct pipe_resource *rtex_res;
-   unsigned              rtex_w, rtex_h;
-   /* Per-LOD byte offset into rtex_buf (mip 0 at [0]); the whole mip chain is
-    * uploaded contiguously so the TEX unit can address any selected level. */
-   uint32_t              rtex_mipoff[VX_TEX_LOD_MAX + 1];
-   uint32_t              rtex_layer_stride;   /* bytes per array layer (0 = single 2D) */
-   /* Sampled-texture identity map: every texture that gets a bindless handle
-    * (create_texture_handle) is recorded here as (resource, level-0 host base).
-    * A draw reads its FS tex descriptor's lp_jit_texture.base and matches it to
-    * pick the sampled resource — so >1 bound texture selects correctly instead
-    * of always sampling the last handle created. */
-#define VP_MAX_TEX_HANDLES 32
-   const void           *txh_base[VP_MAX_TEX_HANDLES];
-   struct pipe_resource *txh_res[VP_MAX_TEX_HANDLES];
-   unsigned              txh_target[VP_MAX_TEX_HANDLES];
-   unsigned              txh_layers[VP_MAX_TEX_HANDLES];
-   unsigned              txh_count;
+   /* Every sampled view that received a handle (create_texture_handle), keyed
+    * by the level-0 host base its descriptor carries (lp_jit_texture.base). A
+    * descriptor is resolved back to its resource and view state through this --
+    * the per-draw FS selection and the per-dispatch bindless heap alike. */
+   struct vp_tex_view *views;
+   unsigned            n_views, views_cap;
+   /* Captured sampler states, indexed by llvmpipe's sampler_index, which is what
+    * a combined image-sampler descriptor names its sampler by. */
+   struct vp_sampler_cso *samplers;
+   bool                  *sampler_valid;
+   unsigned               samplers_cap;
    /* Output-merger state (depth-stencil-alpha + blend). */
    struct vp_dsa_cso   *cur_dsa;
    struct vp_blend_cso *cur_blend;

@@ -236,6 +236,12 @@ struct vp_tr {
    bool           ok;
 };
 
+/* Every rejection names its site, so an untranslatable shader is diagnosable
+ * from a VORTEXPIPE_DEBUG log instead of a bare "not translatable yet". */
+#define VP_FAIL(tr) \
+   do { vp_dbg("vortexpipe: vp_nir_to_llvm: rejected at %s:%d", __FILE__, __LINE__); \
+        (tr)->ok = false; } while (0)
+
 /* iptr-typed constant (i32 on rv32, i64 on rv64). */
 static inline LLVMValueRef
 vp_iptr_const(struct vp_tr *t, uint64_t v)
@@ -562,7 +568,7 @@ emit_scan_combine(struct vp_tr *t, nir_op rop, LLVMValueRef a, LLVMValueRef b)
    }
    default:
       mesa_logw("vortexpipe: subgroup scan op %d unsupported", rop);
-      t->ok = false;
+      VP_FAIL(t);
       return NULL;
    }
 }
@@ -598,7 +604,7 @@ emit_scan_identity(struct vp_tr *t, nir_op rop)
       return LLVMConstInt(t->i32, 0xFF800000u, false);          /* -inf  */
    default:
       mesa_logw("vortexpipe: subgroup scan op %d has no identity", rop);
-      t->ok = false;
+      VP_FAIL(t);
       return NULL;
    }
 }
@@ -1383,7 +1389,7 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
       default:
          mesa_logw("vortexpipe: vp_nir_to_llvm: unhandled nir_op '%s'",
                    nir_op_infos[alu->op].name);
-         t->ok = false;
+         VP_FAIL(t);
          return;
       }
       ssa_set(t, alu->def.index, c, r);
@@ -1404,7 +1410,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
       if (v->data.mode == nir_var_function_temp) {
          struct vp_var *e = vp_var_find(t, v);
          if (!e) {
-            if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+            if (t->nvars >= VP_MAXV) { VP_FAIL(t); return; }
             /* allocas must sit in the entry block so every deref --
              * including ones inside loops/branches -- is dominated. */
             LLVMBasicBlockRef cur = LLVMGetInsertBlock(t->b);
@@ -1422,7 +1428,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
          addr = LLVMBuildPtrToInt(t->b, e->alloca, t->iptr, "");
       } else if (v->data.mode == nir_var_shader_out) {
          struct vp_var *e = vp_var_find(t, v);
-         if (!e || e->out_off < 0) { t->ok = false; return; }
+         if (!e || e->out_off < 0) { VP_FAIL(t); return; }
          LLVMValueRef off = vp_iptr_const(t, (unsigned)e->out_off);
          if (t->is_vs) {
             /* vertex shader: out_base + vraw * stride + slot_offset. The output
@@ -1440,7 +1446,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
       } else if (v->data.mode == nir_var_shader_in && t->is_fs) {
          /* fragment shader input: an interpolated varying. */
          struct vp_var *e = vp_var_find(t, v);
-         if (!e || e->out_off < 0) { t->ok = false; return; }
+         if (!e || e->out_off < 0) { VP_FAIL(t); return; }
          addr = LLVMBuildAdd(t->b, t->fs_in_base,
             vp_iptr_const(t, (unsigned)e->out_off), "fsin");
       } else if (v->data.mode == nir_var_shader_in && t->is_vs) {
@@ -1456,7 +1462,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
       } else {
          mesa_logw("vortexpipe: vp_nir_to_llvm: deref of unsupported "
                    "var mode %d", (int)v->data.mode);
-         t->ok = false;
+         VP_FAIL(t);
          return;
       }
       break;
@@ -1464,7 +1470,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
    case nir_deref_type_array: {
       LLVMValueRef base = ssa_get(t, d->parent.ssa->index, 0);
       LLVMValueRef idx  = ssa_get(t, d->arr.index.ssa->index, 0);
-      if (!base || !idx) { t->ok = false; return; }
+      if (!base || !idx) { VP_FAIL(t); return; }
       LLVMValueRef off = LLVMBuildMul(t->b, vp_to_iptr(t, idx),
          vp_iptr_const(t, glsl_bytes(d->type)), "");
       addr = LLVMBuildAdd(t->b, base, off, "elem");
@@ -1473,7 +1479,7 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
    default:
       mesa_logw("vortexpipe: vp_nir_to_llvm: unhandled deref type %d",
                 (int)d->deref_type);
-      t->ok = false;
+      VP_FAIL(t);
       return;
    }
 
@@ -1503,14 +1509,14 @@ emit_atomic_at(struct vp_tr *t, nir_intrinsic_instr *in, LLVMValueRef p,
    if (in->def.bit_size != 32) {
       mesa_logw("vortexpipe: %u-bit atomic unsupported (32-bit only)",
                 in->def.bit_size);
-      t->ok = false;
+      VP_FAIL(t);
       return;
    }
    nir_atomic_op aop = nir_intrinsic_atomic_op(in);
    if (is_swap) {
       if (aop != nir_atomic_op_cmpxchg) {
          mesa_logw("vortexpipe: atomic_swap op %d unsupported", aop);
-         t->ok = false;
+         VP_FAIL(t);
          return;
       }
       LLVMValueRef r = LLVMBuildAtomicCmpXchg(t->b, p,
@@ -1537,7 +1543,7 @@ emit_atomic_at(struct vp_tr *t, nir_intrinsic_instr *in, LLVMValueRef p,
    }
    if (!supported) {
       mesa_logw("vortexpipe: atomic op %d unsupported (int32 only)", aop);
-      t->ok = false;
+      VP_FAIL(t);
       return;
    }
    LLVMValueRef r = LLVMBuildAtomicRMW(t->b, op, p, intr_src(t, in, di),
@@ -1895,7 +1901,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       if (in->def.bit_size != 32) {
          mesa_logw("vortexpipe: %u-bit SSBO atomic unsupported (32-bit only)",
                    in->def.bit_size);
-         t->ok = false;
+         VP_FAIL(t);
          break;
       }
       nir_atomic_op aop = nir_intrinsic_atomic_op(in);
@@ -1912,7 +1918,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
           * {oldval, i1 success}; the intrinsic wants the old value. */
          if (aop != nir_atomic_op_cmpxchg) {
             mesa_logw("vortexpipe: SSBO atomic_swap op %d unsupported", aop);
-            t->ok = false;
+            VP_FAIL(t);
             break;
          }
          LLVMValueRef cmp = intr_src(t, in, 2);
@@ -1943,7 +1949,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          /* float atomics (fadd/fmin/fmax), inc/dec_wrap: no device AMO */
          mesa_logw("vortexpipe: SSBO atomic op %d unsupported (int32 only)",
                    aop);
-         t->ok = false;
+         VP_FAIL(t);
          break;
       }
       LLVMValueRef val = intr_src(t, in, 2);
@@ -1966,7 +1972,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
     * data follows at src[1] (swap: src[1]=compare, src[2]=new). */
    case nir_intrinsic_shared_atomic:
    case nir_intrinsic_shared_atomic_swap: {
-      if (!t->lmem_base) { t->ok = false; break; }
+      if (!t->lmem_base) { VP_FAIL(t); break; }
       LLVMValueRef addr = LLVMBuildAdd(t->b,
          LLVMBuildAdd(t->b, t->lmem_base,
             vp_iptr_const(t, nir_intrinsic_base(in)), ""),
@@ -2031,7 +2037,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    }
    /* shared memory: addr = CTA local-mem base + nir_base + dynamic off. */
    case nir_intrinsic_load_shared: {
-      if (!t->lmem_base) { t->ok = false; break; }
+      if (!t->lmem_base) { VP_FAIL(t); break; }
       LLVMValueRef addr = LLVMBuildAdd(t->b,
          LLVMBuildAdd(t->b, t->lmem_base,
             vp_iptr_const(t, nir_intrinsic_base(in)), ""),
@@ -2046,7 +2052,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       break;
    }
    case nir_intrinsic_store_shared: {
-      if (!t->lmem_base) { t->ok = false; break; }
+      if (!t->lmem_base) { VP_FAIL(t); break; }
       LLVMValueRef addr = LLVMBuildAdd(t->b,
          LLVMBuildAdd(t->b, t->lmem_base,
             vp_iptr_const(t, nir_intrinsic_base(in)), ""),
@@ -2202,7 +2208,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       if (in->def.bit_size != 32) {
          mesa_logw("vortexpipe: %u-bit subgroup scan/reduce unsupported (32-bit only)",
                    in->def.bit_size);
-         t->ok = false;
+         VP_FAIL(t);
          break;
       }
       unsigned cluster = in->intrinsic == nir_intrinsic_reduce
@@ -2214,7 +2220,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       if ((cluster & (cluster - 1u)) || cluster > 32u) {
          mesa_logw("vortexpipe: unsupported subgroup reduce cluster size %u",
                    cluster);
-         t->ok = false;
+         VP_FAIL(t);
          break;
       }
       if (cluster == 1u) {
@@ -2320,7 +2326,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
     * component is a separate scalar load/store, width from bit size. */
    case nir_intrinsic_load_deref: {
       LLVMValueRef addr = intr_src(t, in, 0);
-      if (!addr) { t->ok = false; break; }
+      if (!addr) { VP_FAIL(t); break; }
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
@@ -2332,7 +2338,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    }
    case nir_intrinsic_store_deref: {
       LLVMValueRef addr = intr_src(t, in, 0);
-      if (!addr) { t->ok = false; break; }
+      if (!addr) { VP_FAIL(t); break; }
       unsigned mask = nir_intrinsic_write_mask(in);
       unsigned nc   = nir_src_num_components(in->src[1]);
       unsigned esz  = nir_src_bit_size(in->src[1]) / 8u;
@@ -2340,7 +2346,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          if (!(mask & (1u << c)))
             continue;
          LLVMValueRef v = ssa_get(t, in->src[1].ssa->index, c);
-         if (!v) { t->ok = false; break; }
+         if (!v) { VP_FAIL(t); break; }
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             vp_iptr_const(t, c * esz), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
@@ -2465,7 +2471,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       default:
          mesa_logw("vortexpipe: image %s: unsupported format %d",
                    store ? "store" : "load", fmt);
-         t->ok = false;
+         VP_FAIL(t);
          break;
       }
       if (!t->ok) break;
@@ -2624,7 +2630,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
    default:
       mesa_logw("vortexpipe: vp_nir_to_llvm: unhandled intrinsic '%s'",
                 nir_intrinsic_infos[in->intrinsic].name);
-      t->ok = false;
+      VP_FAIL(t);
    }
 }
 
@@ -2886,8 +2892,12 @@ emit_vx_wgather(struct vp_tr *t, LLVMValueRef self, LLVMValueRef v1,
     * consumes operand index $1, so the three scatter sources v1/v2/v3 are
     * $2/$3/$4 — referencing $1/$2/$3 here would alias the self register and
     * drop v3 (lane3). rs1<-v1(lane1), rs2<-v2(lane2), rs3<-v3(lane3). */
+   /* The gather writes every lane of rd, active or not (so the unit reading the
+    * packed operand across the warp sees all of it), which would clobber an
+    * inactive lane's live value in any allocatable register. x31 is the
+    * warp-gather register the backend reserves wherever it is pinned. */
    const char *s = ".insn r4 43, 0, 0, $0, $2, $3, $4";
-   const char *c = "=r,0,r,r,r";
+   const char *c = "={x31},0,r,r,r";
    LLVMTypeRef args[4] = { t->i32, t->i32, t->i32, t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 4, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
@@ -2930,7 +2940,9 @@ emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
    LLVMValueRef cfg = emit_vx_wgather(t, z, scene, z, flags_cull);
 
    const char *s = ".insn r 43, 7, 0, $0, $1, x0";
-   const char *c = "=r,r,{f0},{f1},{f2},{f3},{f4},{f5},{f6},{f7}";
+   /* cfg is read straight from the gather register: a copy elsewhere would be
+    * written on active lanes only, leaving the packed lanes the RTU reads stale. */
+   const char *c = "=r,{x31},{f0},{f1},{f2},{f3},{f4},{f5},{f6},{f7}";
    LLVMTypeRef args[9];
    args[0] = t->i32;                              /* cfg (rs1) */
    for (int i = 0; i < 8; i++) args[1 + i] = t->f32;  /* f0..f7 */
@@ -3816,14 +3828,12 @@ emit_tex_3d(struct vp_tr *t, nir_tex_instr *tex, LLVMValueRef u, LLVMValueRef v,
  * texel as four floats in [0,1]. A sampler2DShadow op returns a single depth-
  * compare float instead (emit_tex_shadow). */
 static void
-emit_tex(struct vp_tr *t, nir_tex_instr *tex)
+emit_tex_sample(struct vp_tr *t, nir_tex_instr *tex)
 {
    /* Every texture route -- the SW sampler and the HW TEX path alike -- reads the
-    * resident descriptor table for the filter word and the log2 dimensions. Only
-    * the fragment entry carries that table, so a texture op in any other stage has
-    * no descriptor to read. Refuse the shader rather than build a GEP on a null. */
+    * resident descriptor for the filter word and the log2 dimensions. */
    if (!t->fs_texstate) {
-      t->ok = false;
+      VP_FAIL(t);
       return;
    }
    /* The gather footprint is addressed in one face's 2D space, so a cube gather
@@ -3834,7 +3844,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
        tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
       mesa_logw("vortexpipe: vp_nir_to_llvm: textureGather on a cube sampler "
                 "is unimplemented");
-      t->ok = false;
+      VP_FAIL(t);
       return;
    }
    LLVMValueRef u = NULL, v = NULL, lod_int = NULL, bias_f = NULL;
@@ -4009,7 +4019,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    if (tex->op == nir_texop_txf) {
       if (!u || !v) {
          mesa_logw("vortexpipe: vp_nir_to_llvm: texelFetch missing coord");
-         t->ok = false;
+         VP_FAIL(t);
          return;
       }
       LLVMValueRef lod = lod_int ? lod_int : LLVMConstInt(t->i32, 0, false);
@@ -4047,7 +4057,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    if (tex->op == nir_texop_tg4) {
       if (!u || !v) {
          mesa_logw("vortexpipe: vp_nir_to_llvm: textureGather missing coord");
-         t->ok = false;
+         VP_FAIL(t);
          return;
       }
       LLVMValueRef guf = LLVMBuildBitCast(t->b, u, t->f32, "");
@@ -4092,7 +4102,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    if (tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
        tex->op != nir_texop_txb) {
       mesa_logw("vortexpipe: vp_nir_to_llvm: unsupported texture op %d", tex->op);
-      t->ok = false;
+      VP_FAIL(t);
       return;
    }
    /* A 1D texture is one row of a 2D one, so supplying the second coordinate
@@ -4110,7 +4120,7 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
       mesa_logw("vortexpipe: vp_nir_to_llvm: texture op %d: no %s coordinate "
                 "component (unsupported sampler dimensionality)",
                 tex->op, u ? "second" : "first");
-      t->ok = false;
+      VP_FAIL(t);
       return;
    }
 
@@ -4223,6 +4233,47 @@ emit_tex(struct vp_tr *t, nir_tex_instr *tex)
    emit_tex_unpack(t, tex, texel);
 }
 
+/* A texture op. The fragment entry is handed its resident texture descriptor as a
+ * kernel argument. Every other stage (compute, and the ray-tracing megashader built
+ * on it) samples bindlessly: the texture handle is the device address of the
+ * sampled image's lp_descriptor, whose first word the launch rewrote to the device
+ * address of that texture's resident gfx_sw_texstate_t -- the descriptor-in-memory
+ * model of a modern GPU's T#. The handle may differ per lane, so the sample runs
+ * on the per-thread SW sampler; the FF TEX unit's DCR-banked stages cannot be
+ * indexed by a descriptor. Without derivatives only explicit-LOD and size/fetch
+ * ops are well defined outside a fragment shader. */
+static void
+emit_tex(struct vp_tr *t, nir_tex_instr *tex)
+{
+   if (t->is_fs) {
+      emit_tex_sample(t, tex);
+      return;
+   }
+   LLVMValueRef handle = NULL;
+   for (unsigned i = 0; i < tex->num_srcs; i++)
+      if (tex->src[i].src_type == nir_tex_src_texture_handle)
+         handle = ssa_get(t, tex->src[i].src.ssa->index, 0);
+   if (!handle ||
+       (tex->op != nir_texop_txl && tex->op != nir_texop_txf &&
+        tex->op != nir_texop_txs && tex->op != nir_texop_tg4)) {
+      mesa_logw("vortexpipe: vp_nir_to_llvm: texture op %d outside a fragment "
+                "shader needs a bindless handle and an explicit LOD", tex->op);
+      VP_FAIL(t);
+      return;
+   }
+   if (LLVMTypeOf(handle) != t->i64)
+      handle = LLVMBuildZExt(t->b, handle, t->i64, "");
+   LLVMValueRef ts_addr = LLVMBuildLoad2(t->b, t->i64,
+      LLVMBuildIntToPtr(t->b, handle, t->ptr, ""), "texstate_addr");
+   LLVMValueRef saved_ts = t->fs_texstate;
+   bool saved_sw = t->sw_tex;
+   t->fs_texstate = LLVMBuildIntToPtr(t->b, ts_addr, t->ptr, "texstate");
+   t->sw_tex = true;
+   emit_tex_sample(t, tex);
+   t->fs_texstate = saved_ts;
+   t->sw_tex = saved_sw;
+}
+
 /* A NIR phi -> one LLVM phi per component. The incoming values are
  * wired up by emit_cfg's deferred pass, once every block + value
  * exists (a loop's header phi reads a value defined in its body). */
@@ -4274,7 +4325,7 @@ emit_instr(struct vp_tr *t, nir_instr *instr)
    default:
       mesa_logw("vortexpipe: vp_nir_to_llvm: unhandled nir_instr_type %d",
                 (int)instr->type);
-      t->ok = false;
+      VP_FAIL(t);
       break;
    }
    return t->ok;
@@ -4292,7 +4343,12 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
 {
    nir_metadata_require(impl, nir_metadata_block_index);
    LLVMBasicBlockRef *bb = calloc(impl->num_blocks, sizeof(*bb));
-   if (!bb) { t->ok = false; return; }
+   /* The block each NIR block's control leaves from. An instruction that
+    * branches internally (a texture HW/SW route, a sampler call split) moves
+    * the insert point into a block of its own, and that block -- not the one
+    * the NIR block started in -- is the phi's predecessor. */
+   LLVMBasicBlockRef *bb_exit = calloc(impl->num_blocks, sizeof(*bb_exit));
+   if (!bb || !bb_exit) { VP_FAIL(t); free(bb); free(bb_exit); return; }
 
    /* one LLVM block per NIR block; block 0 reuses `entry` so the
     * kernel prologue stays contiguous with the first NIR block. */
@@ -4305,12 +4361,13 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
    nir_foreach_block(blk, impl) {
       LLVMPositionBuilderAtEnd(t->b, bb[blk->index]);
       nir_foreach_instr(instr, blk) {
-         if (!emit_instr(t, instr)) { free(bb); return; }
+         if (!emit_instr(t, instr)) { free(bb); free(bb_exit); return; }
       }
+      bb_exit[blk->index] = LLVMGetInsertBlock(t->b);
       nir_if *nif = nir_block_get_following_if(blk);
       if (nif) {
          LLVMValueRef c = ssa_get(t, nif->condition.ssa->index, 0);
-         if (!c) { t->ok = false; free(bb); return; }
+         if (!c) { VP_FAIL(t); free(bb); free(bb_exit); return; }
          if (LLVMTypeOf(c) != LLVMInt1TypeInContext(t->ctx))
             c = LLVMBuildICmp(t->b, LLVMIntNE, c,
                    LLVMConstInt(LLVMTypeOf(c), 0, false), "");
@@ -4336,7 +4393,7 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
                continue;
             nir_foreach_phi_src(src, phi) {
                LLVMValueRef     v    = ssa_get(t, src->src.ssa->index, c);
-               LLVMBasicBlockRef pred = bb[src->pred->index];
+               LLVMBasicBlockRef pred = bb_exit[src->pred->index];
                if (v)
                   LLVMAddIncoming(llphi, &v, &pred, 1);
             }
@@ -4344,6 +4401,7 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
       }
    }
    free(bb);
+   free(bb_exit);
 }
 
 /* Mark `fn` as a Vortex kernel entry: emit the @llvm.global.annotations
@@ -4406,7 +4464,7 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
    unsigned next = 16;   /* slot 0 reserved for gl_Position */
    unsigned vs_scalars = 0;
    nir_foreach_shader_out_variable(var, nir) {
-      if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      if (t->nvars >= VP_MAXV) { VP_FAIL(t); return; }
       int off;
       if (var->data.location == VARYING_SLOT_POS) {
          off = 0;
@@ -4418,7 +4476,7 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
                mesa_logw("vortexpipe: VS declares more than %u generic "
                          "varyings; this draw runs on llvmpipe",
                          VP_VS_MAX_VARYINGS);
-               t->ok = false; return;
+               VP_FAIL(t); return;
             }
             out_vs->varying_loc[out_vs->num_varyings]   = var->data.location;
             out_vs->varying_comps[out_vs->num_varyings] =
@@ -4441,7 +4499,7 @@ vs_scan_outputs(struct vp_tr *t, struct nir_shader *nir,
       mesa_logw("vortexpipe: VS varyings need %u interpolation planes, "
                 "device carries %u; this draw runs on llvmpipe",
                 vs_scalars, VP_RAST_MAX_PLANES);
-      t->ok = false; return;
+      VP_FAIL(t); return;
    }
    t->out_stride = next;   /* 16 * (1 + num_varyings) */
    if (out_vs)
@@ -4458,7 +4516,7 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
    unsigned fs_scalars = 0;
    t->fs_pos_off = -1;
    nir_foreach_shader_in_variable(var, nir) {
-      if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      if (t->nvars >= VP_MAXV) { VP_FAIL(t); return; }
       /* A flat varying bypasses the interpolator: its bit pattern is not
        * necessarily a number -- which is why every integer varying is flat --
        * and the plane path would premultiply it by 1/w and quantise it to
@@ -4475,7 +4533,7 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
                    "interpolation, which the device varying path does not "
                    "implement; this draw runs on llvmpipe",
                    var->data.location);
-         t->ok = false; return;
+         VP_FAIL(t); return;
       }
       /* gl_FragCoord is a system value wearing an input's clothes. It takes a
        * slot in the record like any other input, but the wrapper writes it from
@@ -4503,7 +4561,7 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
       mesa_logw("vortexpipe: FS declares %u input slots, record holds %u; "
                 "this draw runs on llvmpipe",
                 off / 16u, (VP_FS_IN_WORDS * 4u) / 16u - 1u);
-      t->ok = false; return;
+      VP_FAIL(t); return;
    }
    /* Same plane budget as the VS side, checked here too because the two are
     * compiled independently: a fragment shader reading past the last plane is
@@ -4512,7 +4570,7 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
       mesa_logw("vortexpipe: FS inputs need %u interpolation planes, "
                 "device carries %u; this draw runs on llvmpipe",
                 fs_scalars, VP_RAST_MAX_PLANES);
-      t->ok = false; return;
+      VP_FAIL(t); return;
    }
    /* Output slots are keyed by render-target index: a colour output at
     * FRAG_RESULT_DATA0+k lands at out slot k*16, so the wrapper can pack colours
@@ -4523,7 +4581,7 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
    unsigned num_color = 0, scratch = 0;
    t->fs_depth_off = -1;
    nir_foreach_shader_out_variable(var, nir) {
-      if (t->nvars >= VP_MAXV) { t->ok = false; return; }
+      if (t->nvars >= VP_MAXV) { VP_FAIL(t); return; }
       unsigned loc = var->data.location;
       int rt;
       if (loc == FRAG_RESULT_COLOR) {
@@ -4541,7 +4599,7 @@ fs_scan_io(struct vp_tr *t, struct nir_shader *nir)
          if ((unsigned)rt >= GFX_OM_MAX_RT) { /* bound the RT index */
             mesa_loge("vortexpipe: FS colour output RT%d exceeds VX_OM_MAX_RT=%u",
                       rt, GFX_OM_MAX_RT);
-            t->ok = false; return;
+            VP_FAIL(t); return;
          }
          slot = (unsigned)rt;
          if ((unsigned)rt + 1 > num_color) num_color = (unsigned)rt + 1;
@@ -5120,7 +5178,7 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
       if (t->fs_samples > 1 && !msaa) {
          mesa_logw("vortexpipe: multisample FS variant lacks a per-sample "
                    "coverage source or a software merger; runs on llvmpipe");
-         t->ok = false;
+         VP_FAIL(t);
       }
       /* MRT under multisampling has no device ABI -- gfx_om_fragment_mrt_sw is
        * single-sample only, and merging through it would write plausible garbage
@@ -5129,7 +5187,7 @@ emit_shade_pixel(struct vp_tr *t, LLVMValueRef fn,
       if (msaa && num_color > 1) {
          mesa_logw("vortexpipe: multisample MRT has no device merge path; "
                    "this shader runs on llvmpipe");
-         t->ok = false;
+         VP_FAIL(t);
       }
 
       if (msaa && num_color <= 1) {
@@ -5928,7 +5986,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    nir_foreach_function_impl(impl, nir) {
       t.nval = impl->ssa_alloc;
       t.val  = calloc((size_t)t.nval * VP_MAXC, sizeof(LLVMValueRef));
-      if (!t.val) { t.ok = false; break; }
+      if (!t.val) { VP_FAIL(&t); break; }
 
       /* walk the control-flow graph (emits each block's terminator,
        * including the function return). NIR block 0 reuses the prologue's
@@ -6206,6 +6264,20 @@ vp_descriptors_max_cbuf(struct nir_shader *nir)
       if (scratch[i].cbuf_index > max)
          max = scratch[i].cbuf_index;
    return max;
+}
+
+bool
+vp_nir_uses_tex(struct nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(blk, impl) {
+         nir_foreach_instr(instr, blk) {
+            if (instr->type == nir_instr_type_tex)
+               return true;
+         }
+      }
+   }
+   return false;
 }
 
 /* Locate the FS's TEX-stage-0 texture descriptor: the sampled image's lp_descriptor

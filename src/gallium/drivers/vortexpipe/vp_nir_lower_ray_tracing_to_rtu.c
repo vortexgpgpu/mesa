@@ -24,6 +24,7 @@
  */
 
 #include "vp_nir_to_llvm.h"
+#include "vp_launch.h"   /* VP_RTU_INST_TABLE_STRIDE */
 
 #include "nir.h"
 #include "nir_builder.h"
@@ -170,6 +171,23 @@ lower_proceed(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    return sts_is_yield(b, status);
 }
 
+/* The RTU reports an instance only by ID; vp_transcode_as places lavapipe's
+ * lvp_bvh_instance_node for each ID just below the scene base. Read one 32-bit
+ * word of the hit instance's node. */
+#define LVP_INST_SBTFLAGS_OFF 12
+#define LVP_INST_WTO_OFF      16
+#define LVP_INST_OTW_OFF      72
+
+static nir_def *
+rq_instance_word(nir_builder *b, struct rq_state *st, nir_def *status, unsigned off)
+{
+   nir_def *id = rt_get(b, VX_RT_HIT_INSTANCE_ID, status);
+   nir_def *entry = nir_isub(b, nir_u2u64(b, nir_load_var(b, st->scene)),
+                             nir_u2u64(b, nir_imul_imm(b, nir_iadd_imm(b, id, 1),
+                                                       VP_RTU_INST_TABLE_STRIDE)));
+   return nir_build_load_global(b, 1, 32, nir_iadd_imm(b, entry, off));
+}
+
 static nir_def *
 lower_load(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
 {
@@ -204,18 +222,35 @@ lower_load(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    case nir_ray_query_value_intersection_primitive_index:
       return rt_get(b, VX_RT_HIT_PRIMITIVE_ID, status);
    case nir_ray_query_value_intersection_geometry_index:
-      return rt_get(b, VX_RT_HIT_GEOMETRY_INDEX, status);
+      /* The scene carries lavapipe's geometry_id_and_flags; flags ride the top. */
+      return nir_iand_imm(b, rt_get(b, VX_RT_HIT_GEOMETRY_INDEX, status), 0x0fffffff);
    case nir_ray_query_value_intersection_instance_id:
       return rt_get(b, VX_RT_HIT_INSTANCE_ID, status);
    case nir_ray_query_value_intersection_instance_custom_index:
       return rt_get(b, VX_RT_HIT_INSTANCE_CUSTOM, status);
    case nir_ray_query_value_intersection_object_ray_origin:
-      /* Opaque single-level path: object ray == world ray (the RTU only
-       * stages a distinct object ray on a callback yield). Return the
-       * staged world ray rather than the unwritten object-ray slots. */
-      return nir_load_var(b, st->origin);
-   case nir_ray_query_value_intersection_object_ray_direction:
-      return nir_load_var(b, st->dir);
+   case nir_ray_query_value_intersection_object_ray_direction: {
+      /* The RTU stages the instance-space ray with both the committed hit and
+       * a yielded candidate. */
+      unsigned base = value == nir_ray_query_value_intersection_object_ray_origin
+                         ? VX_RT_OBJECT_RAY_ORIGIN : VX_RT_OBJECT_RAY_DIRECTION;
+      return nir_vec3(b, rt_get(b, base + 0, status), rt_get(b, base + 1, status),
+                         rt_get(b, base + 2, status));
+   }
+   case nir_ray_query_value_intersection_instance_sbt_index:
+      return nir_iand_imm(b, rq_instance_word(b, st, status, LVP_INST_SBTFLAGS_OFF),
+                          0xffffff);
+   case nir_ray_query_value_intersection_object_to_world:
+   case nir_ray_query_value_intersection_world_to_object: {
+      /* Column `column` of the instance's 3x4 row-major affine. */
+      unsigned off = value == nir_ray_query_value_intersection_object_to_world
+                        ? LVP_INST_OTW_OFF : LVP_INST_WTO_OFF;
+      unsigned col = nir_intrinsic_column(in);
+      return nir_vec3(b,
+         rq_instance_word(b, st, status, off + 4 * (0 * 4 + col)),
+         rq_instance_word(b, st, status, off + 4 * (1 * 4 + col)),
+         rq_instance_word(b, st, status, off + 4 * (2 * 4 + col)));
+   }
    default:
       /* Unhandled query value (front-face, transforms, world ray, …):
        * return zeros of the requested shape for now. */
