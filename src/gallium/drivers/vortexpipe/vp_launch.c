@@ -317,51 +317,68 @@ vp_xform_compose(const float A[12], const float B[12], float C[12])
    }
 }
 
+/* Node-pointer stack for the lavapipe BVH walks. lavapipe's binary trees can
+ * run deeper than any fixed recursion bound on large meshes, so the walks are
+ * iterative and every subtree is visited. */
+struct vp_ptr_stack {
+   uint32_t *p;
+   uint32_t  count, cap;
+   bool      ok;
+};
+
 /* Collect a BLAS's primitives in object space. Opacity here is the geometry's
  * own: instance overrides travel in the instance record, where the RTU
  * composes them per instance, so one BLAS serves every instance of it. */
 static void
-vp_walk_blas(const uint8_t *bvh, uint32_t node_ptr, struct vp_prim_list *l, int depth)
+vp_walk_blas(const uint8_t *bvh, uint32_t root, struct vp_prim_list *l)
 {
-   if (node_ptr == LVP_NODE_INVALID || depth > 64 || !l->ok)
-      return;
-   const uint8_t *node = bvh + (node_ptr & ~7u);
-   switch (node_ptr & 7u) {
-   case LVP_NODE_INTERNAL: {
-      uint32_t c0, c1;
-      memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
-      memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
-      vp_walk_blas(bvh, c0, l, depth + 1);
-      vp_walk_blas(bvh, c1, l, depth + 1);
-      break;
+   struct vp_ptr_stack st = { .ok = true };
+   VP_LIST_PUSH(&st, root);
+   while (st.ok && l->ok && st.count) {
+      const uint32_t node_ptr = st.p[--st.count];
+      if (node_ptr == LVP_NODE_INVALID)
+         continue;
+      const uint8_t *node = bvh + (node_ptr & ~7u);
+      switch (node_ptr & 7u) {
+      case LVP_NODE_INTERNAL: {
+         uint32_t c0, c1;
+         memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
+         memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
+         VP_LIST_PUSH(&st, c1);
+         VP_LIST_PUSH(&st, c0);
+         break;
+      }
+      case LVP_NODE_TRIANGLE: {
+         struct vp_prim pr;
+         uint32_t geom_flags = 0;
+         memcpy(pr.v, node, 36);                    /* coords[3][3] */
+         memcpy(&pr.prim_id, node + 40, 4);
+         memcpy(&geom_flags, node + LVP_TRI_GEOMFLAGS_OFF, 4);
+         pr.geom_id = geom_flags;
+         pr.flags = (geom_flags & LVP_GEOMETRY_OPAQUE) ? RTU_BVH_FLAG_OPAQUE : 0u;
+         VP_LIST_PUSH(l, pr);
+         break;
+      }
+      case LVP_NODE_AABB: {
+         struct vp_prim pr;
+         uint32_t geom_flags = 0;
+         memset(&pr, 0, sizeof pr);
+         memcpy(pr.v, node, 24);                    /* vk_aabb {min, max} */
+         memcpy(&pr.prim_id, node + LVP_AABB_PRIM_OFF, 4);
+         memcpy(&geom_flags, node + LVP_AABB_GEOMFLAGS_OFF, 4);
+         pr.geom_id = geom_flags;
+         pr.flags = RTU_BVH_FLAG_PROCEDURAL |
+                    ((geom_flags & LVP_GEOMETRY_OPAQUE) ? RTU_BVH_FLAG_OPAQUE : 0u);
+         VP_LIST_PUSH(l, pr);
+         break;
+      }
+      default:
+         break;
+      }
    }
-   case LVP_NODE_TRIANGLE: {
-      struct vp_prim pr;
-      uint32_t geom_flags = 0;
-      memcpy(pr.v, node, 36);                    /* coords[3][3] */
-      memcpy(&pr.prim_id, node + 40, 4);
-      memcpy(&geom_flags, node + LVP_TRI_GEOMFLAGS_OFF, 4);
-      pr.geom_id = geom_flags;
-      pr.flags = (geom_flags & LVP_GEOMETRY_OPAQUE) ? RTU_BVH_FLAG_OPAQUE : 0u;
-      VP_LIST_PUSH(l, pr);
-      break;
-   }
-   case LVP_NODE_AABB: {
-      struct vp_prim pr;
-      uint32_t geom_flags = 0;
-      memset(&pr, 0, sizeof pr);
-      memcpy(pr.v, node, 24);                    /* vk_aabb {min, max} */
-      memcpy(&pr.prim_id, node + LVP_AABB_PRIM_OFF, 4);
-      memcpy(&geom_flags, node + LVP_AABB_GEOMFLAGS_OFF, 4);
-      pr.geom_id = geom_flags;
-      pr.flags = RTU_BVH_FLAG_PROCEDURAL |
-                 ((geom_flags & LVP_GEOMETRY_OPAQUE) ? RTU_BVH_FLAG_OPAQUE : 0u);
-      VP_LIST_PUSH(l, pr);
-      break;
-   }
-   default:
-      break;
-   }
+   if (!st.ok)
+      l->ok = false;
+   free(st.p);
 }
 
 /* lavapipe's packed instance flags -> the RTU's (VkGeometryInstanceFlagBits). */
@@ -381,43 +398,51 @@ vp_rtu_inst_flags(uint32_t sbt_offset_and_flags)
 }
 
 static void
-vp_walk_tlas(const uint8_t *bvh, uint32_t node_ptr, struct vp_inst_list *il, int depth)
+vp_walk_tlas(const uint8_t *bvh, uint32_t root, struct vp_inst_list *il)
 {
-   if (node_ptr == LVP_NODE_INVALID || depth > 64 || !il->ok)
-      return;
-   const uint8_t *node = bvh + (node_ptr & ~7u);
-   switch (node_ptr & 7u) {
-   case LVP_NODE_INTERNAL: {
-      uint32_t c0, c1;
-      memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
-      memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
-      vp_walk_tlas(bvh, c0, il, depth + 1);
-      vp_walk_tlas(bvh, c1, il, depth + 1);
-      break;
-   }
-   case LVP_NODE_INSTANCE: {
-      struct vp_inst in;
-      uint64_t blas = 0;
-      uint32_t cm = 0, sf = 0;
-      memcpy(&blas, node, 8);
-      memcpy(&cm, node + LVP_INST_CUSTOM_OFF, 4);
-      memcpy(&sf, node + LVP_INST_SBTFLAGS_OFF, 4);
-      memcpy(&in.id, node + LVP_INST_ID_OFF, 4);
-      memcpy(in.otw, node + LVP_INST_OTW_OFF, 48);
-      if (!blas)
+   struct vp_ptr_stack st = { .ok = true };
+   VP_LIST_PUSH(&st, root);
+   while (st.ok && il->ok && st.count) {
+      const uint32_t node_ptr = st.p[--st.count];
+      if (node_ptr == LVP_NODE_INVALID)
+         continue;
+      const uint8_t *node = bvh + (node_ptr & ~7u);
+      switch (node_ptr & 7u) {
+      case LVP_NODE_INTERNAL: {
+         uint32_t c0, c1;
+         memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
+         memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
+         VP_LIST_PUSH(&st, c1);
+         VP_LIST_PUSH(&st, c0);
          break;
-      in.blas = (const uint8_t *)(uintptr_t)blas;
-      in.custom = cm & 0xffffffu;
-      in.mask = cm >> 24;
-      in.flags = vp_rtu_inst_flags(sf);
-      memcpy(in.node, node, LVP_INST_NODE_BYTES);
-      VP_LIST_PUSH(il, in);
-      break;
+      }
+      case LVP_NODE_INSTANCE: {
+         struct vp_inst in;
+         uint64_t blas = 0;
+         uint32_t cm = 0, sf = 0;
+         memcpy(&blas, node, 8);
+         memcpy(&cm, node + LVP_INST_CUSTOM_OFF, 4);
+         memcpy(&sf, node + LVP_INST_SBTFLAGS_OFF, 4);
+         memcpy(&in.id, node + LVP_INST_ID_OFF, 4);
+         memcpy(in.otw, node + LVP_INST_OTW_OFF, 48);
+         if (!blas)
+            break;
+         in.blas = (const uint8_t *)(uintptr_t)blas;
+         in.custom = cm & 0xffffffu;
+         in.mask = cm >> 24;
+         in.flags = vp_rtu_inst_flags(sf);
+         memcpy(in.node, node, LVP_INST_NODE_BYTES);
+         VP_LIST_PUSH(il, in);
+         break;
+      }
+      default:
+         il->has_geometry = true;
+         break;
+      }
    }
-   default:
-      il->has_geometry = true;
-      break;
-   }
+   if (!st.ok)
+      il->ok = false;
+   free(st.p);
 }
 
 /* ── CW-BVH4 builder (binned SAH, ≤4 children, 1 tri/leaf) ──
@@ -777,7 +802,7 @@ static void
 vp_emit_blas(const uint8_t *host, struct vp_blas_entry *e, struct vp_sbuf *sb)
 {
    struct vp_prim_list l = { .ok = true };
-   vp_walk_blas(host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &l, 0);
+   vp_walk_blas(host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &l);
    e->host = host;
    e->empty = true;
    if (!l.ok) { sb->ok = false; free(l.p); return; }
@@ -872,7 +897,7 @@ static uint64_t
 vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
 {
    struct vp_inst_list il = { .ok = true };
-   vp_walk_tlas((const uint8_t *)tlas_host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &il, 0);
+   vp_walk_tlas((const uint8_t *)tlas_host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &il);
    if (il.has_geometry && il.count == 0) {
       /* The handle names a BLAS: trace it as one identity instance. */
       static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
@@ -955,6 +980,21 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    const uint32_t img_size = tbl + sb.size;
    vp_dbg("vortexpipe: RTU scene: %u instance(s), %u BLAS, %u bytes",
           n_live, n_blas, sb.size);
+   /* VORTEXPIPE_DUMP_SCENE=<prefix>: write each transcoded scene image to
+    * <prefix>.<n>.bin (the scene base is at byte offset `tbl`, logged). */
+   const char *dump = getenv("VORTEXPIPE_DUMP_SCENE");
+   if (img && dump) {
+      static unsigned dump_seq;
+      char path[512];
+      snprintf(path, sizeof path, "%s.%u.bin", dump, dump_seq++);
+      FILE *f = fopen(path, "wb");
+      if (f) {
+         fwrite(img, 1, img_size, f);
+         fclose(f);
+         mesa_logi("vortexpipe: dumped RTU scene to %s (base offset %u, %u instance(s))",
+                   path, tbl, n_live);
+      }
+   }
    free(sb.buf); free(blas); free(inst_blas); free(il.p);
    if (!img) { c->ok = false; return 0; }
 
