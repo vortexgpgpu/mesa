@@ -28,6 +28,7 @@
 #include "VX_types.h"        /* VX_MEM_OM_BASE_ADDR */
 
 #include <assert.h>          /* static_assert */
+#include <math.h>            /* INFINITY, NAN */
 #include <stddef.h>          /* offsetof */
 #include <stdio.h>
 #include <stdlib.h>
@@ -320,17 +321,113 @@ emit_ctlz(struct vp_tr *t, LLVMValueRef v)
    return LLVMBuildCall2(t->b, fty, fn, a, 2, "ctlz");
 }
 
-/* llvm.pow.f32 (x**y). Lowered by the RISC-V backend to a powf libcall. */
+static LLVMValueRef emit_ffloor(struct vp_tr *t, LLVMValueRef fa, unsigned bits);
+
+/* llvm.fma.f32: one rounding, the Vortex FPU fmadd.s. */
+static LLVMValueRef
+emit_fma32(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b, LLVMValueRef c)
+{
+   LLVMTypeRef  args[3] = { t->f32, t->f32, t->f32 };
+   LLVMTypeRef  fty = LLVMFunctionType(t->f32, args, 3, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.fma.f32");
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, "llvm.fma.f32", fty);
+   LLVMValueRef a3[3] = { a, b, c };
+   return LLVMBuildCall2(t->b, fty, fn, a3, 3, "fma");
+}
+
+/* exp2 / log2 / pow evaluate exactly as gallivm's lp_build_exp2,
+ * lp_build_log2_safe and lp_build_pow, so a shader returns the same bits here
+ * as on the llvmpipe path it falls back to. gallivm's multiply-adds are
+ * llvm.fmuladd, which the host backend fuses, hence the explicit fma. */
+static const double vp_exp2_poly[] = {   /* EXP_POLY_DEGREE 5 */
+   1.000000000000000000000,
+   0.693153073200168932794,
+   0.240153617044375388211,
+   0.0558263180532956664775,
+   0.00898934009049466391101,
+   0.00187757667519147912699,
+};
+static const double vp_log2_poly[] = {   /* LOG_POLY_DEGREE 4 */
+   2.88539009343309178325,
+   0.961791550404184197881,
+   0.577440339438736392009,
+   0.403343858251329912514,
+   0.406718052498846252698,
+};
+
+/* lp_build_polynomial: even and odd terms in x^2, joined by one fma. */
+static LLVMValueRef
+emit_lp_polynomial(struct vp_tr *t, LLVMValueRef x, const double *coeffs,
+                   unsigned n)
+{
+   LLVMValueRef x2 = LLVMBuildFMul(t->b, x, x, "");
+   LLVMValueRef even = NULL, odd = NULL;
+   for (unsigned i = n; i--; ) {
+      LLVMValueRef c = LLVMConstReal(t->f32, (float)coeffs[i]);
+      if (i % 2 == 0)
+         even = even ? emit_fma32(t, x2, even, c) : c;
+      else
+         odd = odd ? emit_fma32(t, x2, odd, c) : c;
+   }
+   return odd ? emit_fma32(t, odd, x, even) : even;
+}
+
+static LLVMValueRef
+emit_lp_exp2(struct vp_tr *t, LLVMValueRef x)
+{
+   LLVMValueRef hi = LLVMConstReal(t->f32, 128.0);
+   LLVMValueRef lo = LLVMConstReal(t->f32, (float)-126.99999);
+   /* NaN fails both compares and passes through */
+   x = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, x, hi, ""), hi, x, "");
+   x = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, x, lo, ""), lo, x, "");
+   LLVMValueRef fl    = emit_ffloor(t, x, 32);
+   LLVMValueRef fpart = LLVMBuildFSub(t->b, x, fl, "");
+   LLVMValueRef ipart = LLVMBuildFPToSI(t->b, fl, t->i32, "");
+   LLVMValueRef e = LLVMBuildShl(t->b,
+                       LLVMBuildAdd(t->b, ipart, LLVMConstInt(t->i32, 127, false), ""),
+                       LLVMConstInt(t->i32, 23, false), "");
+   LLVMValueRef expipart = LLVMBuildBitCast(t->b, e, t->f32, "");
+   LLVMValueRef expfpart = emit_lp_polynomial(t, fpart, vp_exp2_poly,
+                                              ARRAY_SIZE(vp_exp2_poly));
+   return LLVMBuildFMul(t->b, expipart, expfpart, "exp2");
+}
+
+static LLVMValueRef
+emit_lp_log2_safe(struct vp_tr *t, LLVMValueRef x)
+{
+   LLVMValueRef one = LLVMConstReal(t->f32, 1.0);
+   LLVMValueRef i   = LLVMBuildBitCast(t->b, x, t->i32, "");
+   LLVMValueRef e   = LLVMBuildAnd(t->b, i, LLVMConstInt(t->i32, 0x7f800000, false), "");
+   LLVMValueRef logexp = LLVMBuildSIToFP(t->b,
+      LLVMBuildSub(t->b, LLVMBuildLShr(t->b, e, LLVMConstInt(t->i32, 23, false), ""),
+                   LLVMConstInt(t->i32, 127, false), ""), t->f32, "");
+   LLVMValueRef mant = LLVMBuildBitCast(t->b,
+      LLVMBuildOr(t->b, LLVMBuildAnd(t->b, i, LLVMConstInt(t->i32, 0x007fffff, false), ""),
+                  LLVMConstInt(t->i32, 0x3f800000, false), ""), t->f32, "");
+   LLVMValueRef y = LLVMBuildFDiv(t->b, LLVMBuildFSub(t->b, mant, one, ""),
+                                  LLVMBuildFAdd(t->b, mant, one, ""), "");
+   LLVMValueRef z = LLVMBuildFMul(t->b, y, y, "");
+   LLVMValueRef pz = emit_lp_polynomial(t, z, vp_log2_poly, ARRAY_SIZE(vp_log2_poly));
+   LLVMValueRef res = emit_fma32(t, y, pz, logexp);
+   LLVMValueRef zero = LLVMConstReal(t->f32, 0.0);
+   res = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGE, x,
+                                  LLVMConstReal(t->f32, INFINITY), ""),
+                         LLVMConstReal(t->f32, INFINITY), res, "");
+   res = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOEQ, x, zero, ""),
+                         LLVMConstReal(t->f32, -INFINITY), res, "");
+   res = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, x, zero, ""),
+                         LLVMConstReal(t->f32, NAN), res, "log2");
+   return res;
+}
+
 static LLVMValueRef
 emit_fpow(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y)
 {
-   LLVMTypeRef  args[2] = { t->f32, t->f32 };
-   LLVMTypeRef  fty = LLVMFunctionType(t->f32, args, 2, false);
-   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.pow.f32");
-   if (!fn)
-      fn = LLVMAddFunction(t->mod, "llvm.pow.f32", fty);
-   LLVMValueRef a[2] = { x, y };
-   return LLVMBuildCall2(t->b, fty, fn, a, 2, "fpow");
+   LLVMValueRef zero = LLVMConstReal(t->f32, 0.0);
+   LLVMValueRef res = emit_lp_exp2(t, LLVMBuildFMul(t->b, emit_lp_log2_safe(t, x), y, ""));
+   return LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOEQ, x, zero, ""),
+                          zero, res, "fpow");
 }
 
 static LLVMTypeRef cty(struct vp_tr *t, unsigned bits);
@@ -1331,7 +1428,18 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          unsigned bs = alu->def.bit_size;
          LLVMValueRef x = as_float(t, alu_src(t, alu, 0, c), bs);
          LLVMValueRef y = as_float(t, alu_src(t, alu, 1, c), bs);
-         r = from_float(t, emit_fpow(t, x, y), bs);
+         if (LLVMTypeOf(x) == t->f32) {
+            r = from_float(t, emit_fpow(t, x, y), bs);
+         } else {
+            LLVMTypeRef  ft = LLVMTypeOf(x);
+            LLVMTypeRef  args[2] = { ft, ft };
+            LLVMTypeRef  fty = LLVMFunctionType(ft, args, 2, false);
+            LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.pow.f64");
+            if (!fn)
+               fn = LLVMAddFunction(t->mod, "llvm.pow.f64", fty);
+            LLVMValueRef a2[2] = { x, y };
+            r = from_float(t, LLVMBuildCall2(t->b, fty, fn, a2, 2, "fpow"), bs);
+         }
          break;
       }
       /* Unary float rounding + transcendentals. floor/ceil/trunc are synthesized
@@ -1351,8 +1459,14 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          case nir_op_fceil:       res = emit_fceil(t, fa, bs);  break;
          case nir_op_ftrunc:      res = emit_ftrunc(t, fa, bs); break;
          case nir_op_fround_even: res = emit_funary_intrin(t, "nearbyint", fa, bs); break;
-         case nir_op_fexp2:       res = emit_funary_intrin(t, "exp2", fa, bs); break;
-         case nir_op_flog2:       res = emit_funary_intrin(t, "log2", fa, bs); break;
+         case nir_op_fexp2:
+            res = (LLVMTypeOf(fa) == t->f32) ? emit_lp_exp2(t, fa)
+                                             : emit_funary_intrin(t, "exp2", fa, bs);
+            break;
+         case nir_op_flog2:
+            res = (LLVMTypeOf(fa) == t->f32) ? emit_lp_log2_safe(t, fa)
+                                             : emit_funary_intrin(t, "log2", fa, bs);
+            break;
          case nir_op_fsin:        res = emit_funary_intrin(t, "sin",  fa, bs); break;
          default:                 res = emit_funary_intrin(t, "cos",  fa, bs); break;
          }
@@ -1589,23 +1703,26 @@ img_desc_u32(struct vp_tr *t, LLVMValueRef desc, unsigned byte_off)
    return LLVMBuildLoad2(t->b, t->i32, p, "imgfld");
 }
 
-/* f32 in [0,1] -> unsigned-normalized integer of `bits` width (round-to-nearest),
- * value given as its i32 bit pattern. Covers the 8-bit channels of RGBA8_UNORM and
- * the 10/2-bit channels of R10G10B10A2_UNORM. */
+/* f32 in [0,1] -> unsigned-normalized integer of `bits` width, value given as its
+ * i32 bit pattern. Covers the 8-bit channels of RGBA8_UNORM and the 10/2-bit
+ * channels of R10G10B10A2_UNORM. Same arithmetic as gallivm's
+ * lp_build_clamped_float_to_unsigned_norm: scale by (2^n-1)/2^n, add 2^(23-n) so
+ * the result lands in the low n mantissa bits, rounded to nearest-even. Ties
+ * matter: 0.3f*255 is exactly 76.5, which this rounds to 76 (f*255+0.5 gives 77). */
 static LLVMValueRef
 f32bits_to_unorm(struct vp_tr *t, LLVMValueRef vi, unsigned bits)
 {
-   double maxv = (double)((1u << bits) - 1u);
+   unsigned mask = (1u << bits) - 1u;
    LLVMValueRef f   = LLVMBuildBitCast(t->b, vi, t->f32, "");
    LLVMValueRef z   = LLVMConstReal(t->f32, 0.0);
    LLVMValueRef one = LLVMConstReal(t->f32, 1.0);
    f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, f, z, ""), f, z, "");
    f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, f, one, ""), f, one, "");
    LLVMValueRef s = LLVMBuildFAdd(t->b,
-      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, maxv), ""),
-      LLVMConstReal(t->f32, 0.5), "");
-   LLVMValueRef b = LLVMBuildFPToUI(t->b, s, t->i32, "");
-   return LLVMBuildAnd(t->b, b, LLVMConstInt(t->i32, (1u << bits) - 1u, false), "");
+      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, (double)mask / (double)(1u << bits)), ""),
+      LLVMConstReal(t->f32, (double)(1u << (23 - bits))), "");
+   LLVMValueRef b = LLVMBuildBitCast(t->b, s, t->i32, "");
+   return LLVMBuildAnd(t->b, b, LLVMConstInt(t->i32, mask, false), "");
 }
 
 /* `bits`-wide unsigned-normalized field (low bits of `word`) -> f32 in [0,1],
@@ -3576,6 +3693,299 @@ emit_tex_argb_to_f32_scratch(struct vp_tr *t, LLVMValueRef texel)
    return out;
 }
 
+/* ---- gallivm AoS 8-bit sampler (lp_bld_sample_aos.c), replicated bit-exactly ----
+ *
+ * llvmpipe samples a texture whose format fits 8-bit unorm, with REPEAT /
+ * CLAMP_TO_EDGE wrap and no anisotropy (always the case for an explicit LOD), in
+ * 8.8 fixed point rather than float (lp_build_sample_soa_code's use_aos). A
+ * ray-tracing or compute shader only ever samples with an explicit LOD, so that
+ * is the arithmetic lavapipe applies there, and it is NOT the vx_tex4 unit's:
+ *   - texel coordinate: iround(s * (dim*256)) - 128 (round-to-nearest-even), then
+ *     floor = >>8, weight = &255 -- not the unit's truncated S.23 fixed point;
+ *   - blend: v0 + ((w*(v1-v0)*128 + 0x4000) >> 15) per byte (pmulhrsw, weights
+ *     out of 256) -- not the unit's (a*(255-w) + b*w)/255;
+ *   - the two-mip blend uses the same lerp with weight trunc(lod_fpart*256).
+ * Feeding those through the FF-model sampler moved ~2% of textured RT pixels by
+ * 1/255. The helpers below mirror the gallivm functions named in each comment. */
+
+/* A texstate u32 field. */
+static LLVMValueRef
+emit_texstate_u32(struct vp_tr *t, size_t off, const char *name)
+{
+   LLVMValueRef o = LLVMConstInt(t->i32, off, false);
+   return LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &o, 1, ""), name);
+}
+
+/* lp_build_lerp (unorm8, LP_BLD_LERP_PRESCALED_WEIGHTS) on one byte channel:
+ * the x86 pmulhrsw path, (w * (delta << 7) + 0x4000) >> 15, masked to 8 bits and
+ * added to v0 in 8-bit arithmetic. */
+static LLVMValueRef
+emit_aos_lerp8(struct vp_tr *t, LLVMValueRef w, LLVMValueRef v0, LLVMValueRef v1)
+{
+   LLVMValueRef d = LLVMBuildSub(t->b, v1, v0, "");
+   LLVMValueRef p = LLVMBuildMul(t->b, w,
+      LLVMBuildShl(t->b, d, LLVMConstInt(t->i32, 7, false), ""), "");
+   LLVMValueRef r = LLVMBuildAShr(t->b,
+      LLVMBuildAdd(t->b, p, LLVMConstInt(t->i32, 0x4000, false), ""),
+      LLVMConstInt(t->i32, 15, false), "");
+   r = LLVMBuildAnd(t->b, r, LLVMConstInt(t->i32, 0xff, false), "");
+   return LLVMBuildAnd(t->b, LLVMBuildAdd(t->b, v0, r, ""),
+                       LLVMConstInt(t->i32, 0xff, false), "");
+}
+
+/* The same lerp over the four bytes of two packed texels. */
+static LLVMValueRef
+emit_aos_lerp8888(struct vp_tr *t, LLVMValueRef w, LLVMValueRef a, LLVMValueRef b)
+{
+   LLVMValueRef res = LLVMConstInt(t->i32, 0, false);
+   for (unsigned s = 0; s < 32; s += 8) {
+      LLVMValueRef sh = LLVMConstInt(t->i32, s, false);
+      LLVMValueRef m = LLVMConstInt(t->i32, 0xff, false);
+      LLVMValueRef ca = LLVMBuildAnd(t->b, LLVMBuildLShr(t->b, a, sh, ""), m, "");
+      LLVMValueRef cb = LLVMBuildAnd(t->b, LLVMBuildLShr(t->b, b, sh, ""), m, "");
+      res = LLVMBuildOr(t->b, res,
+         LLVMBuildShl(t->b, emit_aos_lerp8(t, w, ca, cb), sh, ""), "");
+   }
+   return res;
+}
+
+/* lp_build_iround: round to nearest even (cvtps2dq), as i32. */
+static LLVMValueRef
+emit_aos_iround(struct vp_tr *t, LLVMValueRef f)
+{
+   return LLVMBuildFPToSI(t->b, emit_funary_intrin(t, "nearbyint", f, 32), t->i32, "");
+}
+
+/* One axis of a bilinear footprint: lp_build_sample_image_linear's coordinate
+ * scaling plus lp_build_sample_wrap_linear_int (block length 1). Returns the two
+ * texel indices and the 8-bit weight. `len` is the level's dimension, `pot`
+ * whether the BASE level's is a power of two (static_texture_state->pot_*). */
+static void
+emit_aos_axis_linear(struct vp_tr *t, LLVMValueRef f, LLVMValueRef len,
+                     LLVMValueRef pot, LLVMValueRef wrap,
+                     LLVMValueRef *c0, LLVMValueRef *c1, LLVMValueRef *w)
+{
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+   LLVMValueRef c8 = LLVMConstInt(t->i32, 8, false);
+   LLVMValueRef c255 = LLVMConstInt(t->i32, 255, false);
+   LLVMValueRef cm128 = LLVMConstInt(t->i32, (uint64_t)-128, true);
+   LLVMValueRef lm1 = LLVMBuildSub(t->b, len, one, "");
+
+   /* s * float(len << 8), iround, -128; floor = >>8, weight = &255. */
+   LLVMValueRef sc = LLVMBuildFMul(t->b, f,
+      LLVMBuildUIToFP(t->b, LLVMBuildShl(t->b, len, c8, ""), t->f32, ""), "");
+   LLVMValueRef si = LLVMBuildAdd(t->b, emit_aos_iround(t, sc), cm128, "");
+   LLVMValueRef ip = LLVMBuildAShr(t->b, si, c8, "");
+   LLVMValueRef fp = LLVMBuildAnd(t->b, si, c255, "");
+
+   /* CLAMP_TO_EDGE: c0 clamped; c1 = c0 + 1 only strictly inside the texture. */
+   LLVMValueRef lmask = LLVMBuildICmp(t->b, LLVMIntSGE, ip, zero, "");
+   LLVMValueRef umask = LLVMBuildICmp(t->b, LLVMIntSLT, ip, lm1, "");
+   LLVMValueRef cl0 = LLVMBuildSelect(t->b, lmask, ip, zero, "");
+   cl0 = LLVMBuildSelect(t->b, umask, cl0, lm1, "");
+   LLVMValueRef cl1 = LLVMBuildAdd(t->b, cl0,
+      LLVMBuildZExt(t->b, LLVMBuildAnd(t->b, lmask, umask, ""), t->i32, ""), "");
+
+   /* REPEAT, power of two: mask; the second tap wraps to 0 past the end. */
+   LLVMValueRef rp0 = LLVMBuildAnd(t->b, ip, lm1, "");
+
+   /* REPEAT, NPOT (lp_build_coord_repeat_npot_linear_int): wrap the float coord
+    * with fract first, then scale by len and by 256 as two multiplies. */
+   LLVMValueRef fr = LLVMBuildFSub(t->b, f, emit_ffloor(t, f, 32), "");
+   LLVMValueRef nx = LLVMBuildFMul(t->b,
+      LLVMBuildFMul(t->b, fr, LLVMBuildUIToFP(t->b, len, t->f32, ""), ""),
+      LLVMConstReal(t->f32, 256.0), "");
+   LLVMValueRef ni = LLVMBuildAdd(t->b, emit_aos_iround(t, nx), cm128, "");
+   LLVMValueRef nfp = LLVMBuildAnd(t->b, ni, c255, "");
+   LLVMValueRef rn0 = LLVMBuildAShr(t->b, ni, c8, "");
+   rn0 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSLT, rn0, zero, ""), lm1, rn0, "");
+   rn0 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, rn0, lm1, ""), lm1, rn0, "");
+
+   LLVMValueRef rep = LLVMBuildICmp(t->b, LLVMIntEQ, wrap,
+                                    LLVMConstInt(t->i32, VX_TEX_WRAP_REPEAT, false), "");
+   LLVMValueRef r0 = LLVMBuildSelect(t->b, pot, rp0, rn0, "");
+   LLVMValueRef r1 = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntEQ, r0, lm1, ""),
+                                     zero, LLVMBuildAdd(t->b, r0, one, ""), "");
+   *c0 = LLVMBuildSelect(t->b, rep, r0, cl0, "aos_c0");
+   *c1 = LLVMBuildSelect(t->b, rep, r1, cl1, "aos_c1");
+   *w = LLVMBuildSelect(t->b, LLVMBuildAnd(t->b, rep, LLVMBuildNot(t->b, pot, ""), ""),
+                        nfp, fp, "aos_w");
+}
+
+/* One axis of a nearest tap: lp_build_sample_image_nearest + _wrap_nearest_int. */
+static LLVMValueRef
+emit_aos_axis_nearest(struct vp_tr *t, LLVMValueRef f, LLVMValueRef len,
+                      LLVMValueRef pot, LLVMValueRef wrap)
+{
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef lm1 = LLVMBuildSub(t->b, len, LLVMConstInt(t->i32, 1, false), "");
+   LLVMValueRef lenf = LLVMBuildUIToFP(t->b, len, t->f32, "");
+   LLVMValueRef ip = LLVMBuildFPToSI(t->b,
+      emit_ffloor(t, LLVMBuildFMul(t->b, f, lenf, ""), 32), t->i32, "");
+   LLVMValueRef cl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSLT, ip, zero, ""),
+                                     zero, ip, "");
+   cl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntSGT, cl, lm1, ""), lm1, cl, "");
+   LLVMValueRef rp = LLVMBuildAnd(t->b, ip, lm1, "");
+   /* NPOT repeat: itrunc(fract_safe(s) * len). */
+   LLVMValueRef fr = LLVMBuildFSub(t->b, f, emit_ffloor(t, f, 32), "");
+   LLVMValueRef fmax = LLVMConstReal(t->f32, 1.0 - 1.0 / (double)(1 << 24));
+   fr = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, fr, fmax, ""), fr, fmax, "");
+   LLVMValueRef rn = LLVMBuildFPToSI(t->b, LLVMBuildFMul(t->b, fr, lenf, ""), t->i32, "");
+   LLVMValueRef rep = LLVMBuildICmp(t->b, LLVMIntEQ, wrap,
+                                    LLVMConstInt(t->i32, VX_TEX_WRAP_REPEAT, false), "");
+   return LLVMBuildSelect(t->b, rep, LLVMBuildSelect(t->b, pot, rp, rn, ""), cl, "aos_cn");
+}
+
+/* lp_build_sample_image_{linear,nearest} on one mip level of an A8R8G8B8 texture,
+ * returning the packed result. Levels are stored tightly (row = max(w>>l,1)
+ * texels). */
+static LLVMValueRef
+emit_aos_sample_level(struct vp_tr *t, LLVMValueRef uf, LLVMValueRef vf,
+                      LLVMValueRef level, LLVMValueRef bilinear)
+{
+   LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+   LLVMValueRef w0, h0;
+   emit_tex_mip0_dims(t, &w0, &h0);
+   LLVMValueRef wl = LLVMBuildLShr(t->b, w0, level, "");
+   LLVMValueRef hl = LLVMBuildLShr(t->b, h0, level, "");
+   wl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntULT, wl, one, ""), one, wl, "aos_wl");
+   hl = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntULT, hl, one, ""), one, hl, "aos_hl");
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef potw = LLVMBuildICmp(t->b, LLVMIntEQ,
+      LLVMBuildAnd(t->b, w0, LLVMBuildSub(t->b, w0, one, ""), ""), zero, "");
+   LLVMValueRef poth = LLVMBuildICmp(t->b, LLVMIntEQ,
+      LLVMBuildAnd(t->b, h0, LLVMBuildSub(t->b, h0, one, ""), ""), zero, "");
+   LLVMValueRef wrap = emit_texstate_u32(t, offsetof(gfx_sw_texstate_t, wrap), "wrap");
+   LLVMValueRef wrap_u = LLVMBuildAnd(t->b, wrap, LLVMConstInt(t->i32, 0xffff, false), "");
+   LLVMValueRef wrap_v = LLVMBuildLShr(t->b, wrap, LLVMConstInt(t->i32, 16, false), "");
+
+   /* level base address: base + mip_off[level] */
+   LLVMValueRef ob = LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, base), false);
+   LLVMValueRef base = LLVMBuildLoad2(t->b, t->i64,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &ob, 1, ""), "tbase");
+   LLVMValueRef omo = LLVMBuildAdd(t->b,
+      LLVMConstInt(t->i32, offsetof(gfx_sw_texstate_t, mip_off), false),
+      LLVMBuildShl(t->b, level, LLVMConstInt(t->i32, 2, false), ""), "");
+   LLVMValueRef moff = LLVMBuildLoad2(t->b, t->i32,
+      LLVMBuildGEP2(t->b, t->i8, t->fs_texstate, &omo, 1, ""), "mipoff");
+   base = LLVMBuildAdd(t->b, base, LLVMBuildZExt(t->b, moff, t->i64, ""), "lbase");
+
+#define AOS_FETCH(x, y) \
+   LLVMBuildLoad2(t->b, t->i32, LLVMBuildIntToPtr(t->b, LLVMBuildAdd(t->b, base, \
+      LLVMBuildZExt(t->b, LLVMBuildShl(t->b, LLVMBuildAdd(t->b, \
+         LLVMBuildMul(t->b, (y), wl, ""), (x), ""), \
+         LLVMConstInt(t->i32, 2, false), ""), t->i64, ""), ""), t->ptr, ""), "aos_texel")
+
+   /* Both footprints are computed and the bilinear/nearest result selected, so
+    * the filter (a per-lane value for a bindless handle) never branches. */
+   LLVMValueRef x0, x1, y0, y1, ws, wt;
+   emit_aos_axis_linear(t, uf, wl, potw, wrap_u, &x0, &x1, &ws);
+   emit_aos_axis_linear(t, vf, hl, poth, wrap_v, &y0, &y1, &wt);
+   LLVMValueRef xn = emit_aos_axis_nearest(t, uf, wl, potw, wrap_u);
+   LLVMValueRef yn = emit_aos_axis_nearest(t, vf, hl, poth, wrap_v);
+   /* nearest reuses the first tap's fetch: point its coords at the nearest texel */
+   LLVMValueRef fx0 = LLVMBuildSelect(t->b, bilinear, x0, xn, "");
+   LLVMValueRef fy0 = LLVMBuildSelect(t->b, bilinear, y0, yn, "");
+   LLVMValueRef t00 = AOS_FETCH(fx0, fy0);
+   LLVMValueRef t01 = AOS_FETCH(x1, y0);
+   LLVMValueRef t10 = AOS_FETCH(x0, y1);
+   LLVMValueRef t11 = AOS_FETCH(x1, y1);
+#undef AOS_FETCH
+   /* lp_build_lerp_2d: lerp(t, lerp(s, v00, v01), lerp(s, v10, v11)) */
+   LLVMValueRef r0 = emit_aos_lerp8888(t, ws, t00, t01);
+   LLVMValueRef r1 = emit_aos_lerp8888(t, ws, t10, t11);
+   LLVMValueRef lin = emit_aos_lerp8888(t, wt, r0, r1);
+   return LLVMBuildSelect(t->b, bilinear, lin, t00, "aos_level");
+}
+
+/* Full AoS sample from the resolved (lod, filter) pair of
+ * emit_tex_resolve_explicit_lod: the tap in filter bit 0, and either an integer
+ * level or -- with the mip-linear bit -- a Q(VX_TEX_LOD_FRAC_BITS) lod whose two
+ * levels are blended (lp_build_sample_mipmap). Returns the packed texel. */
+static LLVMValueRef
+emit_tex_aos(struct vp_tr *t, LLVMValueRef uf, LLVMValueRef vf,
+             LLVMValueRef lod, LLVMValueRef filter)
+{
+   LLVMValueRef zero = LLVMConstInt(t->i32, 0, false);
+   LLVMValueRef bilinear = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filter, LLVMConstInt(t->i32, 1, false), ""), zero, "aos_bilin");
+   LLVMValueRef mip_lin = LLVMBuildICmp(t->b, LLVMIntNE,
+      LLVMBuildAnd(t->b, filter, LLVMConstInt(t->i32, VX_TEX_FILTER_MIP_LINEAR, false), ""),
+      zero, "aos_miplin");
+   LLVMValueRef li = LLVMBuildSelect(t->b, mip_lin,
+      LLVMBuildLShr(t->b, lod, LLVMConstInt(t->i32, VX_TEX_LOD_FRAC_BITS, false), ""),
+      lod, "aos_l0");
+   LLVMValueRef frac = LLVMBuildSelect(t->b, mip_lin,
+      LLVMBuildAnd(t->b, lod,
+         LLVMConstInt(t->i32, (1u << VX_TEX_LOD_FRAC_BITS) - 1, false), ""),
+      zero, "aos_frac");
+   LLVMValueRef c0 = emit_aos_sample_level(t, uf, vf, li, bilinear);
+
+   /* Second level only when there is a blend weight (gallivm's need_lerp). */
+   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
+   LLVMBasicBlockRef bb_pre = LLVMGetInsertBlock(t->b);
+   LLVMBasicBlockRef bb_l1 = LLVMAppendBasicBlockInContext(t->ctx, fn, "aos_mip1");
+   LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "aos_mip_merge");
+   LLVMBuildCondBr(t->b, LLVMBuildICmp(t->b, LLVMIntNE, frac, zero, ""), bb_l1, bb_mg);
+   LLVMPositionBuilderAtEnd(t->b, bb_l1);
+   LLVMValueRef lmax = LLVMConstInt(t->i32, VX_TEX_LOD_MAX, false);
+   LLVMValueRef lj = LLVMBuildAdd(t->b, li, LLVMConstInt(t->i32, 1, false), "");
+   lj = LLVMBuildSelect(t->b, LLVMBuildICmp(t->b, LLVMIntUGT, lj, lmax, ""), lmax, lj, "");
+   LLVMValueRef c1 = emit_aos_sample_level(t, uf, vf, lj, bilinear);
+   LLVMValueRef blended = emit_aos_lerp8888(t, frac, c0, c1);
+   LLVMBasicBlockRef bb_l1_end = LLVMGetInsertBlock(t->b);
+   LLVMBuildBr(t->b, bb_mg);
+   LLVMPositionBuilderAtEnd(t->b, bb_mg);
+   LLVMValueRef phi = LLVMBuildPhi(t->b, t->i32, "aos_texel");
+   LLVMValueRef vals[2] = { c0, blended };
+   LLVMBasicBlockRef bbs[2] = { bb_pre, bb_l1_end };
+   LLVMAddIncoming(phi, vals, bbs, 2);
+   return phi;
+}
+
+/* Explicit-LOD float sample outside a fragment shader: the gallivm AoS arithmetic
+ * when lavapipe would take it (an A8R8G8B8-resident texture -- every 8-bit unorm
+ * format -- with REPEAT/CLAMP_TO_EDGE on both axes), the SW sampler otherwise.
+ * Both arms fill the one float[4] scratch slot, which is returned. */
+static LLVMValueRef
+emit_tex_lod_f32_lp(struct vp_tr *t, LLVMValueRef uf, LLVMValueRef vf,
+                    LLVMValueRef ux, LLVMValueRef vx, LLVMValueRef lam_bits)
+{
+   LLVMValueRef lod, filter;
+   emit_tex_resolve_explicit_lod(t, lam_bits, &lod, &filter);
+   LLVMValueRef fmt = emit_texstate_u32(t, offsetof(gfx_sw_texstate_t, format), "format");
+   LLVMValueRef wrap = emit_texstate_u32(t, offsetof(gfx_sw_texstate_t, wrap), "wrap");
+   LLVMValueRef wu = LLVMBuildAnd(t->b, wrap, LLVMConstInt(t->i32, 0xffff, false), "");
+   LLVMValueRef wv = LLVMBuildLShr(t->b, wrap, LLVMConstInt(t->i32, 16, false), "");
+   LLVMValueRef simple_u = LLVMBuildICmp(t->b, LLVMIntULE, wu,
+      LLVMConstInt(t->i32, VX_TEX_WRAP_REPEAT, false), "");   /* CLAMP(0) | REPEAT(1) */
+   LLVMValueRef simple_v = LLVMBuildICmp(t->b, LLVMIntULE, wv,
+      LLVMConstInt(t->i32, VX_TEX_WRAP_REPEAT, false), "");
+   LLVMValueRef use_aos = LLVMBuildAnd(t->b,
+      LLVMBuildICmp(t->b, LLVMIntEQ, fmt,
+                    LLVMConstInt(t->i32, VX_TEX_FORMAT_A8R8G8B8, false), ""),
+      LLVMBuildAnd(t->b, simple_u, simple_v, ""), "use_aos");
+
+   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
+   LLVMBasicBlockRef bb_aos = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_aos");
+   LLVMBasicBlockRef bb_sw = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_aos_sw");
+   LLVMBasicBlockRef bb_mg = LLVMAppendBasicBlockInContext(t->ctx, fn, "tex_aos_merge");
+   LLVMBuildCondBr(t->b, use_aos, bb_aos, bb_sw);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_aos);
+   LLVMValueRef out = emit_tex_argb_to_f32_scratch(t, emit_tex_aos(t, uf, vf, lod, filter));
+   LLVMBuildBr(t->b, bb_mg);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_sw);
+   emit_tex_sw_f32(t, ux, vx, lod, filter);
+   LLVMBuildBr(t->b, bb_mg);
+
+   LLVMPositionBuilderAtEnd(t->b, bb_mg);
+   return out;
+}
+
 /* The software arm of a 2D sampling op, in whichever carrier the sampler's result
  * type calls for: textureLod samples the explicit lambda, textureBias adds its bias
  * to the quad-gradient LOD, and plain texture() takes the gradient alone. */
@@ -4174,6 +4584,14 @@ emit_tex_sample(struct vp_tr *t, nir_tex_instr *tex)
    const bool as_f32 = !tex_dest_is_int(tex);
 
    if (t->sw_tex) {
+      /* Explicit-LOD float sample outside a fragment shader (every ray-tracing /
+       * compute sample): llvmpipe's AoS 8-bit arithmetic where it applies. */
+      if (!t->is_fs && tex->op == nir_texop_txl && as_f32 && !off_x && !off_y &&
+          (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+           tex->sampler_dim == GLSL_SAMPLER_DIM_1D)) {
+         emit_tex_unpack_f32(t, tex, emit_tex_lod_f32_lp(t, uf, vf, ux, vx, lod_bits));
+         return;
+      }
       /* TEX-less device: software always. The SW arm resolves min/mag + mip itself
        * (a non-mipmapped sampler falls out as magnified -> base level). */
       LLVMValueRef r = emit_tex_sw_arm(t, tex, ux, vx, lod_bits, bias_q8, as_f32);
