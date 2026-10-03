@@ -1058,7 +1058,9 @@ vp_inst_leaf_write(const void *ctx, uint32_t i, uint8_t *p)
    memcpy(p + 8, &in->rank, 4);
    memcpy(p + 12, &c->tlas_otab, 4);
    uint8_t *rec = p + RTU_BVH_LEAF_HDR_BYTES;
-   memcpy(rec, in->otw, 48);
+   /* lavapipe's own world->object matrix: the RTU transforms the ray with it
+    * in lavapipe's op order, so the object ray is lavapipe's bit for bit. */
+   memcpy(rec, in->node + LVP_INST_WTO_OFF, 48);
    uint32_t cull = (in->mask & 0xffu) | (in->flags << RTU_INST_FLAGS_SHIFT);
    memcpy(rec + RTU_BVH_INSTANCE_BLAS_OFF, &c->blas_root[i], 4);
    memcpy(rec + RTU_BVH_INSTANCE_CUSTOM_OFF, &in->custom, 4);
