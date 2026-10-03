@@ -1592,25 +1592,51 @@ img_desc_u32(struct vp_tr *t, LLVMValueRef desc, unsigned byte_off)
    return LLVMBuildLoad2(t->b, t->i32, p, "imgfld");
 }
 
-/* f32 in [0,1] -> unsigned-normalized integer of `bits` width, value given as its
- * i32 bit pattern. Covers the 8-bit channels of RGBA8_UNORM and the 10/2-bit
- * channels of R10G10B10A2_UNORM. Same arithmetic as gallivm's
- * lp_build_clamped_float_to_unsigned_norm: scale by (2^n-1)/2^n, add 2^(23-n) so
- * the result lands in the low n mantissa bits, rounded to nearest-even. Ties
- * matter: 0.3f*255 is exactly 76.5, which this rounds to 76 (f*255+0.5 gives 77). */
+/* f32 -> unsigned-normalized integer of `bits` width, value given as its i32 bit
+ * pattern (Vulkan "Conversion From Floating-Point to Normalized Fixed-Point":
+ * clamp to [0,1], NaN -> 0, then the integer nearest f * (2^b - 1)). Covers the
+ * 8-bit channels of RGBA8_UNORM and the 10/2-bit channels of R10G10B10A2_UNORM.
+ *
+ * The product is rounded to nearest, ties to even, from its exact value. The fp32
+ * product p = f*m can itself round onto a half-integer the exact product is not
+ * on (or round f*m + 0.5 up to the next integer, as trunc(f*m + 0.5) did: f =
+ * 0.49999997/255 gave 1), so the rounding error e = fma(f, m, -p), which is
+ * exact, settles a tie p sits on: e > 0 rounds up, e < 0 down, e == 0 is a real
+ * tie and goes to even. Away from a half-integer p rounds like the exact value
+ * (|e| <= ulp(p)/2 and half-integers are fp32 values below 2^23). */
 static LLVMValueRef
 f32bits_to_unorm(struct vp_tr *t, LLVMValueRef vi, unsigned bits)
 {
-   unsigned mask = (1u << bits) - 1u;
-   LLVMValueRef f   = LLVMBuildBitCast(t->b, vi, t->f32, "");
-   LLVMValueRef z   = LLVMConstReal(t->f32, 0.0);
-   LLVMValueRef one = LLVMConstReal(t->f32, 1.0);
+   const unsigned mask = (1u << bits) - 1u;
+   LLVMValueRef f    = LLVMBuildBitCast(t->b, vi, t->f32, "");
+   LLVMValueRef z    = LLVMConstReal(t->f32, 0.0);
+   LLVMValueRef one  = LLVMConstReal(t->f32, 1.0);
+   LLVMValueRef half = LLVMConstReal(t->f32, 0.5);
+   LLVMValueRef m    = LLVMConstReal(t->f32, (double)mask);
    f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, f, z, ""), f, z, "");
    f = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, f, one, ""), f, one, "");
-   LLVMValueRef s = LLVMBuildFAdd(t->b,
-      LLVMBuildFMul(t->b, f, LLVMConstReal(t->f32, (double)mask / (double)(1u << bits)), ""),
-      LLVMConstReal(t->f32, (double)(1u << (23 - bits))), "");
-   LLVMValueRef b = LLVMBuildBitCast(t->b, s, t->i32, "");
+
+   LLVMValueRef p = LLVMBuildFMul(t->b, f, m, "unorm_p");
+   LLVMTypeRef  fargs[3] = { t->f32, t->f32, t->f32 };
+   LLVMTypeRef  fmaty = LLVMFunctionType(t->f32, fargs, 3, false);
+   LLVMValueRef fmafn = LLVMGetNamedFunction(t->mod, "llvm.fma.f32");
+   if (!fmafn)
+      fmafn = LLVMAddFunction(t->mod, "llvm.fma.f32", fmaty);
+   LLVMValueRef fa[3] = { f, m, LLVMBuildFNeg(t->b, p, "") };
+   LLVMValueRef e = LLVMBuildCall2(t->b, fmaty, fmafn, fa, 3, "unorm_err");
+
+   LLVMValueRef n = emit_funary_intrin(t, "nearbyint", p, 32);
+   LLVMValueRef d = LLVMBuildFSub(t->b, p, n, "");
+   LLVMValueRef tie = LLVMBuildOr(t->b,
+      LLVMBuildFCmp(t->b, LLVMRealOEQ, d, half, ""),
+      LLVMBuildFCmp(t->b, LLVMRealOEQ, d, LLVMConstReal(t->f32, -0.5), ""), "");
+   LLVMValueRef up = LLVMBuildAnd(t->b, tie,
+      LLVMBuildFCmp(t->b, LLVMRealOGT, e, z, ""), "");
+   LLVMValueRef dn = LLVMBuildAnd(t->b, tie,
+      LLVMBuildFCmp(t->b, LLVMRealOLT, e, z, ""), "");
+   n = LLVMBuildSelect(t->b, up, LLVMBuildFAdd(t->b, p, half, ""), n, "");
+   n = LLVMBuildSelect(t->b, dn, LLVMBuildFSub(t->b, p, half, ""), n, "unorm_n");
+   LLVMValueRef b = LLVMBuildFPToUI(t->b, n, t->i32, "");
    return LLVMBuildAnd(t->b, b, LLVMConstInt(t->i32, mask, false), "");
 }
 
