@@ -222,8 +222,11 @@ lower_load(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    case nir_ray_query_value_intersection_primitive_index:
       return rt_get(b, VX_RT_HIT_PRIMITIVE_ID, status);
    case nir_ray_query_value_intersection_geometry_index:
-      /* The scene carries lavapipe's geometry_id_and_flags; flags ride the top. */
-      return nir_iand_imm(b, rt_get(b, VX_RT_HIT_GEOMETRY_INDEX, status), 0x0fffffff);
+      return nir_iand_imm(b, rt_get(b, VX_RT_HIT_GEOMETRY_INDEX, status),
+                          VX_RT_HIT_GEOMETRY_MASK);
+   case nir_ray_query_value_intersection_front_face:
+      return nir_ieq_imm(b, nir_iand_imm(b, rt_get(b, VX_RT_HIT_GEOMETRY_INDEX, status),
+                                         VX_RT_HIT_BACK_FACING), 0);
    case nir_ray_query_value_intersection_instance_id:
       return rt_get(b, VX_RT_HIT_INSTANCE_ID, status);
    case nir_ray_query_value_intersection_instance_custom_index:

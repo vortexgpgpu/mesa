@@ -260,6 +260,7 @@ struct vp_prim {
    uint32_t geom_id;    /* lavapipe's geometry_id_and_flags: gl_GeometryIndexEXT
                          * in bits 0..27, the geometry-opaque flag in bit 31.
                          * The RTU reports it verbatim; readers mask. */
+   uint32_t ps;         /* lavapipe parent node << 1 | side (visit-order table) */
 };
 
 struct vp_prim_list {
@@ -276,6 +277,7 @@ struct vp_inst {
    uint32_t       mask;       /* visibility mask */
    uint32_t       flags;      /* RTU_INST_FLAG_* */
    uint32_t       id;         /* gl_InstanceID */
+   uint32_t       rank;       /* leaf index in the TLAS visit-order table */
    uint8_t        node[LVP_INST_NODE_BYTES];   /* lavapipe's own record */
 };
 
@@ -326,16 +328,79 @@ struct vp_ptr_stack {
    bool      ok;
 };
 
+/* Visit-order table of a lavapipe BVH: its binary tree, which lavapipe walks
+ * depth-first, nearer child box first, child[0] on equal entry distances, so
+ * of two hits at exactly the same t it keeps the one it reaches first. The RTU
+ * walks its own tree in its own order; on an exact-t tie it settles which of
+ * the two leaves lavapipe reaches first from these tables (the two child boxes
+ * under their lowest common ancestor, tested as lavapipe tests them). Scene
+ * layouts (rtu_walker.cpp):
+ *  TLAS (few nodes; leaf = instance, ranked in child[0]-first DFS order):
+ *   { n_leaves, n_nodes, nodes_off, 64 }
+ *   leaf[i] at +16 + i*64: { parent << 1 | side, _, _, _, world->object 3x4 }
+ *   node[j] at +nodes_off + j*64: { bounds[2] (min, max), parent << 1 | side
+ *     (~0 for the root), depth }
+ *  BLAS (one node per triangle, so kept compact):
+ *   { n_nodes, _, 64, 32 }, 64 B header
+ *   node[j] at +64 + j*32: { own box (min, max) = the parent's bounds[side],
+ *     parent << 1 | side, depth }
+ *   A triangle leaf carries its own parent << 1 | side in its leaf header, and
+ *   its box is fp32 min/max of its vertices -- lavapipe's leaf bound, checked
+ *   here for every triangle (a BLAS where it does not hold gets no table). */
+#define VP_OTAB_HDR_BYTES   16u
+#define VP_OTAB_NODE_BYTES  64u
+#define VP_OTAB_TLAS_LEAF   64u
+#define VP_OTAB_BLAS_HDR    64u
+#define VP_OTAB_BLAS_NODE   32u
+#define VP_OTAB_ROOT        0xffffffffu
+
+struct vp_onode {
+   float    box[12];     /* lvp_bvh_box_node.bounds[2] */
+   uint32_t ps;          /* parent << 1 | side */
+   uint32_t depth;
+};
+
+struct vp_otab {
+   struct { struct vp_onode *p; uint32_t count, cap; bool ok; } nodes;
+   struct { uint32_t *p; uint32_t count, cap; bool ok; } leaves;   /* TLAS: ps */
+   uint32_t leaf_box_mismatch;   /* BLAS: leaves whose bound != vertex min/max */
+};
+
+static void
+vp_otab_fini(struct vp_otab *ot)
+{
+   free(ot->nodes.p);
+   free(ot->leaves.p);
+}
+
+/* Record internal node `node` reached as (parent << 1 | side) = ps; returns
+ * its index. */
+static uint32_t
+vp_otab_node(struct vp_otab *ot, const uint8_t *node, uint32_t ps)
+{
+   struct vp_onode n;
+   memcpy(n.box, node, sizeof n.box);
+   n.ps = ps;
+   n.depth = ps == VP_OTAB_ROOT ? 0 : ot->nodes.p[ps >> 1].depth + 1;
+   const uint32_t idx = ot->nodes.count;
+   VP_LIST_PUSH(&ot->nodes, n);
+   return idx;
+}
+
 /* Collect a BLAS's primitives in object space. Opacity here is the geometry's
  * own: instance overrides travel in the instance record, where the RTU
  * composes them per instance, so one BLAS serves every instance of it. */
 static void
-vp_walk_blas(const uint8_t *bvh, uint32_t root, struct vp_prim_list *l)
+vp_walk_blas(const uint8_t *bvh, uint32_t root, struct vp_prim_list *l,
+             struct vp_otab *ot)
 {
+   /* Stack entries are (ps, node_ptr) pairs. */
    struct vp_ptr_stack st = { .ok = true };
+   VP_LIST_PUSH(&st, VP_OTAB_ROOT);
    VP_LIST_PUSH(&st, root);
-   while (st.ok && l->ok && st.count) {
+   while (st.ok && l->ok && ot->nodes.ok && ot->leaves.ok && st.count >= 2) {
       const uint32_t node_ptr = st.p[--st.count];
+      const uint32_t ps = st.p[--st.count];
       if (node_ptr == LVP_NODE_INVALID)
          continue;
       const uint8_t *node = bvh + (node_ptr & ~7u);
@@ -344,7 +409,10 @@ vp_walk_blas(const uint8_t *bvh, uint32_t root, struct vp_prim_list *l)
          uint32_t c0, c1;
          memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
          memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
+         const uint32_t idx = vp_otab_node(ot, node, ps);
+         VP_LIST_PUSH(&st, idx << 1 | 1u);
          VP_LIST_PUSH(&st, c1);
+         VP_LIST_PUSH(&st, idx << 1);
          VP_LIST_PUSH(&st, c0);
          break;
       }
@@ -356,6 +424,17 @@ vp_walk_blas(const uint8_t *bvh, uint32_t root, struct vp_prim_list *l)
          memcpy(&geom_flags, node + LVP_TRI_GEOMFLAGS_OFF, 4);
          pr.geom_id = geom_flags;
          pr.flags = (geom_flags & LVP_GEOMETRY_OPAQUE) ? RTU_BVH_FLAG_OPAQUE : 0u;
+         pr.ps = ps;
+         if (ps != VP_OTAB_ROOT) {
+            const float *bb = ot->nodes.p[ps >> 1].box + 6 * (ps & 1u);
+            for (int a = 0; a < 3; a++) {
+               if (bb[a] != fminf(pr.v[a], fminf(pr.v[3 + a], pr.v[6 + a])) ||
+                   bb[3 + a] != fmaxf(pr.v[a], fmaxf(pr.v[3 + a], pr.v[6 + a]))) {
+                  ot->leaf_box_mismatch++;
+                  break;
+               }
+            }
+         }
          VP_LIST_PUSH(l, pr);
          break;
       }
@@ -369,6 +448,7 @@ vp_walk_blas(const uint8_t *bvh, uint32_t root, struct vp_prim_list *l)
          pr.geom_id = geom_flags;
          pr.flags = RTU_BVH_FLAG_PROCEDURAL |
                     ((geom_flags & LVP_GEOMETRY_OPAQUE) ? RTU_BVH_FLAG_OPAQUE : 0u);
+         pr.ps = ps;
          VP_LIST_PUSH(l, pr);
          break;
       }
@@ -376,7 +456,7 @@ vp_walk_blas(const uint8_t *bvh, uint32_t root, struct vp_prim_list *l)
          break;
       }
    }
-   if (!st.ok)
+   if (!st.ok || !ot->nodes.ok || !ot->leaves.ok)
       l->ok = false;
    free(st.p);
 }
@@ -398,12 +478,15 @@ vp_rtu_inst_flags(uint32_t sbt_offset_and_flags)
 }
 
 static void
-vp_walk_tlas(const uint8_t *bvh, uint32_t root, struct vp_inst_list *il)
+vp_walk_tlas(const uint8_t *bvh, uint32_t root, struct vp_inst_list *il,
+             struct vp_otab *ot)
 {
    struct vp_ptr_stack st = { .ok = true };
+   VP_LIST_PUSH(&st, VP_OTAB_ROOT);
    VP_LIST_PUSH(&st, root);
-   while (st.ok && il->ok && st.count) {
+   while (st.ok && il->ok && ot->nodes.ok && ot->leaves.ok && st.count >= 2) {
       const uint32_t node_ptr = st.p[--st.count];
+      const uint32_t ps = st.p[--st.count];
       if (node_ptr == LVP_NODE_INVALID)
          continue;
       const uint8_t *node = bvh + (node_ptr & ~7u);
@@ -412,7 +495,10 @@ vp_walk_tlas(const uint8_t *bvh, uint32_t root, struct vp_inst_list *il)
          uint32_t c0, c1;
          memcpy(&c0, node + LVP_BOX_CHILDREN_OFF + 0, 4);
          memcpy(&c1, node + LVP_BOX_CHILDREN_OFF + 4, 4);
+         const uint32_t idx = vp_otab_node(ot, node, ps);
+         VP_LIST_PUSH(&st, idx << 1 | 1u);
          VP_LIST_PUSH(&st, c1);
+         VP_LIST_PUSH(&st, idx << 1);
          VP_LIST_PUSH(&st, c0);
          break;
       }
@@ -432,7 +518,9 @@ vp_walk_tlas(const uint8_t *bvh, uint32_t root, struct vp_inst_list *il)
          in.mask = cm >> 24;
          in.flags = vp_rtu_inst_flags(sf);
          memcpy(in.node, node, LVP_INST_NODE_BYTES);
+         in.rank = il->count;
          VP_LIST_PUSH(il, in);
+         VP_LIST_PUSH(&ot->leaves, ps);
          break;
       }
       default:
@@ -440,7 +528,7 @@ vp_walk_tlas(const uint8_t *bvh, uint32_t root, struct vp_inst_list *il)
          break;
       }
    }
-   if (!st.ok)
+   if (!st.ok || !ot->nodes.ok || !ot->leaves.ok)
       il->ok = false;
    free(st.p);
 }
@@ -659,18 +747,30 @@ vp_bvh_choose_exp(const float mn[3], const float mx[3], int exp[3])
       if (ext <= 0.f) { exp[a] = -16; continue; }
       int e = (int)ceilf(log2f(ext / 255.0f));
       if (e < -16) e = -16;
+      /* ext and log2f round in fp32: grow e until the RTU's decode of q=255
+       * (origin + 255*2^e, in fp32) reaches the node's max */
+      while (e < 16 && mn[a] + 255.0f * ldexpf(1.0f, e) < mx[a])
+         e++;
       if (e >  16) e =  16;
       exp[a] = e;
    }
 }
 
+/* Conservative quantization w.r.t. the RTU's fp32 decode origin + q*2^exp:
+ * the decoded box must contain [v_lo, v_hi]. The offset is taken exactly in
+ * double (fp32 v - origin can round inward), then nudged against the decode. */
 static uint8_t
 vp_quant(float v, float origin, int exp, bool hi)
 {
-   float t = (v - origin) / ldexpf(1.0f, exp);
-   float q = hi ? ceilf(t) : floorf(t);
-   if (q < 0.f)   q = 0.f;
-   if (q > 255.f) q = 255.f;
+   const float step = ldexpf(1.0f, exp);
+   double t = ((double)v - (double)origin) / (double)step;
+   double q = hi ? ceil(t) : floor(t);
+   if (q < 0.0)   q = 0.0;
+   if (q > 255.0) q = 255.0;
+   while (hi && q < 255.0 && origin + (float)q * step < v)
+      q += 1.0;
+   while (!hi && q > 0.0 && origin + (float)q * step > v)
+      q -= 1.0;
    return (uint8_t)q;
 }
 
@@ -704,6 +804,82 @@ vp_sbuf_alloc(struct vp_sbuf *sb, uint32_t bytes)
    }
    sb->size = off + bytes;
    return off;
+}
+
+/* Bytes a table of `bytes` takes appended at `size`, 64-B aligned so no node
+ * straddles a line. */
+static uint64_t
+vp_otab_need(uint32_t size, uint64_t bytes)
+{
+   return (((uint64_t)size + 63u) & ~(uint64_t)63u) - size + bytes;
+}
+
+static uint64_t
+vp_otab_tlas_bytes(const struct vp_otab *ot)
+{
+   const uint64_t nodes_off =
+      (VP_OTAB_HDR_BYTES + (uint64_t)ot->leaves.count * VP_OTAB_TLAS_LEAF + 63u) & ~(uint64_t)63u;
+   return nodes_off + (uint64_t)ot->nodes.count * VP_OTAB_NODE_BYTES;
+}
+
+/* Append the TLAS visit-order table to the scene; returns its offset (0 when
+ * it does not fit, which the RTU reads as "no table"). Each leaf carries its
+ * instance's world->object matrix, so the RTU can rebuild lavapipe's own
+ * object-space ray for a tie inside a BLAS. */
+static uint32_t
+vp_otab_emit_tlas(struct vp_sbuf *sb, const struct vp_otab *ot,
+                  const struct vp_inst *insts)
+{
+   const uint32_t stride = VP_OTAB_TLAS_LEAF;
+   const uint64_t bytes = vp_otab_tlas_bytes(ot);
+   if (sb->size + vp_otab_need(sb->size, bytes) > VP_RTU_SCENE_MAX_BYTES)
+      return 0;
+   const uint32_t nodes_off = (VP_OTAB_HDR_BYTES + ot->leaves.count * stride + 63u) & ~63u;
+   vp_sbuf_alloc(sb, ((sb->size + 63u) & ~63u) - sb->size);
+   const uint32_t off = vp_sbuf_alloc(sb, (uint32_t)bytes);
+   if (!sb->ok)
+      return 0;
+   uint8_t *p = sb->buf + off;
+   const uint32_t hdr[4] = { ot->leaves.count, ot->nodes.count, nodes_off, stride };
+   memcpy(p, hdr, sizeof hdr);
+   for (uint32_t i = 0; i < ot->leaves.count; i++) {
+      uint8_t *lp = p + VP_OTAB_HDR_BYTES + i * stride;
+      memcpy(lp, &ot->leaves.p[i], 4);
+      memcpy(lp + 16, insts[i].node + LVP_INST_WTO_OFF, 48);
+   }
+   for (uint32_t j = 0; j < ot->nodes.count; j++) {
+      uint8_t *np = p + nodes_off + j * VP_OTAB_NODE_BYTES;
+      memcpy(np, ot->nodes.p[j].box, 48);
+      memcpy(np + 48, &ot->nodes.p[j].ps, 4);
+      memcpy(np + 52, &ot->nodes.p[j].depth, 4);
+   }
+   return off;
+}
+
+/* Pack a BLAS visit-order table (see the layout above) into a host blob, for
+ * appending once every BLAS is in the scene and the space left is known. */
+static uint8_t *
+vp_otab_pack_blas(const struct vp_otab *ot, uint32_t *bytes)
+{
+   const uint64_t n = ot->nodes.count;
+   const uint64_t sz = VP_OTAB_BLAS_HDR + n * VP_OTAB_BLAS_NODE;
+   if (sz > VP_RTU_SCENE_MAX_BYTES)
+      return NULL;
+   uint8_t *p = calloc(1, sz);
+   if (!p)
+      return NULL;
+   const uint32_t hdr[4] = { (uint32_t)n, 0, VP_OTAB_BLAS_HDR, VP_OTAB_BLAS_NODE };
+   memcpy(p, hdr, sizeof hdr);
+   for (uint32_t j = 0; j < n; j++) {
+      const struct vp_onode *nd = &ot->nodes.p[j];
+      uint8_t *np = p + VP_OTAB_BLAS_HDR + (size_t)j * VP_OTAB_BLAS_NODE;
+      if (nd->ps != VP_OTAB_ROOT)
+         memcpy(np, ot->nodes.p[nd->ps >> 1].box + 6 * (nd->ps & 1u), 24);
+      memcpy(np + 24, &nd->ps, 4);
+      memcpy(np + 28, &nd->depth, 4);
+   }
+   *bytes = (uint32_t)sz;
+   return p;
 }
 
 /* Leaf encoders for vp_bvh_emit: a BLAS leaf holds one primitive, a TLAS leaf
@@ -776,7 +952,11 @@ vp_prim_leaf_write(const void *ctx, uint32_t i, uint8_t *p)
    uint32_t hdr[4] = {
       (proc ? RTU_BVH_KIND_LEAF_PROC : RTU_BVH_KIND_LEAF_TRI) | (1u << RTU_BVH_COUNT_SHIFT),
       pr->geom_id,          /* gl_GeometryIndexEXT */
-      proc ? pr->flags : 0u,/* a procedural leaf carries its flags word here */
+      /* A procedural leaf carries its flags word here; a triangle leaf its
+       * place in lavapipe's tree (parent << 1 | side in the BLAS's
+       * visit-order table), which the RTU uses to break exact-t ties the way
+       * lavapipe's first-visited-wins does. */
+      proc ? pr->flags : pr->ps,
       pr->prim_id,          /* prim_base = gl_PrimitiveID */
    };
    memcpy(p, hdr, sizeof hdr);
@@ -792,6 +972,9 @@ vp_prim_leaf_write(const void *ctx, uint32_t i, uint8_t *p)
 struct vp_blas_entry {
    const uint8_t *host;
    uint32_t       root;      /* scene offset of its root node */
+   uint32_t       otab;      /* scene offset of its visit-order table (0: none) */
+   uint8_t       *otab_blob; /* the table, until appended */
+   uint32_t       otab_bytes;
    float          mn[3], mx[3];
    bool           empty;
 };
@@ -802,11 +985,20 @@ static void
 vp_emit_blas(const uint8_t *host, struct vp_blas_entry *e, struct vp_sbuf *sb)
 {
    struct vp_prim_list l = { .ok = true };
-   vp_walk_blas(host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &l);
+   struct vp_otab ot = { .nodes.ok = true, .leaves.ok = true };
+   vp_walk_blas(host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &l, &ot);
    e->host = host;
    e->empty = true;
-   if (!l.ok) { sb->ok = false; free(l.p); return; }
-   if (l.count == 0) { free(l.p); return; }
+   if (!l.ok) { sb->ok = false; free(l.p); vp_otab_fini(&ot); return; }
+   if (l.count == 0) { free(l.p); vp_otab_fini(&ot); return; }
+   e->otab = 0;
+   if (ot.leaf_box_mismatch)
+      mesa_logw("vortexpipe: BLAS %p: %u triangle bound(s) differ from their "
+                "vertices' min/max; its exact-t ties fall back to a static key",
+                (const void *)host, ot.leaf_box_mismatch);
+   else
+      e->otab_blob = vp_otab_pack_blas(&ot, &e->otab_bytes);
+   vp_otab_fini(&ot);
 
    struct vp_bvh b;
    if (!vp_bvh_init(&b, l.count)) { sb->ok = false; vp_bvh_fini(&b); free(l.p); return; }
@@ -838,6 +1030,10 @@ vp_emit_blas(const uint8_t *host, struct vp_blas_entry *e, struct vp_sbuf *sb)
 struct vp_tlas_leaf_ctx {
    const struct vp_inst *inst;
    const uint32_t       *blas_root;   /* per instance */
+   const uint32_t       *blas_otab;   /* per instance (patched later) */
+   uint32_t              tlas_otab;
+   const struct vp_sbuf *sb;
+   uint32_t             *leaf_off;    /* out: each instance leaf's offset */
 };
 
 static uint32_t
@@ -854,6 +1050,13 @@ vp_inst_leaf_write(const void *ctx, uint32_t i, uint8_t *p)
    const struct vp_inst *in = &c->inst[i];
    uint32_t kind = RTU_BVH_KIND_LEAF_INST | (1u << RTU_BVH_COUNT_SHIFT);
    memcpy(p, &kind, 4);
+   /* Header words 1..3: the BLAS's visit-order table, the instance's rank in
+    * the TLAS's (lavapipe's DFS order, kept by the empty-BLAS compaction), and
+    * the TLAS's table. */
+   memcpy(p + 4, &c->blas_otab[i], 4);
+   c->leaf_off[i] = (uint32_t)(p - c->sb->buf);
+   memcpy(p + 8, &in->rank, 4);
+   memcpy(p + 12, &c->tlas_otab, 4);
    uint8_t *rec = p + RTU_BVH_LEAF_HDR_BYTES;
    memcpy(rec, in->otw, 48);
    uint32_t cull = (in->mask & 0xffu) | (in->flags << RTU_INST_FLAGS_SHIFT);
@@ -897,7 +1100,8 @@ static uint64_t
 vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
 {
    struct vp_inst_list il = { .ok = true };
-   vp_walk_tlas((const uint8_t *)tlas_host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &il);
+   struct vp_otab tot = { .nodes.ok = true, .leaves.ok = true };
+   vp_walk_tlas((const uint8_t *)tlas_host, LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL, &il, &tot);
    if (il.has_geometry && il.count == 0) {
       /* The handle names a BLAS: trace it as one identity instance. */
       static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
@@ -908,9 +1112,11 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
       memcpy(in.node + LVP_INST_SBTFLAGS_OFF, &sf, 4);
       memcpy(in.node + LVP_INST_WTO_OFF, kIdentity, sizeof kIdentity);
       memcpy(in.node + LVP_INST_OTW_OFF, kIdentity, sizeof kIdentity);
+      in.rank = 0;
       VP_LIST_PUSH(&il, in);
+      VP_LIST_PUSH(&tot.leaves, VP_OTAB_ROOT);
    }
-   if (!il.ok) { free(il.p); c->ok = false; return 0; }
+   if (!il.ok || !tot.leaves.ok) { free(il.p); vp_otab_fini(&tot); c->ok = false; return 0; }
 
    struct vp_sbuf sb = { .ok = true };
    vp_sbuf_alloc(&sb, RTU_SCENE_HDR_BYTES);
@@ -930,6 +1136,12 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
       if (il.p[i].id > max_id) max_id = il.p[i].id;
    }
 
+   /* Before compaction: the TLAS's visit-order table is indexed by every
+    * collected instance. It is small; without it ties fall back to a static
+    * key. */
+   const uint32_t tlas_otab = sb.ok ? vp_otab_emit_tlas(&sb, &tot, il.p) : 0;
+   vp_otab_fini(&tot);
+
    /* The TLAS over the non-empty instances. */
    uint32_t n_live = 0;
    for (uint32_t i = 0; sb.ok && i < il.count; i++) {
@@ -940,10 +1152,13 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
       n_live++;
    }
    uint32_t hdr[4] = { 0, RTU_SCENE_KIND_TRILIST, 0, 0 };   /* empty: all-miss */
+   uint32_t *leaf_off = calloc(n_live ? n_live : 1, sizeof *leaf_off);
+   if (!leaf_off) sb.ok = false;
    if (sb.ok && n_live) {
-      struct vp_bvh b;
+      struct vp_bvh b = { 0 };
       uint32_t *roots = malloc(n_live * sizeof *roots);
-      if (!roots || !vp_bvh_init(&b, n_live)) {
+      uint32_t *otabs = calloc(n_live, sizeof *otabs);
+      if (!roots || !otabs || !vp_bvh_init(&b, n_live)) {
          sb.ok = false;
       } else {
          for (uint32_t i = 0; i < n_live; i++) {
@@ -954,7 +1169,7 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
             roots[i] = e->root;
          }
          int root = vp_bvh_build(&b, 0, n_live);
-         struct vp_tlas_leaf_ctx lc = { il.p, roots };
+         struct vp_tlas_leaf_ctx lc = { il.p, roots, otabs, tlas_otab, &sb, leaf_off };
          struct vp_leaf_ops lo = { vp_inst_leaf_size, vp_inst_leaf_write, &lc };
          hdr[0] = vp_bvh_emit(&b, root, &lo, &sb);
          hdr[1] = RTU_SCENE_KIND_BVH4;
@@ -962,14 +1177,54 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
       }
       vp_bvh_fini(&b);
       free(roots);
+      free(otabs);
+   }
+
+   /* The BLAS visit-order tables go in a buffer of their own: a BLAS without
+    * one only loses lavapipe's tie order (its near-equal-t ties fall back to a
+    * static key), so they must not take the scene's own room -- its 31-bit
+    * offsets, or the largest buffer the device hands out. The RTU reaches
+    * them by 32-bit offsets from the scene base, patched in once both buffers
+    * have addresses. */
+   const uint32_t n_ids = il.count ? max_id + 1 : 0;
+   const uint32_t tbl = n_ids * VP_RTU_INST_TABLE_STRIDE;
+   const uint32_t base_bytes = sb.size;
+   struct vp_sbuf tb = { .ok = true };
+   uint32_t otab_kept = 0, otab_dropped = 0;
+   for (uint32_t k = 0; k < n_blas; k++) {
+      struct vp_blas_entry *e = &blas[k];
+      e->otab = 0;
+      if (!e->otab_blob)
+         continue;
+      const uint32_t before = tb.size;
+      if (tb.ok && (uint64_t)vp_otab_need(tb.size, e->otab_bytes) + tb.size
+                   <= VP_RTU_SCENE_MAX_BYTES) {
+         vp_sbuf_alloc(&tb, ((tb.size + 63u) & ~63u) - tb.size);
+         const uint32_t off = vp_sbuf_alloc(&tb, e->otab_bytes);
+         if (tb.ok) {
+            memcpy(tb.buf + off, e->otab_blob, e->otab_bytes);
+            e->otab = off + 1u;   /* +1: offset 0 is a table too; fixed below */
+            otab_kept++;
+         }
+      }
+      if (!e->otab) {
+         tb.size = tb.ok ? before : tb.size;
+         otab_dropped++;
+      }
+      free(e->otab_blob);
+      e->otab_blob = NULL;
+   }
+   if (!tb.ok) {
+      otab_dropped += otab_kept;
+      otab_kept = 0;
+      for (uint32_t k = 0; k < n_blas; k++)
+         blas[k].otab = 0;
    }
    hdr[2] = sb.size;
    if (sb.ok)
       memcpy(sb.buf, hdr, sizeof hdr);
 
    /* Prefix the instance table; its stride keeps the scene 64-B aligned. */
-   const uint32_t n_ids = il.count ? max_id + 1 : 0;
-   const uint32_t tbl = n_ids * VP_RTU_INST_TABLE_STRIDE;
    uint8_t *img = sb.ok ? calloc(1, (size_t)tbl + sb.size) : NULL;
    if (img) {
       for (uint32_t i = 0; i < n_live; i++)
@@ -977,9 +1232,10 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
                 il.p[i].node, LVP_INST_NODE_BYTES);
       memcpy(img + tbl, sb.buf, sb.size);
    }
-   const uint32_t img_size = tbl + sb.size;
-   vp_dbg("vortexpipe: RTU scene: %u instance(s), %u BLAS, %u bytes",
-          n_live, n_blas, sb.size);
+   uint32_t img_size = tbl + sb.size;
+   vp_dbg("vortexpipe: RTU scene: %u instance(s), %u BLAS, %u bytes; "
+          "BLAS visit-order tables: %u bytes for %u BLAS (%u without)",
+          n_live, n_blas, base_bytes, tb.size, otab_kept, otab_dropped);
    /* VORTEXPIPE_DUMP_SCENE=<prefix>: write each transcoded scene image to
     * <prefix>.<n>.bin (the scene base is at byte offset `tbl`, logged). */
    const char *dump = getenv("VORTEXPIPE_DUMP_SCENE");
@@ -995,10 +1251,14 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
                    path, tbl, n_live);
       }
    }
-   free(sb.buf); free(blas); free(inst_blas); free(il.p);
-   if (!img) { c->ok = false; return 0; }
+   free(sb.buf);
+   if (!img) {
+      free(blas); free(inst_blas); free(il.p); free(leaf_off);
+      c->ok = false; return 0;
+   }
 
    if (c->n_bufs >= VP_MAX_BVH || c->n_stages >= VP_MAX_BVH) {
+      free(blas); free(inst_blas); free(il.p); free(leaf_off);
       free(img); c->ok = false; return 0;
    }
    /* The upload is asynchronous; keep the image alive until the queue
@@ -1006,11 +1266,48 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    c->stages[c->n_stages++] = img;
    vx_buffer_h buf = NULL;
    uint64_t dev_addr = 0;
-   if (vx_buffer_create(c->dev, img_size, VX_MEM_READ, &buf) != VX_SUCCESS) {
+   if (vx_buffer_create(c->dev, img_size, VX_MEM_READ, &buf) != VX_SUCCESS ||
+       vx_buffer_address(buf, &dev_addr) != VX_SUCCESS) {
+      free(blas); free(inst_blas); free(il.p); free(leaf_off); free(tb.buf);
       c->ok = false; return 0;
    }
    c->bufs[c->n_bufs++] = buf;
-   if (vx_buffer_address(buf, &dev_addr) != VX_SUCCESS ||
+
+   /* The tables, if they get a buffer the RTU can reach from the scene. */
+   if (otab_kept && c->n_bufs < VP_MAX_BVH && c->n_stages < VP_MAX_BVH) {
+      vx_buffer_h tbuf = NULL;
+      uint64_t taddr = 0;
+      const uint64_t scene = dev_addr + tbl;
+      if (vx_buffer_create(c->dev, tb.size, VX_MEM_READ, &tbuf) == VX_SUCCESS) {
+         c->bufs[c->n_bufs++] = tbuf;
+         if (vx_buffer_address(tbuf, &taddr) == VX_SUCCESS && taddr >= scene
+             && taddr - scene + tb.size <= 0xffffff00ull) {
+            const uint32_t delta = (uint32_t)(taddr - scene);
+            for (uint32_t i = 0; i < n_live; i++) {
+               const uint32_t o = blas[inst_blas[i]].otab;
+               const uint32_t w = o ? delta + (o - 1u) : 0u;
+               memcpy(img + tbl + leaf_off[i] + 4, &w, 4);
+            }
+            if (vx_enqueue_write(c->q, tbuf, 0, tb.buf, tb.size, 0, NULL, NULL)
+                == VX_SUCCESS) {
+               c->stages[c->n_stages++] = tb.buf;
+               tb.buf = NULL;
+            } else {
+               c->ok = false;
+            }
+         } else {
+            mesa_logw("vortexpipe: RTU scene: visit-order tables unreachable "
+                      "from the scene; near-equal-t ties fall back to a static key");
+         }
+      } else {
+         mesa_logw("vortexpipe: RTU scene: no device memory for %u bytes of "
+                   "visit-order tables; near-equal-t ties fall back to a static key",
+                   tb.size);
+      }
+   }
+   free(tb.buf);
+   free(blas); free(inst_blas); free(il.p); free(leaf_off);
+   if (!c->ok ||
        vx_enqueue_write(c->q, buf, 0, img, img_size, 0, NULL, NULL) != VX_SUCCESS) {
       c->ok = false; return 0;
    }

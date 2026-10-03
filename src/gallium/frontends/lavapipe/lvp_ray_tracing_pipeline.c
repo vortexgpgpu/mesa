@@ -828,7 +828,7 @@ lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *comp
                .opaque = nir_imm_false(b),
             },
             .t = cand_t,
-            .frontface = nir_imm_true(b),   /* the RTU does not report facing */
+            .frontface = nir_ieq_imm(b, nir_iand_imm(b, geom, VX_RT_HIT_BACK_FACING), 0),
             .barycentrics = nir_vec2(b,
                nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_BARY_U),
                nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_BARY_V)),
@@ -872,7 +872,9 @@ lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *comp
                     nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_PRIMITIVE_ID), 0x1);
       nir_store_var(b, state->geometry_id_and_flags, geom, 0x1);
       nir_store_var(b, state->instance_addr, inst_addr, 0x1);
-      nir_store_var(b, state->hit_kind, nir_imm_int(b, 0xFE), 0x1);
+      nir_store_var(b, state->hit_kind,
+                    nir_bcsel(b, nir_ieq_imm(b, nir_iand_imm(b, geom, VX_RT_HIT_BACK_FACING), 0),
+                              nir_imm_int(b, 0xFE), nir_imm_int(b, 0xFF)), 0x1);
       /* Barycentrics live in scratch at the traversal stack pointer — the slot
        * the software triangle handler uses, so hitAttributeEXT reads unchanged. */
       nir_store_scratch(b,
