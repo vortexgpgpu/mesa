@@ -28,7 +28,6 @@
 #include "VX_types.h"        /* VX_MEM_OM_BASE_ADDR */
 
 #include <assert.h>          /* static_assert */
-#include <math.h>            /* INFINITY, NAN */
 #include <stddef.h>          /* offsetof */
 #include <stdio.h>
 #include <stdlib.h>
@@ -321,113 +320,20 @@ emit_ctlz(struct vp_tr *t, LLVMValueRef v)
    return LLVMBuildCall2(t->b, fty, fn, a, 2, "ctlz");
 }
 
-static LLVMValueRef emit_ffloor(struct vp_tr *t, LLVMValueRef fa, unsigned bits);
-
-/* llvm.fma.f32: one rounding, the Vortex FPU fmadd.s. */
-static LLVMValueRef
-emit_fma32(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b, LLVMValueRef c)
-{
-   LLVMTypeRef  args[3] = { t->f32, t->f32, t->f32 };
-   LLVMTypeRef  fty = LLVMFunctionType(t->f32, args, 3, false);
-   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.fma.f32");
-   if (!fn)
-      fn = LLVMAddFunction(t->mod, "llvm.fma.f32", fty);
-   LLVMValueRef a3[3] = { a, b, c };
-   return LLVMBuildCall2(t->b, fty, fn, a3, 3, "fma");
-}
-
-/* exp2 / log2 / pow evaluate exactly as gallivm's lp_build_exp2,
- * lp_build_log2_safe and lp_build_pow, so a shader returns the same bits here
- * as on the llvmpipe path it falls back to. gallivm's multiply-adds are
- * llvm.fmuladd, which the host backend fuses, hence the explicit fma. */
-static const double vp_exp2_poly[] = {   /* EXP_POLY_DEGREE 5 */
-   1.000000000000000000000,
-   0.693153073200168932794,
-   0.240153617044375388211,
-   0.0558263180532956664775,
-   0.00898934009049466391101,
-   0.00187757667519147912699,
-};
-static const double vp_log2_poly[] = {   /* LOG_POLY_DEGREE 4 */
-   2.88539009343309178325,
-   0.961791550404184197881,
-   0.577440339438736392009,
-   0.403343858251329912514,
-   0.406718052498846252698,
-};
-
-/* lp_build_polynomial: even and odd terms in x^2, joined by one fma. */
-static LLVMValueRef
-emit_lp_polynomial(struct vp_tr *t, LLVMValueRef x, const double *coeffs,
-                   unsigned n)
-{
-   LLVMValueRef x2 = LLVMBuildFMul(t->b, x, x, "");
-   LLVMValueRef even = NULL, odd = NULL;
-   for (unsigned i = n; i--; ) {
-      LLVMValueRef c = LLVMConstReal(t->f32, (float)coeffs[i]);
-      if (i % 2 == 0)
-         even = even ? emit_fma32(t, x2, even, c) : c;
-      else
-         odd = odd ? emit_fma32(t, x2, odd, c) : c;
-   }
-   return odd ? emit_fma32(t, odd, x, even) : even;
-}
-
-static LLVMValueRef
-emit_lp_exp2(struct vp_tr *t, LLVMValueRef x)
-{
-   LLVMValueRef hi = LLVMConstReal(t->f32, 128.0);
-   LLVMValueRef lo = LLVMConstReal(t->f32, (float)-126.99999);
-   /* NaN fails both compares and passes through */
-   x = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGT, x, hi, ""), hi, x, "");
-   x = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, x, lo, ""), lo, x, "");
-   LLVMValueRef fl    = emit_ffloor(t, x, 32);
-   LLVMValueRef fpart = LLVMBuildFSub(t->b, x, fl, "");
-   LLVMValueRef ipart = LLVMBuildFPToSI(t->b, fl, t->i32, "");
-   LLVMValueRef e = LLVMBuildShl(t->b,
-                       LLVMBuildAdd(t->b, ipart, LLVMConstInt(t->i32, 127, false), ""),
-                       LLVMConstInt(t->i32, 23, false), "");
-   LLVMValueRef expipart = LLVMBuildBitCast(t->b, e, t->f32, "");
-   LLVMValueRef expfpart = emit_lp_polynomial(t, fpart, vp_exp2_poly,
-                                              ARRAY_SIZE(vp_exp2_poly));
-   return LLVMBuildFMul(t->b, expipart, expfpart, "exp2");
-}
-
-static LLVMValueRef
-emit_lp_log2_safe(struct vp_tr *t, LLVMValueRef x)
-{
-   LLVMValueRef one = LLVMConstReal(t->f32, 1.0);
-   LLVMValueRef i   = LLVMBuildBitCast(t->b, x, t->i32, "");
-   LLVMValueRef e   = LLVMBuildAnd(t->b, i, LLVMConstInt(t->i32, 0x7f800000, false), "");
-   LLVMValueRef logexp = LLVMBuildSIToFP(t->b,
-      LLVMBuildSub(t->b, LLVMBuildLShr(t->b, e, LLVMConstInt(t->i32, 23, false), ""),
-                   LLVMConstInt(t->i32, 127, false), ""), t->f32, "");
-   LLVMValueRef mant = LLVMBuildBitCast(t->b,
-      LLVMBuildOr(t->b, LLVMBuildAnd(t->b, i, LLVMConstInt(t->i32, 0x007fffff, false), ""),
-                  LLVMConstInt(t->i32, 0x3f800000, false), ""), t->f32, "");
-   LLVMValueRef y = LLVMBuildFDiv(t->b, LLVMBuildFSub(t->b, mant, one, ""),
-                                  LLVMBuildFAdd(t->b, mant, one, ""), "");
-   LLVMValueRef z = LLVMBuildFMul(t->b, y, y, "");
-   LLVMValueRef pz = emit_lp_polynomial(t, z, vp_log2_poly, ARRAY_SIZE(vp_log2_poly));
-   LLVMValueRef res = emit_fma32(t, y, pz, logexp);
-   LLVMValueRef zero = LLVMConstReal(t->f32, 0.0);
-   res = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOGE, x,
-                                  LLVMConstReal(t->f32, INFINITY), ""),
-                         LLVMConstReal(t->f32, INFINITY), res, "");
-   res = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOEQ, x, zero, ""),
-                         LLVMConstReal(t->f32, -INFINITY), res, "");
-   res = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOLT, x, zero, ""),
-                         LLVMConstReal(t->f32, NAN), res, "log2");
-   return res;
-}
-
+/* llvm.pow.f32 / llvm.pow.f64 (x**y) on a compute-typed float. Lowered by the
+ * RISC-V backend to a powf / pow libcall. */
 static LLVMValueRef
 emit_fpow(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y)
 {
-   LLVMValueRef zero = LLVMConstReal(t->f32, 0.0);
-   LLVMValueRef res = emit_lp_exp2(t, LLVMBuildFMul(t->b, emit_lp_log2_safe(t, x), y, ""));
-   return LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOEQ, x, zero, ""),
-                          zero, res, "fpow");
+   LLVMTypeRef  ft = LLVMTypeOf(x);
+   const char  *nm = ft == t->f64 ? "llvm.pow.f64" : "llvm.pow.f32";
+   LLVMTypeRef  args[2] = { ft, ft };
+   LLVMTypeRef  fty = LLVMFunctionType(ft, args, 2, false);
+   LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, nm);
+   if (!fn)
+      fn = LLVMAddFunction(t->mod, nm, fty);
+   LLVMValueRef a[2] = { x, y };
+   return LLVMBuildCall2(t->b, fty, fn, a, 2, "fpow");
 }
 
 static LLVMTypeRef cty(struct vp_tr *t, unsigned bits);
@@ -1428,18 +1334,7 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          unsigned bs = alu->def.bit_size;
          LLVMValueRef x = as_float(t, alu_src(t, alu, 0, c), bs);
          LLVMValueRef y = as_float(t, alu_src(t, alu, 1, c), bs);
-         if (LLVMTypeOf(x) == t->f32) {
-            r = from_float(t, emit_fpow(t, x, y), bs);
-         } else {
-            LLVMTypeRef  ft = LLVMTypeOf(x);
-            LLVMTypeRef  args[2] = { ft, ft };
-            LLVMTypeRef  fty = LLVMFunctionType(ft, args, 2, false);
-            LLVMValueRef fn  = LLVMGetNamedFunction(t->mod, "llvm.pow.f64");
-            if (!fn)
-               fn = LLVMAddFunction(t->mod, "llvm.pow.f64", fty);
-            LLVMValueRef a2[2] = { x, y };
-            r = from_float(t, LLVMBuildCall2(t->b, fty, fn, a2, 2, "fpow"), bs);
-         }
+         r = from_float(t, emit_fpow(t, x, y), bs);
          break;
       }
       /* Unary float rounding + transcendentals. floor/ceil/trunc are synthesized
@@ -1459,14 +1354,8 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          case nir_op_fceil:       res = emit_fceil(t, fa, bs);  break;
          case nir_op_ftrunc:      res = emit_ftrunc(t, fa, bs); break;
          case nir_op_fround_even: res = emit_funary_intrin(t, "nearbyint", fa, bs); break;
-         case nir_op_fexp2:
-            res = (LLVMTypeOf(fa) == t->f32) ? emit_lp_exp2(t, fa)
-                                             : emit_funary_intrin(t, "exp2", fa, bs);
-            break;
-         case nir_op_flog2:
-            res = (LLVMTypeOf(fa) == t->f32) ? emit_lp_log2_safe(t, fa)
-                                             : emit_funary_intrin(t, "log2", fa, bs);
-            break;
+         case nir_op_fexp2:       res = emit_funary_intrin(t, "exp2", fa, bs); break;
+         case nir_op_flog2:       res = emit_funary_intrin(t, "log2", fa, bs); break;
          case nir_op_fsin:        res = emit_funary_intrin(t, "sin",  fa, bs); break;
          default:                 res = emit_funary_intrin(t, "cos",  fa, bs); break;
          }
