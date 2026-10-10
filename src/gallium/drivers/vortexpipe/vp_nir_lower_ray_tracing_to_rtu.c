@@ -51,7 +51,7 @@
  * the ray geometry through the trace register window (not the slot file), so
  * the ray inputs are staged here at rq_initialize and consumed at rq_proceed. */
 struct rq_state {
-   nir_variable *scene;   /* uint: TLAS device address (low 32 bits) */
+   nir_variable *scene;   /* uint64: TLAS device address              */
    nir_variable *flags;   /* uint: ray flags                         */
    nir_variable *cull;    /* uint: cull mask (low byte)              */
    nir_variable *origin;  /* vec3: world ray origin                  */
@@ -83,11 +83,8 @@ lower_initialize(nir_builder *b, nir_intrinsic_instr *in, struct rq_state *st)
    nir_def *dir    = in->src[6].ssa;
    nir_def *tmax   = in->src[7].ssa;
 
-   /* Stage the ray inputs; rq_proceed issues them as one trace macro-op.
-    * The TLAS pointer is the low 32 bits of the acceleration-structure
-    * address (the RV32 trace config carries one XLEN scene register). */
-   nir_def *scene = accel->bit_size == 32 ? accel : nir_u2u32(b, accel);
-   nir_store_var(b, st->scene, scene, 0x1);
+   /* Stage the ray inputs; rq_proceed issues them as one trace macro-op. */
+   nir_store_var(b, st->scene, nir_u2u64(b, accel), 0x1);
    nir_store_var(b, st->flags, nir_u2u32(b, flags), 0x1);
    nir_store_var(b, st->cull, nir_iand_imm(b, nir_u2u32(b, cull), 0xff), 0x1);
    nir_store_var(b, st->origin, origin, 0x7);
@@ -182,7 +179,7 @@ static nir_def *
 rq_instance_word(nir_builder *b, struct rq_state *st, nir_def *status, unsigned off)
 {
    nir_def *id = rt_get(b, VX_RT_HIT_INSTANCE_ID, status);
-   nir_def *entry = nir_isub(b, nir_u2u64(b, nir_load_var(b, st->scene)),
+   nir_def *entry = nir_isub(b, nir_load_var(b, st->scene),
                              nir_u2u64(b, nir_imul_imm(b, nir_iadd_imm(b, id, 1),
                                                        VP_RTU_INST_TABLE_STRIDE)));
    return nir_build_load_global(b, 1, 32, nir_iadd_imm(b, entry, off));
@@ -299,7 +296,7 @@ vp_nir_lower_ray_tracing_to_rtu(nir_shader *shader)
 
    /* One shared query state (RTU is one ray per lane). */
    struct rq_state st = {
-      .scene  = nir_local_variable_create(impl, glsl_uint_type(), "rq_scene"),
+      .scene  = nir_local_variable_create(impl, glsl_uint64_t_type(), "rq_scene"),
       .flags  = nir_local_variable_create(impl, glsl_uint_type(), "rq_flags"),
       .cull   = nir_local_variable_create(impl, glsl_uint_type(), "rq_cull"),
       .origin = nir_local_variable_create(impl, glsl_vec_type(3), "rq_origin"),

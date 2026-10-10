@@ -753,15 +753,13 @@ lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *comp
    struct lvp_ray_tracing_state *state = &compiler->state;
    nir_def *scene64 = nir_u2u64(b, accel_struct);
 
-   /* One XLEN scene register carries the TLAS pointer (low 32 bits). */
-   nir_def *scene = accel_struct->bit_size == 32 ? accel_struct : nir_u2u32(b, accel_struct);
    /* Config word: ray_flags (low 16) | cull_mask (high 16), matching the
     * ray-query lowering's lane-3 packing. */
    nir_def *flags_cull =
       nir_ior(b, nir_iand_imm(b, flags, 0xffff),
                  nir_ishl_imm(b, nir_iand_imm(b, cull_mask, 0xff), 16));
 
-   nir_def *handle = nir_vortex_rt_wtrace(b, 32, scene, flags_cull, origin, dir, tmin, tmax);
+   nir_def *handle = nir_vortex_rt_wtrace(b, 32, scene64, flags_cull, origin, dir, tmin, tmax);
    nir_variable *status_var =
       nir_local_variable_create(b->impl, glsl_uint_type(), "rtu_status");
    nir_store_var(b, status_var, nir_vortex_rt_wait(b, 32, handle), 0x1);

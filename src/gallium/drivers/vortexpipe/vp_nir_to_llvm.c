@@ -2930,8 +2930,8 @@ emit_vx_wgather(struct vp_tr *t, LLVMValueRef self, LLVMValueRef v1,
     * warp-gather register the backend reserves wherever it is pinned. */
    const char *s = ".insn r4 43, 0, 0, $0, $2, $3, $4";
    const char *c = "={x31},0,r,r,r";
-   LLVMTypeRef args[4] = { t->i32, t->i32, t->i32, t->i32 };
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 4, false);
+   LLVMTypeRef args[4] = { t->iptr, t->iptr, t->iptr, t->iptr };
+   LLVMTypeRef fnty = LLVMFunctionType(t->iptr, args, 4, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
                                       /*HasSideEffects*/ true, false,
                                       LLVMInlineAsmDialectATT, false);
@@ -2959,7 +2959,8 @@ emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
 
 /* vx_rt_trace: rd = handle <- trace(rs1 = lane-packed config; f0..f7 = ray).
  * config = wgather(0, scene, 0, flags|cull): lane1=scene, lane2=payload(0),
- * lane3=flags|cull (the RTU reads rs1 lanes 1/2/3). The eight ray floats
+ * lane3=flags|cull (the RTU reads rs1 lanes 1/2/3). The config register is XLEN
+ * wide, so the scene address reaches the RTU whole on rv64. The eight ray floats
  * are bound to f0..f7 — read by HW convention, like the tensor unit's fragment
  * window; the encoding itself only names rd/rs1, so the window operands ride
  * the operand list unreferenced. SSA values are i32 bit-patterns, so the ray
@@ -2968,15 +2969,17 @@ static LLVMValueRef
 emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
                   LLVMValueRef ray[8])
 {
-   LLVMValueRef z = LLVMConstInt(t->i32, 0, false);
-   LLVMValueRef cfg = emit_vx_wgather(t, z, scene, z, flags_cull);
+   LLVMValueRef z   = LLVMConstInt(t->iptr, 0, false);
+   LLVMValueRef sc  = LLVMBuildIntCast2(t->b, scene, t->iptr, false, "");
+   LLVMValueRef fc  = LLVMBuildIntCast2(t->b, flags_cull, t->iptr, false, "");
+   LLVMValueRef cfg = emit_vx_wgather(t, z, sc, z, fc);
 
    const char *s = ".insn r 43, 7, 0, $0, $1, x0";
    /* cfg is read straight from the gather register: a copy elsewhere would be
     * written on active lanes only, leaving the packed lanes the RTU reads stale. */
    const char *c = "=r,{x31},{f0},{f1},{f2},{f3},{f4},{f5},{f6},{f7}";
    LLVMTypeRef args[9];
-   args[0] = t->i32;                              /* cfg (rs1) */
+   args[0] = t->iptr;                             /* cfg (rs1) */
    for (int i = 0; i < 8; i++) args[1 + i] = t->f32;  /* f0..f7 */
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 9, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
